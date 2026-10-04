@@ -1,0 +1,16 @@
+[package]
+name = "seek-ipc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Seek named-pipe protocol between service and app"
+
+[dependencies]
+seek-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+tokio.workspace = true
+futures.workspace = true
+windows-sys.workspace = true
