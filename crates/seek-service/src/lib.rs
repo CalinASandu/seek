@@ -1,0 +1,78 @@
+//! Seek background service: owns every device index, keeps them current and answers searches
+//! over a named pipe.
+
+pub mod monitor;
+pub mod server;
+pub mod state;
+
+use std::path::PathBuf;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::time::Duration;
+
+pub use monitor::{RealVolumes, VolumeSource};
+pub use state::{Config, State};
+
+const VOLUME_POLL: Duration = Duration::from_secs(2);
+const JOURNAL_POLL: Duration = Duration::from_millis(500);
+const SAVE_EVERY: Duration = Duration::from_secs(5 * 60);
+
+/// Default data directory: `%ProgramData%\Seek`.
+pub fn default_data_dir() -> PathBuf {
+    std::env::var_os("ProgramData")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
+        .join("Seek")
+}
+
+/// Runs the service until `shutdown` flips to `true`, then saves everything.
+pub async fn run(
+    cfg: Config,
+    source: Arc<dyn VolumeSource>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) -> anyhow::Result<()> {
+    let state = tokio::task::spawn_blocking(move || State::load(cfg, source)).await??;
+    tracing::info!(
+        "data dir {}, {} known devices",
+        state.cfg.data_dir.display(),
+        state.registry.read().unwrap().devices.len()
+    );
+
+    let mut background = Vec::new();
+    background.push(every(VOLUME_POLL, state.clone(), monitor::poll_volumes));
+    background.push(every(JOURNAL_POLL, state.clone(), monitor::poll_journals));
+    background.push(every(SAVE_EVERY, state.clone(), |s| s.save_dirty()));
+    background.push(every(Duration::from_secs(1), state.clone(), |s| {
+        if s.invalidated.swap(false, Ordering::Relaxed) {
+            s.emit(seek_ipc::Event::ResultsInvalidated);
+        }
+    }));
+
+    let served = server::serve(state.clone(), shutdown).await;
+
+    for task in background {
+        task.abort();
+    }
+    let st = state.clone();
+    tokio::task::spawn_blocking(move || st.save_dirty()).await?;
+    tracing::info!("stopped");
+    served
+}
+
+fn every(
+    period: Duration,
+    state: Arc<State>,
+    f: fn(&Arc<State>),
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(period);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            let st = state.clone();
+            if let Err(e) = tokio::task::spawn_blocking(move || f(&st)).await {
+                tracing::error!("background task panicked: {e}");
+            }
+        }
+    })
+}

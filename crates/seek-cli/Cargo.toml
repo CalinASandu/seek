@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Seek developer CLI: scan, query, bench"
+description = "Seek developer CLI: scan, query, perf"
 
 [[bin]]
 name = "seek"
@@ -17,3 +17,6 @@ seek-ipc.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 tokio.workspace = true
+uuid.workspace = true
+serde_json.workspace = true
+windows-sys.workspace = true
