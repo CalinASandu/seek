@@ -118,7 +118,10 @@ mod tests {
     fn device_serde_roundtrip_camel_case() {
         let d = Device {
             id: uuid::Uuid::nil(),
-            identity: DeviceIdentity::Volume { serial: 42, filesystem: "NTFS".into() },
+            identity: DeviceIdentity::Volume {
+                serial: 42,
+                filesystem: "NTFS".into(),
+            },
             display_name: "System".into(),
             label: "".into(),
             filesystem: "NTFS".into(),

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/seek-core", "crates/seek-scan", "crates/seek-ipc", "crates/seek-service", "crates/seek-cli"]
+members = ["crates/seek-core", "crates/seek-scan", "crates/seek-ipc", "crates/seek-service", "crates/seek-cli", "app/src-tauri"]
 
 [workspace.package]
 version = "0.1.0"
@@ -31,7 +31,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 jwalk = "0.8"
 notify = "8"
 windows-service = "0.8"
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Ioctl", "Win32_System_IO", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Memory", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_System_Threading"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Ioctl", "Win32_System_IO", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Memory", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_System_Threading", "Win32_System_ProcessStatus"] }
 criterion = "0.5"
 tempfile = "3"
 
