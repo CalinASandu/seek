@@ -1,0 +1,65 @@
+/* Design tokens. Light/dark resolve through light-dark(); [data-theme] overrides the system setting. */
+:root {
+  color-scheme: light dark;
+
+  --font: "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, sans-serif;
+  --font-display: "Segoe UI Variable Display", "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+  --fs-xs: 12px;
+  --fs-sm: 13px;
+  --fs-md: 14px;
+  --fs-lg: 20px;
+
+  --r-sm: 4px;
+  --r-md: 8px;
+
+  /* 4-pt grid */
+  --s1: 4px;
+  --s2: 8px;
+  --s3: 12px;
+  --s4: 16px;
+  --s5: 20px;
+  --s6: 24px;
+  --s8: 32px;
+
+  /* Window backdrop: solid fallback in a browser, translucent when Mica is available (html.mica). */
+  --bg: light-dark(#f3f3f3, #202020);
+  --surface: light-dark(#ffffffcc, #2b2b2bcc);
+  --surface-solid: light-dark(#ffffff, #2b2b2b);
+  --surface-2: light-dark(#0000000a, #ffffff0f);
+  --hover: light-dark(#0000000a, #ffffff0f);
+  --pressed: light-dark(#00000012, #ffffff17);
+  --border: light-dark(#0000000f, #ffffff14);
+  --border-strong: light-dark(#0000001f, #ffffff24);
+  --text: light-dark(#1a1a1a, #ffffff);
+  --text-2: light-dark(#3d3d3d, #e0e0e0);
+  --muted: light-dark(#5f5f5f, #a0a0a0);
+  --faint: light-dark(#8a8a8a, #707070);
+
+  --accent: light-dark(#3b82f6, #60a5fa);
+  --accent-fg: light-dark(#ffffff, #0b1220);
+  --accent-soft: light-dark(#3b82f61a, #60a5fa26);
+  --accent-text: light-dark(#1d5fd6, #7ab4ff);
+  --success: #10b981;
+  --offline: light-dark(#9ca3af, #6b7280);
+  --warning: #f59e0b;
+  --danger: #ef4444;
+  --danger-text: light-dark(#c62828, #f87171);
+  --danger-soft: light-dark(#ef44441a, #ef44442b);
+
+  --shadow-menu: 0 8px 24px light-dark(#00000026, #00000066), 0 0 0 1px var(--border-strong);
+  --shadow-dialog: 0 24px 64px light-dark(#00000033, #00000099), 0 0 0 1px var(--border-strong);
+  --scrim: light-dark(#00000040, #00000080);
+
+  --ease: cubic-bezier(0.2, 0, 0, 1);
+  --t: 120ms var(--ease);
+}
+:root[data-theme="light"] { color-scheme: light; }
+:root[data-theme="dark"] { color-scheme: dark; }
+
+/* Real Mica: let the OS backdrop show through; surfaces stay translucent. */
+:root.mica { --bg: light-dark(#f3f3f399, transparent); }
+
+@media (prefers-reduced-motion: reduce) {
+  :root { --t: 0ms linear; }
+  *, *::before, *::after { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; }
+}
