@@ -89,10 +89,10 @@ function Shell() {
   };
 
   const hotkeys = useMemo(() => {
-    const map: Record<string, () => void> = { "ctrl+f": focusSearch };
+    const map: Record<string, () => void> = { "ctrl+f": focusSearch, f5: search.refresh };
     SORT_KEYS.forEach((k, i) => (map[`ctrl+${i + 1}`] = () => onSort(k)));
     return map;
-  }, [onSort]);
+  }, [onSort, search.refresh]);
   useHotkeys(hotkeys);
 
   const toggleCollapsed = () => {
@@ -167,6 +167,7 @@ function Shell() {
               onSort={onSort}
               notify={notify}
               scrollerRef={scrollerRef}
+              onStale={search.refresh}
             />
           ) : null}
         </div>
@@ -175,6 +176,8 @@ function Shell() {
         total={hasQuery && search.active ? search.total : null}
         elapsedMs={search.elapsedMs}
         loading={search.loading}
+        stale={hasQuery && search.active && search.stale}
+        onRefresh={search.refresh}
         status={status}
         devices={devices}
         progress={progress}

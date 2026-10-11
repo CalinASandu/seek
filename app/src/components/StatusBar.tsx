@@ -5,12 +5,15 @@ interface Props {
   total: number | null;
   elapsedMs: number;
   loading: boolean;
+  /** The index changed since the results were computed. */
+  stale: boolean;
+  onRefresh: () => void;
   status: Status | null;
   devices: Device[];
   progress: Record<string, number>;
 }
 
-export function StatusBar({ total, elapsedMs, loading, status, devices, progress }: Props) {
+export function StatusBar({ total, elapsedMs, loading, stale, onRefresh, status, devices, progress }: Props) {
   const scanning = devices.filter((d) => d.state === "scanning");
   const first = scanning[0];
   return (
@@ -23,6 +26,11 @@ export function StatusBar({ total, elapsedMs, loading, status, devices, progress
             <strong>{formatInt(total)}</strong> {total === 1 ? "result" : "results"}
             <span className="status-muted tnum"> in {elapsedMs < 10 ? elapsedMs.toFixed(1) : Math.round(elapsedMs)} ms</span>
             {loading && <span className="status-spin" aria-label="Searching" />}
+            {stale && !loading && (
+              <button type="button" className="status-refresh" onClick={onRefresh} title="Search again (F5)">
+                Index updated · Refresh
+              </button>
+            )}
           </>
         )}
       </span>

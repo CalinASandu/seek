@@ -32,6 +32,10 @@ pub enum Request {
     /// Base64 of an encoded `.seekidx` (see `seek_core::persist::encode_index`).
     PushShareIndex { device_id: DeviceId, data_b64: String },
     SetShareState { device_id: DeviceId, online: bool },
+    /// A drive the app sees in the user's session (e.g. Google Drive's virtual `G:`, a mapped drive).
+    /// The service answers `Ok` when it indexes that volume itself, or `Device` when it cannot see it:
+    /// then the app scans it and feeds it with `PushShareIndex` / `SetShareState`, like a share.
+    AddUserVolume { volume: UserVolume },
     Status,
     /// Switches the connection into an event stream of [`Response::Event`].
     Subscribe,
@@ -51,6 +55,19 @@ pub enum Response {
     Error { message: String },
     Status(StatusInfo),
     Event { event: Event },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct UserVolume {
+    /// e.g. `G:\`
+    pub mount_point: String,
+    pub identity: seek_core::DeviceIdentity,
+    pub label: String,
+    pub filesystem: String,
+    pub kind: seek_core::DeviceKind,
+    pub total_bytes: u64,
+    pub free_bytes: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]

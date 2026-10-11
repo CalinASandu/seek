@@ -52,6 +52,8 @@ pub fn poll_volumes(state: &Arc<State>) {
         let existing = state.registry.read().unwrap().find_by_identity(&v.identity).map(|d| d.id);
         let id = existing.unwrap_or_else(|| register_volume(state, &v));
         present.insert(id);
+        // The service sees it now, so it indexes it itself (the app stops pushing it).
+        state.user_volumes.lock().unwrap().remove(&id);
         let already = state.mounted.lock().unwrap().insert(id, v.clone()).is_some();
         if !already {
             tracing::info!("volume {} ({}) is online", v.mount_point, v.filesystem);
@@ -111,7 +113,7 @@ fn start_pending_rescans(state: &Arc<State>) {
     }
 }
 
-fn register_volume(state: &Arc<State>, v: &VolumeInfo) -> DeviceId {
+pub(crate) fn register_volume(state: &Arc<State>, v: &VolumeInfo) -> DeviceId {
     let now = now_ms();
     let name = if v.label.is_empty() {
         format!("Local Disk ({})", v.mount_point.trim_end_matches('\\'))

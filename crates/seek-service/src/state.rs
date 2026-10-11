@@ -41,6 +41,8 @@ pub struct State {
     pub rescan_pending: Mutex<HashSet<DeviceId>>,
     /// When each device's last scan finished and how long it took.
     pub last_scan: Mutex<HashMap<DeviceId, (Instant, Duration)>>,
+    /// Volumes only the user's session can see (reported by the app, which scans and pushes them).
+    pub user_volumes: Mutex<HashSet<DeviceId>>,
     pub events: broadcast::Sender<Event>,
     pub invalidated: AtomicBool,
 }
@@ -105,6 +107,7 @@ impl State {
             needs_rescan: Mutex::new(needs_rescan),
             rescan_pending: Mutex::new(HashSet::new()),
             last_scan: Mutex::new(HashMap::new()),
+            user_volumes: Mutex::new(HashSet::new()),
             events,
             invalidated: AtomicBool::new(false),
         });

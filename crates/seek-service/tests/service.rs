@@ -9,7 +9,7 @@ use seek_core::{
     encode_index, Checkpoint, DeviceIdentity, DeviceIndex, DeviceKind, DeviceState, IndexHeader,
     RawEntry, SortKey, ATTR_DIRECTORY,
 };
-use seek_ipc::{Client, MuxClient, Request, Response};
+use seek_ipc::{Client, MuxClient, Request, Response, UserVolume};
 use seek_scan::{DirWatcher, FollowError, ScanError, ScanResult, UsnFollower, VolumeInfo};
 use seek_service::{Config, VolumeSource};
 
@@ -353,6 +353,72 @@ async fn mux_client_routes_concurrent_responses() {
     for t in tasks {
         t.await.unwrap();
     }
+    let _ = svc.stop.send(true);
+    svc.task.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn session_only_volume_is_fed_by_the_app() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = Arc::new(Fake::default());
+    fake.vols.lock().unwrap().push(volume()); // T: is visible to the service itself
+    let svc = start(dir.path(), fake.clone()).await;
+    let mut c = connect(&svc.pipe).await;
+    wait_for(&mut c, "device scanned", scanned_online).await;
+
+    // The app reports T: too: the service already indexes it, so the app must leave it alone.
+    let t = UserVolume {
+        mount_point: "T:\\".into(),
+        identity: volume().identity,
+        label: "TESTSTICK".into(),
+        filesystem: "exFAT".into(),
+        kind: DeviceKind::Removable,
+        total_bytes: 0,
+        free_bytes: 0,
+    };
+    assert_eq!(c.request(Request::AddUserVolume { volume: t }).await.unwrap(), Response::Ok);
+
+    // G: only exists in the user's session (Google Drive): the app scans it and pushes the index.
+    let g = UserVolume {
+        mount_point: "G:\\".into(),
+        identity: DeviceIdentity::Volume { serial: 0x1234, filesystem: "FAT32".into() },
+        label: "Google Drive".into(),
+        filesystem: "FAT32".into(),
+        kind: DeviceKind::Fixed,
+        total_bytes: 1 << 40,
+        free_bytes: 1 << 39,
+    };
+    let Response::Device { device } = c.request(Request::AddUserVolume { volume: g.clone() }).await.unwrap() else {
+        panic!("expected a device for a volume the service cannot see")
+    };
+    assert_eq!(device.display_name, "Google Drive (G:)");
+    // reporting it again keeps the same device
+    let Response::Device { device: again } = c.request(Request::AddUserVolume { volume: g }).await.unwrap() else { panic!() };
+    assert_eq!(again.id, device.id);
+
+    let mut ix = DeviceIndex::from_raw(
+        0,
+        vec![RawEntry { id: 1, parent_id: 0, name: "holiday-plan.gdoc".into(), size: 1, modified: 0, created: 0, attrs: 0 }],
+    );
+    let hdr = IndexHeader { format_version: 1, device_id: device.id, host_id: uuid::Uuid::nil(), checkpoint: None, saved_at: 0, rows: 0 };
+    let data_b64 = base64::engine::general_purpose::STANDARD.encode(encode_index(&hdr, &mut ix).unwrap());
+    assert_eq!(c.request(Request::PushShareIndex { device_id: device.id, data_b64 }).await.unwrap(), Response::Ok);
+    let (sid, n) = total(search(&mut c, "holiday-plan").await);
+    assert_eq!(n, 1);
+    let Response::Rows { rows, .. } = c.request(Request::FetchRows { search_id: sid, offset: 0, limit: 5 }).await.unwrap() else { panic!() };
+    assert_eq!(rows[0].full_path, r"G:\holiday-plan.gdoc");
+    assert!(rows[0].online);
+
+    // Drive quits: offline, still searchable.
+    assert_eq!(c.request(Request::SetShareState { device_id: device.id, online: false }).await.unwrap(), Response::Ok);
+    assert_eq!(total(search(&mut c, "offline: holiday-plan").await).1, 1);
+
+    // The service's own volumes cannot be overwritten by the app.
+    let Response::Devices { devices } = c.request(Request::ListDevices).await.unwrap() else { panic!() };
+    let own = devices.iter().find(|d| d.display_name.contains("TESTSTICK")).unwrap().id;
+    let r = c.request(Request::SetShareState { device_id: own, online: false }).await.unwrap();
+    assert!(matches!(r, Response::Error { .. }), "{r:?}");
+
     let _ = svc.stop.send(true);
     svc.task.await.unwrap().unwrap();
 }

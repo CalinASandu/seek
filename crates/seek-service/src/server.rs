@@ -12,7 +12,7 @@ use seek_core::{
 };
 use seek_ipc::{
     create_server, read_frame, write_frame, Envelope, IndexProgress, Request, Response, StatusInfo,
-    PROTOCOL_VERSION,
+    UserVolume, PROTOCOL_VERSION,
 };
 use tokio::net::windows::named_pipe::NamedPipeServer;
 use tokio::sync::mpsc;
@@ -140,7 +140,7 @@ async fn handle(state: Arc<State>, conn: Arc<Conn>, req: Request) -> Response {
         Request::ForgetDevice { id } => forget(&state, id),
         Request::RescanDevice { id } => match state.device(id) {
             None => err("unknown device"),
-            Some(d) if d.kind == DeviceKind::Network => err("network shares are rescanned by the app"),
+            Some(d) if is_app_fed(&state, &d) => err("this device is scanned by the app (network shares are rescanned by the app)"),
             Some(_) => match monitor::rescan(&state, id) {
                 Ok(()) => Response::Ok,
                 Err(e) => err(e),
@@ -152,7 +152,13 @@ async fn handle(state: Arc<State>, conn: Arc<Conn>, req: Request) -> Response {
                 .await
                 .unwrap_or_else(|e| err(e.to_string()))
         }
+        Request::AddUserVolume { volume } => add_user_volume(&state, volume),
         Request::SetShareState { device_id, online } => {
+            match state.device(device_id) {
+                Some(d) if is_app_fed(&state, &d) => {}
+                Some(_) => return err("device is indexed by the service"),
+                None => return err("unknown device"),
+            }
             let ok = state.update_device(device_id, |d| {
                 d.state = if online { DeviceState::Online } else { DeviceState::Offline };
                 d.last_seen = now_ms();
@@ -295,10 +301,50 @@ fn add_share(state: &Arc<State>, unc: &str) -> Response {
     Response::Device { device }
 }
 
+/// Devices whose index comes from the app: network shares and volumes only the user's session sees.
+fn is_app_fed(state: &State, d: &Device) -> bool {
+    d.kind == DeviceKind::Network || state.user_volumes.lock().unwrap().contains(&d.id)
+}
+
+fn add_user_volume(state: &Arc<State>, v: UserVolume) -> Response {
+    if !matches!(v.identity, DeviceIdentity::Volume { .. }) {
+        return err("expected a volume identity");
+    }
+    let seen_by_service = state.mounted.lock().unwrap().values().any(|m| m.identity == v.identity);
+    if seen_by_service {
+        return Response::Ok;
+    }
+    let info = seek_scan::VolumeInfo {
+        mount_point: v.mount_point.clone(),
+        identity: v.identity.clone(),
+        label: v.label.clone(),
+        filesystem: v.filesystem.clone(),
+        kind: v.kind,
+        total_bytes: v.total_bytes,
+        free_bytes: v.free_bytes,
+    };
+    let existing = state.registry.read().unwrap().find_by_identity(&v.identity).map(|d| d.id);
+    let id = existing.unwrap_or_else(|| monitor::register_volume(state, &info));
+    state.user_volumes.lock().unwrap().insert(id);
+    state.update_device(id, |d| {
+        d.last_mount_point = v.mount_point;
+        d.label = v.label;
+        d.filesystem = v.filesystem;
+        d.kind = v.kind;
+        d.total_bytes = v.total_bytes;
+        d.free_bytes = v.free_bytes;
+        d.last_seen = now_ms();
+    });
+    match state.device(id) {
+        Some(device) => Response::Device { device },
+        None => err("unknown device"),
+    }
+}
+
 fn push_share(state: &Arc<State>, id: DeviceId, data_b64: &str) -> Response {
     match state.device(id) {
-        Some(d) if d.kind == DeviceKind::Network => {}
-        Some(_) => return err("device is not a network share"),
+        Some(d) if is_app_fed(state, &d) => {}
+        Some(_) => return err("device is indexed by the service"),
         None => return err("unknown device"),
     }
     let bytes = match base64::engine::general_purpose::STANDARD.decode(data_b64) {

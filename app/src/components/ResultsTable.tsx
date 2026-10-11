@@ -51,6 +51,8 @@ interface Props {
   onSort: (key: SortKey) => void;
   notify: (message: string) => void;
   scrollerRef?: React.RefObject<HTMLDivElement | null>;
+  /** The service can no longer serve these rows (index renumbered): re-run the search. */
+  onStale?: () => void;
 }
 
 function Highlighted({ name, terms }: { name: string; terms: string[] }) {
@@ -79,11 +81,11 @@ function FolderCell({ folder }: { folder: string }) {
   );
 }
 
-export function ResultsTable({ searchId, total, query, sort, descending, onSort, notify, scrollerRef }: Props) {
+export function ResultsTable({ searchId, total, query, sort, descending, onSort, notify, scrollerRef, onStale }: Props) {
   const api = useApi();
   const innerRef = useRef<HTMLDivElement>(null);
   const scroller = scrollerRef ?? innerRef;
-  const { getRow, ensure } = useRows(searchId);
+  const { getRow, ensure } = useRows(searchId, onStale);
   const [widths, setWidths] = useState(loadWidths);
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [focus, setFocus] = useState(0);
@@ -107,13 +109,15 @@ export function ResultsTable({ searchId, total, query, sort, descending, onSort,
     if (total > 0) ensure(firstIdx, lastIdx);
   }, [firstIdx, lastIdx, total, searchId, ensure, getRow]);
 
-  // New results: reset selection and scroll to top.
+  // New query or sort: back to the top. A refresh of the same query keeps the scroll position.
   useEffect(() => {
-    setSelected(new Set());
     setFocus(0);
     anchor.current = 0;
     scroller.current?.scrollTo?.({ top: 0 });
-  }, [searchId, scroller]);
+  }, [query, sort, descending, scroller]);
+
+  // Any new result set: selected row numbers may now be other files.
+  useEffect(() => setSelected(new Set()), [searchId]);
 
   useEffect(() => {
     try {

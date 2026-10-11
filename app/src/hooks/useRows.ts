@@ -4,13 +4,18 @@ import type { ResultRow } from "../api/types";
 
 export const PAGE = 200;
 
-/** Page cache of result rows keyed by searchId. Rows load in pages of 200 as `ensure` is called. */
-export function useRows(searchId: number | null) {
+/**
+ * Page cache of result rows keyed by searchId. Rows load in pages of 200 as `ensure` is called.
+ * `onStale` runs when the service can no longer serve this result set (its rows were renumbered).
+ */
+export function useRows(searchId: number | null, onStale?: () => void) {
   const api = useApi();
   const pages = useRef(new Map<number, ResultRow[]>());
   const pending = useRef(new Set<number>());
   const current = useRef<number | null>(searchId);
   const [, bump] = useState(0);
+  const staleRef = useRef(onStale);
+  staleRef.current = onStale;
 
   const ensure = useCallback(
     (first: number, last: number) => {
@@ -28,7 +33,10 @@ export function useRows(searchId: number | null) {
             pages.current.set(key, rows);
             bump((n) => n + 1);
           })
-          .catch(() => pending.current.delete(key));
+          .catch((err) => {
+            pending.current.delete(key);
+            if (current.current === id && String(err).includes("results changed")) staleRef.current?.();
+          });
       }
     },
     [api],

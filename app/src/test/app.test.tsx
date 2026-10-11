@@ -93,4 +93,37 @@ describe("Seek app", () => {
     await user.click(within(dialog).getByRole("button", { name: "Add share" }));
     expect(await within(dialog).findByRole("alert")).toHaveTextContent("\\\\server\\share");
   });
+  it("does not re-search when the index changes; F5 / the hint refreshes", async () => {
+    const base = makeApi();
+    const listeners: Array<(e: Parameters<Parameters<SeekApi["onEvent"]>[0]>[0]) => void> = [];
+    const search = vi.fn(base.search);
+    const onEvent: SeekApi["onEvent"] = (fn) => {
+      listeners.push(fn);
+      const off = base.onEvent(fn);
+      return () => {
+        listeners.splice(listeners.indexOf(fn), 1);
+        off();
+      };
+    };
+    const user = userEvent.setup();
+    render(<App api={{ ...base, search, onEvent }} />);
+    await user.type(await screen.findByRole("searchbox"), "report");
+    await screen.findByRole("grid");
+    await waitFor(() => expect(search).toHaveBeenLastCalledWith("report", "name", false));
+    await new Promise((r) => setTimeout(r, 100)); // let the typing debounce settle
+    const calls = search.mock.calls.length;
+
+    // a busy drive: many invalidations, no new searches
+    for (let i = 0; i < 5; i++) listeners.forEach((l) => l({ type: "resultsInvalidated" }));
+    const hint = await screen.findByRole("button", { name: /Index updated/ });
+    await new Promise((r) => setTimeout(r, 100));
+    expect(search.mock.calls.length).toBe(calls);
+
+    await user.click(hint);
+    await waitFor(() => expect(search.mock.calls.length).toBe(calls + 1));
+    await waitFor(() => expect(screen.queryByRole("button", { name: /Index updated/ })).toBeNull());
+
+    fireEvent.keyDown(window, { key: "F5" });
+    await waitFor(() => expect(search.mock.calls.length).toBe(calls + 2));
+  });
 });

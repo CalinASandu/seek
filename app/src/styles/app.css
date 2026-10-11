@@ -224,6 +224,9 @@ kbd { font-size: 11px; color: var(--muted); border: 1px solid var(--border-stron
 .status-gap { width: 8px; }
 .status-fill { flex: 1; }
 .status-spin { width: 10px; height: 10px; border-radius: 50%; border: 2px solid var(--border-strong); border-top-color: var(--accent); animation: spin 0.7s linear infinite; margin-left: 4px; }
+.status-refresh { margin-left: 10px; padding: 1px 8px; border: 1px solid var(--border-strong); border-radius: 999px; background: transparent; color: var(--accent); font: inherit; font-size: 11px; cursor: pointer; }
+.status-refresh:hover { background: var(--accent); color: #fff; border-color: var(--accent); }
+.status-refresh:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .progress { width: 64px; height: 4px; border-radius: 2px; background: var(--border-strong); overflow: hidden; position: relative; }
 .progress span { position: absolute; inset: 0; width: 40%; background: var(--accent); border-radius: 2px; animation: slide 1.4s var(--ease) infinite; }
 @keyframes slide { from { transform: translateX(-100%); } to { transform: translateX(260%); } }

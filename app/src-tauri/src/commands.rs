@@ -69,7 +69,7 @@ pub async fn forget_device(link: Link<'_>, id: DeviceId) -> Result<(), String> {
 pub async fn rescan_device(link: Link<'_>, shares: State<'_, ShareQueue>, id: DeviceId) -> Result<(), String> {
     match link.request(Request::RescanDevice { id }).await {
         Ok(Response::Ok) => Ok(()),
-        // Network shares are scanned by the app, not the service.
+        // Network shares and session-only drives (e.g. Google Drive) are scanned by the app.
         Err(e) if e.contains("network shares") => {
             let _ = shares.send(ShareJob::One(id));
             Ok(())
