@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use seek_core::{Device, DeviceId, ResultRow, SortKey};
-use seek_ipc::{Request, Response, StatusInfo};
+use seek_ipc::{PcInfo, Request, Response, StatusInfo};
 use serde_json::{json, Value};
 use tauri::{AppHandle, State};
 use tauri_plugin_autostart::ManagerExt;
@@ -135,4 +135,62 @@ pub fn set_settings(app: AppHandle, settings: Settings) -> Result<(), String> {
         tracing::warn!("updating start-with-Windows failed: {e}");
     }
     settings::save(&settings)
+}
+
+// ---- linked PCs ----
+
+#[tauri::command]
+pub async fn start_pairing(link: Link<'_>) -> Result<Value, String> {
+    match link.request(Request::StartPairing).await? {
+        Response::PairingCode { code, expires_ms } => Ok(json!({ "code": code, "expiresMs": expires_ms })),
+        other => Err(unexpected(other)),
+    }
+}
+
+#[tauri::command]
+pub async fn discovered_pcs(link: Link<'_>) -> Result<Vec<PcInfo>, String> {
+    match link.request(Request::DiscoveredPcs).await? {
+        Response::Pcs { pcs } => Ok(pcs),
+        other => Err(unexpected(other)),
+    }
+}
+
+#[tauri::command]
+pub async fn join_pairing(link: Link<'_>, addr: String, code: String) -> Result<(), String> {
+    expect_ok(&link, Request::JoinPairing { addr, code }).await
+}
+
+#[tauri::command]
+pub async fn list_peers(link: Link<'_>) -> Result<Value, String> {
+    match link.request(Request::ListPeers).await? {
+        Response::Peers { this_pc, peers, sharing, unshared } => {
+            Ok(json!({ "thisPc": this_pc, "peers": peers, "sharing": sharing, "unshared": unshared }))
+        }
+        other => Err(unexpected(other)),
+    }
+}
+
+#[tauri::command]
+pub async fn unlink(link: Link<'_>, host_id: uuid::Uuid) -> Result<(), String> {
+    expect_ok(&link, Request::Unlink { host_id }).await
+}
+
+#[tauri::command]
+pub async fn rename_peer(link: Link<'_>, host_id: uuid::Uuid, name: String) -> Result<(), String> {
+    expect_ok(&link, Request::RenamePeer { host_id, name }).await
+}
+
+#[tauri::command]
+pub async fn sync_now(link: Link<'_>) -> Result<(), String> {
+    expect_ok(&link, Request::SyncNow).await
+}
+
+#[tauri::command]
+pub async fn set_sharing(link: Link<'_>, enabled: bool) -> Result<(), String> {
+    expect_ok(&link, Request::SetSharing { enabled }).await
+}
+
+#[tauri::command]
+pub async fn set_device_shared(link: Link<'_>, device_id: DeviceId, shared: bool) -> Result<(), String> {
+    expect_ok(&link, Request::SetDeviceShared { device_id, shared }).await
 }

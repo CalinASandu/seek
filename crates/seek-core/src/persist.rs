@@ -27,6 +27,9 @@ pub struct IndexHeader {
     /// Unix epoch milliseconds.
     pub saved_at: i64,
     pub rows: u64,
+    /// For a copy of another PC's device: the sync cursor `(generation, seq)` the copy is at.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync_cursor: Option<(uuid::Uuid, u64)>,
 }
 
 fn bad(msg: impl Into<String>) -> Error {
@@ -102,6 +105,11 @@ impl<'a> Cursor<'a> {
 }
 
 pub fn encode_index(header: &IndexHeader, index: &mut DeviceIndex) -> Result<Vec<u8>, Error> {
+    encode_index_level(header, index, ZSTD_LEVEL)
+}
+
+/// Like [`encode_index`] with an explicit zstd level (sync uses 1, the fastest).
+pub fn encode_index_level(header: &IndexHeader, index: &mut DeviceIndex, level: i32) -> Result<Vec<u8>, Error> {
     index.compact();
     let mut hdr = header.clone();
     hdr.format_version = INDEX_FORMAT_VERSION;
@@ -123,7 +131,7 @@ pub fn encode_index(header: &IndexHeader, index: &mut DeviceIndex) -> Result<Vec
     put_bytes(&mut body, index.names.as_bytes());
     put_bytes(&mut body, index.lower.as_bytes());
     body.extend_from_slice(&index.root_id.to_le_bytes());
-    let packed = zstd::encode_all(&body[..], ZSTD_LEVEL)?;
+    let packed = zstd::encode_all(&body[..], level)?;
 
     let mut out = Vec::with_capacity(16 + hdr_json.len() + packed.len());
     out.extend_from_slice(INDEX_MAGIC);

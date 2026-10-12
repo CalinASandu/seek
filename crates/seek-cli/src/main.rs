@@ -178,6 +178,7 @@ fn scan(target: &str, out: Option<&Path>, json: bool) -> anyhow::Result<()> {
             checkpoint: ix.checkpoint,
             saved_at: chrono_now(),
             rows: 0,
+            sync_cursor: None,
         };
         // The mount point is needed later to print paths; keep it next to the index.
         save_index(out, &header, &mut ix)?;
@@ -227,7 +228,7 @@ fn query_file(file: &Path, q: &str, limit: usize) -> anyhow::Result<()> {
         error: None,
     };
     let expr = query::parse(q).map_err(|e| anyhow::anyhow!("{} (at {})", e.message, e.position))?;
-    let devs = [SearchDevice { device: &device, index: &ix, mount: &mount, online: true }];
+    let devs = [SearchDevice { device: &device, index: &ix, mount: &mount, online: true, pc: "" }];
     let t = Instant::now();
     let hits = search(&devs, &expr, SortKey::Name, false, &|| false).unwrap_or_default();
     let ms = t.elapsed().as_secs_f64() * 1000.0;

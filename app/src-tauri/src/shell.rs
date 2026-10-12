@@ -36,7 +36,7 @@ fn shell_execute(verb: &str, file: &str, params: Option<&str>) -> Result<(), Str
 
 pub fn open_path(path: &str) -> Result<(), String> {
     if !Path::new(path).exists() {
-        return Err(format!("{path} is not available — the device may be offline"));
+        return Err(format!("{path} is not available — the drive may be offline"));
     }
     shell_execute("open", path, None)
 }
@@ -52,7 +52,7 @@ pub fn reveal_path(path: &str) -> Result<(), String> {
     } else if let Some(parent) = target.parent().filter(|p| p.exists()) {
         shell_execute("open", &parent.to_string_lossy(), None)
     } else {
-        Err(format!("{path} is not available — the device may be offline"))
+        Err(format!("{path} is not available — the drive may be offline"))
     }
 }
 

@@ -3,8 +3,8 @@
 //!
 //! Sections: synthetic index (build time, memory), search latency for every query × sort key,
 //! fetching a page of results, saving/loading an index, applying a batch of live changes, real
-//! drive scans (each in a child process so its peak memory is its own), and round trips to the
-//! running service.
+//! drive scans (each in a child process so its peak memory is its own), sync between linked PCs
+//! (full copy over loopback, applying a delta), and round trips to the running service.
 
 use std::collections::HashMap;
 use std::os::windows::io::AsRawHandle;
@@ -14,8 +14,8 @@ use std::time::Instant;
 
 use anyhow::Context;
 use seek_core::{
-    load_index, materialize, query, save_index, search, synth_index, Change, Device, DeviceIdentity,
-    DeviceIndex, DeviceKind, DeviceState, IndexHeader, RawEntry, SearchDevice, SortKey,
+    decode_index, encode_index_level, load_index, materialize, query, save_index, search, synth_index, Change,
+    Device, DeviceIdentity, DeviceIndex, DeviceKind, DeviceState, IndexHeader, RawEntry, SearchDevice, SortKey,
     ATTR_DIRECTORY, INDEX_FORMAT_VERSION,
 };
 use seek_ipc::{Client, Request, Response, PROTOCOL_VERSION};
@@ -149,6 +149,7 @@ pub fn run(o: Opts) -> anyhow::Result<()> {
     );
 
     synthetic(&mut r, &o)?;
+    sync(&mut r, o.runs)?;
     for target in &o.scans {
         real_scan(&mut r, target)?;
     }
@@ -192,8 +193,8 @@ fn synthetic(r: &mut Report, o: &Opts) -> anyhow::Result<()> {
     let (da, db) = (device("Synthetic A", "S:\\"), device("Synthetic B", "T:\\"));
     {
         let devs = [
-            SearchDevice { device: &da, index: &a, mount: "S:\\", online: true },
-            SearchDevice { device: &db, index: &b, mount: "T:\\", online: false },
+            SearchDevice { device: &da, index: &a, mount: "S:\\", online: true, pc: "" },
+            SearchDevice { device: &db, index: &b, mount: "T:\\", online: false, pc: "" },
         ];
 
         r.section("search (query × sort)");
@@ -235,6 +236,7 @@ fn synthetic(r: &mut Report, o: &Opts) -> anyhow::Result<()> {
         checkpoint: None,
         saved_at: 0,
         rows: 0,
+            sync_cursor: None,
     };
     let t = Instant::now();
     save_index(&path, &header, &mut a)?;
@@ -252,6 +254,85 @@ fn synthetic(r: &mut Report, o: &Opts) -> anyhow::Result<()> {
 
     r.section("process");
     r.add("process/peak working set", mb(peak_working_set(None)), "MB", "synthetic section");
+    Ok(())
+}
+
+/// Entries in the index sent to a linked PC (a big system drive).
+const SYNC_ENTRIES: usize = 2_000_000;
+const SYNC_DELTA: usize = 1_000;
+
+/// Sync between linked PCs: a full copy of a 2M-entry device (encode, decode, end to end over an encrypted
+/// loopback connection) and applying 1,000 journaled changes.
+fn sync(r: &mut Report, runs: usize) -> anyhow::Result<()> {
+    use seek_sync::journal::{DeviceJournal, Since, JOURNAL_MAX_BYTES};
+    use seek_sync::noise::{accept, connect, Keys};
+    use seek_sync::session::{decode_delta, encode_delta};
+    use seek_sync::{Cursor, Frame, Msg};
+
+    r.section("sync");
+    let ix = synth_index(SYNC_ENTRIES, 3);
+    let header = IndexHeader {
+        format_version: INDEX_FORMAT_VERSION,
+        device_id: uuid::Uuid::new_v4(),
+        host_id: uuid::Uuid::new_v4(),
+        checkpoint: None,
+        saved_at: 0,
+        rows: 0,
+        sync_cursor: Some((uuid::Uuid::new_v4(), 0)),
+    };
+    let mut bytes = Vec::new();
+    let (best, _) = time_ms(runs, || {
+        let mut copy = ix.clone();
+        bytes = encode_index_level(&header, &mut copy, 1).expect("encodes");
+    });
+    let note = format!("{SYNC_ENTRIES} entries");
+    r.add("sync/full encode", best, "ms", &note);
+    r.add("sync/full bytes", mb(bytes.len() as u64), "MB", "zstd level 1");
+    let (best, _) = time_ms(runs, || {
+        std::hint::black_box(decode_index(&bytes).expect("decodes"));
+    });
+    r.add("sync/full decode", best, "ms", "");
+
+    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    let (best, _) = time_ms(runs, || {
+        let payload = bytes.clone();
+        rt.block_on(async {
+            let (ka, kb) = (Keys::generate(), Keys::generate());
+            let kb_public = kb.public;
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind loopback");
+            let addr = listener.local_addr().expect("addr");
+            let receiver = tokio::spawn(async move {
+                let (io, _) = listener.accept().await.expect("accept");
+                let (_, mut rd, _wr) = accept(io, &kb, |_| true).await.expect("handshake");
+                let frame = rd.recv().await.expect("frame");
+                decode_index(&frame.payload).expect("decodes").1.live_count()
+            });
+            let io = tokio::net::TcpStream::connect(addr).await.expect("connect");
+            let _ = io.set_nodelay(true);
+            let (_rd, mut wr) = connect(io, &ka, &kb_public).await.expect("handshake");
+            let msg = Msg::Full { device: uuid::Uuid::nil(), cursor: Cursor::none() };
+            wr.send(&Frame::new(&msg, payload)).await.expect("send");
+            receiver.await.expect("receiver")
+        });
+    });
+    r.add("sync/full loopback", best, "ms", "connect + handshake + send + decode; target < 2000 ms");
+
+    let mut target = ix.clone();
+    let files: Vec<u64> =
+        (0..ix.len() as u32).filter(|&row| !ix.is_dir(row)).map(|row| ix.id(row)).take(SYNC_DELTA).collect();
+    let mut journal = DeviceJournal::in_memory(JOURNAL_MAX_BYTES);
+    let from = journal.cursor();
+    let t = Instant::now();
+    for &id in &files {
+        journal.record(&[Change::Delete { id }]);
+    }
+    let Since::Delta(changes) = journal.since(&from) else { anyhow::bail!("journal lost the changes") };
+    let payload = encode_delta(&changes);
+    let changes = decode_delta(&payload)?;
+    target.apply(&changes);
+    let ms = t.elapsed().as_secs_f64() * 1000.0;
+    anyhow::ensure!(target.live_count() == ix.live_count() - files.len(), "delta applied wrongly");
+    r.add(format!("sync/delta {SYNC_DELTA} apply"), ms, "ms", "journal + encode + decode + apply; target < 50 ms");
     Ok(())
 }
 

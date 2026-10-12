@@ -12,6 +12,8 @@ export interface Device {
   totalBytes: number;
   freeBytes: number;
   lastMountPoint: string;
+  /** Host id of the PC that indexes this device (this PC, or a linked PC for copies). */
+  indexedByHost: string;
   firstSeen: number;
   lastSeen: number;
   indexUpdatedAt: number;
@@ -54,8 +56,42 @@ export interface Settings {
   excludeFolders: string[];
 }
 
+/** This PC or a linked PC. */
+export interface PcSummary {
+  hostId: string;
+  name: string;
+  online: boolean;
+  /** Unix ms of the last update exchanged; 0 = never. */
+  lastSyncMs: number;
+  /** Came back with a different identity (reinstalled): must be linked again. */
+  needsRelink: boolean;
+}
+
+/** A Seek PC on the local network that is not linked yet. */
+export interface PcInfo {
+  hostId: string;
+  name: string;
+  /** `ip:port` */
+  addr: string;
+}
+
+export interface Peers {
+  thisPc: PcSummary;
+  peers: PcSummary[];
+  /** "Share this PC's files with linked PCs". */
+  sharing: boolean;
+  /** Own devices not shared. */
+  unshared: string[];
+}
+
+export interface PairingCode {
+  code: string;
+  expiresMs: number;
+}
+
 export type SeekEvent =
   | { type: "devicesChanged" }
+  | { type: "peersChanged" }
   | { type: "resultsInvalidated" }
   | { type: "indexProgress"; deviceId: string; scanned: number; done: boolean }
   | { type: "serviceState"; state: ServiceState };
@@ -75,5 +111,14 @@ export interface SeekApi {
   installService(): Promise<void>;
   getSettings(): Promise<Settings>;
   setSettings(s: Settings): Promise<void>;
+  startPairing(): Promise<PairingCode>;
+  discoveredPcs(): Promise<PcInfo[]>;
+  joinPairing(addr: string, code: string): Promise<void>;
+  listPeers(): Promise<Peers>;
+  unlink(hostId: string): Promise<void>;
+  renamePeer(hostId: string, name: string): Promise<void>;
+  syncNow(): Promise<void>;
+  setSharing(enabled: boolean): Promise<void>;
+  setDeviceShared(deviceId: string, shared: boolean): Promise<void>;
   onEvent(cb: (e: SeekEvent) => void): () => void;
 }

@@ -24,9 +24,9 @@ export function toggleToken(query: string, token: string, exclusive: string[] = 
   return addToken(q, token);
 }
 
-export const deviceToken = (name: string): string => `device:"${name}"`;
+export const driveToken = (name: string): string => `drive:"${name}"`;
 
-/** Split a query into whitespace-separated tokens; quotes may sit inside a token (`device:"a b"`). */
+/** Split a query into whitespace-separated tokens; quotes may sit inside a token (`drive:"a b"`). */
 export function tokenize(query: string): string[] {
   const toks: string[] = [];
   let cur = "";

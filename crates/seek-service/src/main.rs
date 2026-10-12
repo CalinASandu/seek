@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
-use seek_service::{default_data_dir, Config, RealVolumes};
+use seek_service::{default_data_dir, default_sync_config, Config, RealVolumes};
 
 #[derive(Parser)]
 #[command(name = "seek-service", version, about = "Seek indexing service")]
@@ -20,6 +20,9 @@ struct Cli {
     /// Pipe name to listen on.
     #[arg(long, default_value = seek_ipc::PIPE_NAME)]
     pipe: String,
+    /// Don't sync with linked PCs (no network listener, no mDNS).
+    #[arg(long)]
+    no_sync: bool,
 }
 
 #[derive(Subcommand)]
@@ -38,15 +41,21 @@ fn main() -> anyhow::Result<()> {
         Some(Cmd::Install) => svc::install(),
         Some(Cmd::Uninstall) => svc::uninstall(),
         Some(Cmd::Run) => svc::run_as_service(),
-        None if cli.console => run_console(cli.data_dir.unwrap_or_else(default_data_dir), cli.pipe),
+        None if cli.console => run_console(
+            cli.data_dir.unwrap_or_else(default_data_dir),
+            cli.pipe,
+            !cli.no_sync,
+        ),
         None => {
-            eprintln!("Use `seek-service --console` to run in the foreground, or `seek-service install`.");
+            eprintln!(
+                "Use `seek-service --console` to run in the foreground, or `seek-service install`."
+            );
             Ok(())
         }
     }
 }
 
-fn run_console(data_dir: PathBuf, pipe_name: String) -> anyhow::Result<()> {
+fn run_console(data_dir: PathBuf, pipe_name: String, sync: bool) -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
@@ -60,13 +69,26 @@ fn run_console(data_dir: PathBuf, pipe_name: String) -> anyhow::Result<()> {
             tracing::info!("Ctrl+C: saving and stopping…");
             let _ = tx.send(true);
         });
-        seek_service::run(Config { data_dir, pipe_name }, Arc::new(RealVolumes), rx).await
+        seek_service::run(
+            Config {
+                data_dir,
+                pipe_name,
+                sync: sync.then(default_sync_config),
+            },
+            Arc::new(RealVolumes),
+            rx,
+        )
+        .await
     })
 }
 
 pub(crate) fn init_file_logging(data_dir: &Path) {
     let _ = std::fs::create_dir_all(data_dir);
-    if let Ok(file) = std::fs::OpenOptions::new().create(true).append(true).open(data_dir.join("service.log")) {
+    if let Ok(file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(data_dir.join("service.log"))
+    {
         let _ = tracing_subscriber::fmt()
             .with_ansi(false)
             .with_writer(std::sync::Mutex::new(file))

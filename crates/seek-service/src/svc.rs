@@ -12,10 +12,51 @@ use windows_service::service_control_handler::{self, ServiceControlHandlerResult
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 use windows_service::{define_windows_service, service_dispatcher};
 
-use seek_service::{default_data_dir, Config, RealVolumes};
+use seek_service::{default_data_dir, default_sync_config, Config, RealVolumes, SYNC_PORT};
 
 pub const SERVICE_NAME: &str = "SeekService";
 const DISPLAY_NAME: &str = "Seek indexing service";
+const FIREWALL_RULE: &str = "Seek sync";
+
+fn netsh(args: &[&str]) -> std::io::Result<std::process::Output> {
+    std::process::Command::new("netsh").args(["advfirewall", "firewall"]).args(args).output()
+}
+
+/// Lets linked PCs reach the sync port, on private networks only. A failure is a warning: Seek still works
+/// on this PC, and Windows asks the first time the service listens.
+fn add_firewall_rule() {
+    let _ = netsh(&["delete", "rule", &format!("name={FIREWALL_RULE}")]);
+    let exe = match std::env::current_exe() {
+        Ok(p) => p.display().to_string(),
+        Err(e) => {
+            eprintln!("warning: firewall rule not added ({e})");
+            return;
+        }
+    };
+    let added = netsh(&[
+        "add",
+        "rule",
+        &format!("name={FIREWALL_RULE}"),
+        "dir=in",
+        "action=allow",
+        &format!("program={exe}"),
+        "protocol=TCP",
+        &format!("localport={SYNC_PORT}"),
+        "profile=private",
+    ]);
+    match added {
+        Ok(o) if o.status.success() => println!("firewall rule \"{FIREWALL_RULE}\" added (private networks)"),
+        Ok(o) => eprintln!(
+            "warning: firewall rule not added: {}",
+            String::from_utf8_lossy(&o.stdout).trim()
+        ),
+        Err(e) => eprintln!("warning: firewall rule not added ({e})"),
+    }
+}
+
+fn remove_firewall_rule() {
+    let _ = netsh(&["delete", "rule", &format!("name={FIREWALL_RULE}")]);
+}
 
 pub fn install() -> anyhow::Result<()> {
     let manager = ServiceManager::local_computer(
@@ -35,7 +76,10 @@ pub fn install() -> anyhow::Result<()> {
         account_password: None,
     };
     // Installing over an existing registration (upgrade, repair) updates it instead of failing.
-    let access = ServiceAccess::START | ServiceAccess::STOP | ServiceAccess::QUERY_STATUS | ServiceAccess::CHANGE_CONFIG;
+    let access = ServiceAccess::START
+        | ServiceAccess::STOP
+        | ServiceAccess::QUERY_STATUS
+        | ServiceAccess::CHANGE_CONFIG;
     let service = match manager.open_service(SERVICE_NAME, access) {
         Ok(existing) => {
             stop_and_wait(&existing)?;
@@ -45,6 +89,7 @@ pub fn install() -> anyhow::Result<()> {
         Err(_) => manager.create_service(&info, access)?,
     };
     service.set_description("Keeps Seek's file index up to date and answers searches.")?;
+    add_firewall_rule();
     service.start::<&str>(&[])?;
     println!("{SERVICE_NAME} installed and started");
     Ok(())
@@ -71,6 +116,7 @@ pub fn uninstall() -> anyhow::Result<()> {
     )?;
     stop_and_wait(&service)?;
     service.delete()?;
+    remove_firewall_rule();
     println!("{SERVICE_NAME} removed");
     Ok(())
 }
@@ -114,14 +160,26 @@ fn service_body() -> anyhow::Result<()> {
             process_id: None,
         })
     };
-    set(ServiceState::Running, ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN, 0)?;
+    set(
+        ServiceState::Running,
+        ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
+        0,
+    )?;
 
-    let cfg = Config { data_dir, pipe_name: seek_ipc::PIPE_NAME.into() };
+    let cfg = Config {
+        data_dir,
+        pipe_name: seek_ipc::PIPE_NAME.into(),
+        sync: Some(default_sync_config()),
+    };
     let rt = tokio::runtime::Runtime::new()?;
     let result = rt.block_on(seek_service::run(cfg, Arc::new(RealVolumes), rx));
     if let Err(e) = &result {
         tracing::error!("service stopped with error: {e:#}");
     }
-    set(ServiceState::Stopped, ServiceControlAccept::empty(), if result.is_ok() { 0 } else { 1 })?;
+    set(
+        ServiceState::Stopped,
+        ServiceControlAccept::empty(),
+        if result.is_ok() { 0 } else { 1 },
+    )?;
     Ok(())
 }

@@ -65,7 +65,7 @@ pub struct Device {
 }
 
 /// One file or folder as produced by a scanner, before it is packed into a `DeviceIndex`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RawEntry {
     /// NTFS file reference number (low 48 bits) or a synthetic id from the walker.
     pub id: u64,
@@ -88,7 +88,7 @@ pub struct Checkpoint {
 }
 
 /// Incremental change applied to a `DeviceIndex`, keyed by entry id.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Change {
     Upsert(RawEntry),
     Delete { id: u64 },

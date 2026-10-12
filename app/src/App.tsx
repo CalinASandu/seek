@@ -3,6 +3,7 @@ import { createApi } from "./api";
 import { ApiContext, useApi } from "./api/context";
 import type { SeekApi, ServiceState, SortKey } from "./api/types";
 import { AddShareDialog } from "./components/AddShareDialog";
+import { LinkPcDialog } from "./components/LinkPcDialog";
 import { EmptyNone, EmptyStart } from "./components/EmptyState";
 import { FilterChips } from "./components/FilterChips";
 import { ResultsTable } from "./components/ResultsTable";
@@ -16,6 +17,7 @@ import { useDevices } from "./hooks/useDevices";
 import { useHotkeys } from "./hooks/useHotkeys";
 import { useSearch } from "./hooks/useSearch";
 import { useSettings } from "./hooks/useSettings";
+import { errText, remotePcNames } from "./lib/pcs";
 import { toggleToken } from "./lib/query";
 
 const SORT_KEYS: SortKey[] = ["name", "path", "size", "modified", "device"];
@@ -47,12 +49,14 @@ function Shell() {
   const [collapsed, setCollapsed] = useState(readCollapsed);
   const [showSettings, setShowSettings] = useState(false);
   const [showShare, setShowShare] = useState(false);
+  const [showLink, setShowLink] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const scrollerRef = useRef<HTMLDivElement>(null);
   const toastTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 
-  const { devices, status, progress, refresh } = useDevices();
+  const { devices, status, progress, peers, refresh } = useDevices();
+  const remotePc = useMemo(() => remotePcNames(devices, peers), [devices, peers]);
   const { settings, update } = useSettings();
   const search = useSearch(query, sort, descending);
 
@@ -132,13 +136,16 @@ function Shell() {
       <Sidebar
         devices={devices}
         progress={progress}
+        peers={peers}
         query={query}
         collapsed={collapsed}
         onCollapse={toggleCollapsed}
         onToggleDevice={(t) => applyToken(t)}
         onAddShare={() => setShowShare(true)}
+        onLinkPc={() => setShowLink(true)}
         onOpenSettings={() => setShowSettings(true)}
         onChanged={() => void refresh()}
+        notify={notify}
       />
       <main className="main">
         <div className="main-head">
@@ -168,6 +175,7 @@ function Shell() {
               notify={notify}
               scrollerRef={scrollerRef}
               onStale={search.refresh}
+              remotePc={remotePc}
             />
           ) : null}
         </div>
@@ -181,6 +189,7 @@ function Shell() {
         status={status}
         devices={devices}
         progress={progress}
+        peers={peers}
       />
 
       {toast && (
@@ -190,8 +199,17 @@ function Shell() {
       )}
       {showShare && <AddShareDialog onClose={() => setShowShare(false)} onAdded={(n) => notify(`Added ${n}`)} />}
       {showSettings && (
-        <SettingsPanel settings={settings} version={status?.serviceVersion} onChange={update} onClose={() => setShowSettings(false)} />
+        <SettingsPanel
+          settings={settings}
+          version={status?.serviceVersion}
+          peers={peers}
+          onChange={update}
+          onSharing={(on) => void api.setSharing(on).catch((e: unknown) => notify(errText(e)))}
+          onLinkPc={() => setShowLink(true)}
+          onClose={() => setShowSettings(false)}
+        />
       )}
+      {showLink && <LinkPcDialog peers={peers} onClose={() => setShowLink(false)} onLinked={(n) => notify(`Linked with ${n}`)} />}
     </div>
   );
 }

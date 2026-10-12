@@ -11,14 +11,16 @@ use seek_core::{
     DeviceKind, DeviceState, Hit, SearchDevice, SortKey,
 };
 use seek_ipc::{
-    create_server, read_frame, write_frame, Envelope, IndexProgress, Request, Response, StatusInfo,
-    UserVolume, PROTOCOL_VERSION,
+    create_server, read_frame, write_frame, Envelope, IndexProgress, PcInfo, PcSummary, Request,
+    Response, StatusInfo, UserVolume, PROTOCOL_VERSION,
 };
+use seek_sync::peers::PeerState;
 use tokio::net::windows::named_pipe::NamedPipeServer;
 use tokio::sync::mpsc;
 
-use crate::monitor;
+use crate::peers::PeersRuntime;
 use crate::state::{now_ms, Snapshot, State};
+use crate::{access, monitor};
 
 const MAX_ROWS_PER_FETCH: u32 = 500;
 const KEPT_SEARCHES: usize = 2;
@@ -34,6 +36,10 @@ struct StoredSearch {
 struct Conn {
     generation: AtomicU64,
     searches: Mutex<VecDeque<StoredSearch>>,
+    /// The client's user SID and the folders it may not see (see `access`).
+    sid: String,
+    elevated: bool,
+    hidden: Vec<String>,
 }
 
 /// Search ids are unique across connections and service restarts (seeded from the clock), so a client
@@ -46,7 +52,10 @@ fn next_search_id() -> u64 {
     NEXT_SEARCH_ID.fetch_add(1, Ordering::SeqCst) + 1
 }
 
-pub async fn serve(state: Arc<State>, mut shutdown: tokio::sync::watch::Receiver<bool>) -> anyhow::Result<()> {
+pub async fn serve(
+    state: Arc<State>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) -> anyhow::Result<()> {
     let name = state.cfg.pipe_name.clone();
     let mut server = create_server(&name, true)?;
     tracing::info!("listening on {name}");
@@ -61,6 +70,20 @@ pub async fn serve(state: Arc<State>, mut shutdown: tokio::sync::watch::Receiver
 }
 
 async fn handle_connection(pipe: NamedPipeServer, state: Arc<State>) {
+    let caller = state.source.caller(&pipe);
+    let hidden = access::hidden_folders(&caller, state.source.profiles());
+    tracing::debug!(
+        "client {} (elevated: {}), {} folder(s) hidden",
+        caller.sid,
+        caller.elevated,
+        hidden.len()
+    );
+    let conn = Arc::new(Conn {
+        elevated: caller.elevated,
+        sid: caller.sid,
+        hidden,
+        ..Conn::default()
+    });
     let (mut rd, mut wr) = tokio::io::split(pipe);
     let (tx, mut rx) = mpsc::channel::<Envelope<Response>>(64);
     let writer = tokio::spawn(async move {
@@ -70,7 +93,6 @@ async fn handle_connection(pipe: NamedPipeServer, state: Arc<State>) {
             }
         }
     });
-    let conn = Arc::new(Conn::default());
     let mut tasks = Vec::new();
     while let Ok(Some(env)) = read_frame::<_, Envelope<Request>>(&mut rd).await {
         if env.body == Request::Subscribe {
@@ -80,7 +102,14 @@ async fn handle_connection(pipe: NamedPipeServer, state: Arc<State>) {
                 loop {
                     match events.recv().await {
                         Ok(event) => {
-                            if tx.send(Envelope { id: 0, body: Response::Event { event } }).await.is_err() {
+                            if tx
+                                .send(Envelope {
+                                    id: 0,
+                                    body: Response::Event { event },
+                                })
+                                .await
+                                .is_err()
+                            {
                                 break;
                             }
                         }
@@ -106,7 +135,9 @@ async fn handle_connection(pipe: NamedPipeServer, state: Arc<State>) {
 }
 
 fn err(message: impl Into<String>) -> Response {
-    Response::Error { message: message.into() }
+    Response::Error {
+        message: message.into(),
+    }
 }
 
 async fn handle(state: Arc<State>, conn: Arc<Conn>, req: Request) -> Response {
@@ -122,9 +153,27 @@ async fn handle(state: Arc<State>, conn: Arc<Conn>, req: Request) -> Response {
                 service_version: env!("CARGO_PKG_VERSION").into(),
             }
         }
-        Request::Search { query, sort, descending } => run_search(state, conn, query, sort, descending).await,
-        Request::FetchRows { search_id, offset, limit } => fetch_rows(state, conn, search_id, offset, limit).await,
-        Request::ListDevices => Response::Devices { devices: state.registry.read().unwrap().devices.clone() },
+        Request::Search {
+            query,
+            sort,
+            descending,
+        } => run_search(state, conn, query, sort, descending).await,
+        Request::FetchRows {
+            search_id,
+            offset,
+            limit,
+        } => fetch_rows(state, conn, search_id, offset, limit).await,
+        Request::ListDevices => Response::Devices {
+            devices: state.visible_devices(),
+        },
+        Request::RenameDevice { id, .. }
+        | Request::ForgetDevice { id }
+        | Request::RescanDevice { id }
+            if state.device(id).and_then(|d| state.remote_owner(&d)).is_some() =>
+        {
+            let owner = state.device(id).and_then(|d| state.remote_owner(&d)).unwrap_or_default();
+            err(format!("this drive belongs to {owner}"))
+        }
         Request::RenameDevice { id, name } => {
             let name = name.trim().to_string();
             if name.is_empty() {
@@ -134,47 +183,176 @@ async fn handle(state: Arc<State>, conn: Arc<Conn>, req: Request) -> Response {
                 state.invalidate();
                 Response::Ok
             } else {
-                err("unknown device")
+                err("unknown drive")
             }
         }
         Request::ForgetDevice { id } => forget(&state, id),
         Request::RescanDevice { id } => match state.device(id) {
-            None => err("unknown device"),
-            Some(d) if is_app_fed(&state, &d) => err("this device is scanned by the app (network shares are rescanned by the app)"),
+            None => err("unknown drive"),
+            Some(d) if is_app_fed(&state, &d) => {
+                err("this drive is scanned by the app (network shares are rescanned by the app)")
+            }
             Some(_) => match monitor::rescan(&state, id) {
                 Ok(()) => Response::Ok,
                 Err(e) => err(e),
             },
         },
         Request::AddNetworkShare { unc } => add_share(&state, &unc),
-        Request::PushShareIndex { device_id, data_b64 } => {
-            tokio::task::spawn_blocking(move || push_share(&state, device_id, &data_b64))
-                .await
-                .unwrap_or_else(|e| err(e.to_string()))
-        }
+        Request::PushShareIndex {
+            device_id,
+            data_b64,
+        } => tokio::task::spawn_blocking(move || push_share(&state, device_id, &data_b64))
+            .await
+            .unwrap_or_else(|e| err(e.to_string())),
         Request::AddUserVolume { volume } => add_user_volume(&state, volume),
         Request::SetShareState { device_id, online } => {
             match state.device(device_id) {
                 Some(d) if is_app_fed(&state, &d) => {}
-                Some(_) => return err("device is indexed by the service"),
-                None => return err("unknown device"),
+                Some(_) => return err("drive is indexed by the service"),
+                None => return err("unknown drive"),
             }
             let ok = state.update_device(device_id, |d| {
-                d.state = if online { DeviceState::Online } else { DeviceState::Offline };
+                d.state = if online {
+                    DeviceState::Online
+                } else {
+                    DeviceState::Offline
+                };
                 d.last_seen = now_ms();
             });
             state.invalidate();
-            if ok { Response::Ok } else { err("unknown device") }
+            if ok {
+                Response::Ok
+            } else {
+                err("unknown drive")
+            }
         }
         Request::Status => Response::Status(status(&state)),
         Request::Subscribe => Response::Ok,
+        Request::StartPairing
+        | Request::DiscoveredPcs
+        | Request::JoinPairing { .. }
+        | Request::ListPeers
+        | Request::Unlink { .. }
+        | Request::RenamePeer { .. }
+        | Request::SyncNow
+        | Request::SetSharing { .. }
+        | Request::SetDeviceShared { .. } => match state.peers_rt.get().cloned() {
+            Some(rt) => sync_request(&state, &rt, &conn, req).await,
+            None => err("sync is disabled"),
+        },
     }
 }
 
-async fn run_search(state: Arc<State>, conn: Arc<Conn>, q: String, sort: SortKey, descending: bool) -> Response {
+async fn sync_request(state: &Arc<State>, rt: &Arc<PeersRuntime>, conn: &Conn, req: Request) -> Response {
+    match req {
+        Request::StartPairing => {
+            let c = rt.start_pairing(&conn.sid);
+            Response::PairingCode {
+                code: c.code,
+                expires_ms: c.expires_ms,
+            }
+        }
+        Request::DiscoveredPcs => Response::Pcs {
+            pcs: rt
+                .discovered()
+                .into_iter()
+                .map(|d| PcInfo {
+                    host_id: d.host_id,
+                    name: d.name,
+                    addr: d.addr,
+                })
+                .collect(),
+        },
+        Request::JoinPairing { addr, code } => {
+            let code: String = code.chars().filter(|c| c.is_ascii_digit()).collect();
+            if code.len() != 6 {
+                return err("the code has 6 digits");
+            }
+            match rt.join(addr.trim(), &code, &conn.sid).await {
+                Ok(_) => Response::Ok,
+                Err(e) => err(e),
+            }
+        }
+        Request::ListPeers => peers_info(state, rt),
+        Request::Unlink { host_id } => match rt.unlink(host_id).await {
+            Ok(()) => Response::Ok,
+            Err(e) => err(e),
+        },
+        Request::RenamePeer { host_id, name } => {
+            let name = name.trim().to_string();
+            if name.is_empty() {
+                return err("name cannot be empty");
+            }
+            if state.peers.lock().unwrap().get(host_id).is_none() {
+                return err("that device is not linked");
+            }
+            rt.rename_peer(host_id, name);
+            state.invalidate();
+            Response::Ok
+        }
+        Request::SyncNow => {
+            rt.sync_now();
+            Response::Ok
+        }
+        Request::SetSharing { enabled } => {
+            rt.set_sharing(enabled);
+            Response::Ok
+        }
+        Request::SetDeviceShared { device_id, shared } => match state.device(device_id) {
+            Some(d) if state.remote_owner(&d).is_none() => {
+                rt.set_device_shared(device_id, shared);
+                Response::Ok
+            }
+            Some(_) => err("only this device's drives can be shared"),
+            None => err("unknown drive"),
+        },
+        _ => err("not a sync request"),
+    }
+}
+
+fn peers_info(state: &Arc<State>, rt: &Arc<PeersRuntime>) -> Response {
+    let peers = state.peers.lock().unwrap();
+    let last_sync = peers.file.peers.iter().map(|p| p.last_sync_ms).max().unwrap_or(0);
+    Response::Peers {
+        this_pc: PcSummary {
+            host_id: state.host_id(),
+            name: state.pc_name(),
+            online: true,
+            last_sync_ms: last_sync,
+            needs_relink: false,
+        },
+        peers: peers
+            .file
+            .peers
+            .iter()
+            .map(|p| PcSummary {
+                host_id: p.host_id,
+                name: p.name.clone(),
+                online: rt.is_connected(p.host_id),
+                last_sync_ms: p.last_sync_ms,
+                needs_relink: p.state == PeerState::NeedsRelink,
+            })
+            .collect(),
+        sharing: peers.file.sharing,
+        unshared: peers.file.unshared.clone(),
+    }
+}
+
+async fn run_search(
+    state: Arc<State>,
+    conn: Arc<Conn>,
+    q: String,
+    sort: SortKey,
+    descending: bool,
+) -> Response {
     let expr = match query::parse(&q) {
         Ok(e) => e,
-        Err(e) => return Response::SearchError { message: e.message, position: e.position },
+        Err(e) => {
+            return Response::SearchError {
+                message: e.message,
+                position: e.position,
+            }
+        }
     };
     let my_gen = conn.generation.fetch_add(1, Ordering::SeqCst) + 1;
     let c2 = conn.clone();
@@ -185,11 +363,36 @@ async fn run_search(state: Arc<State>, conn: Arc<Conn>, q: String, sort: SortKey
         let devs: Vec<SearchDevice> = snap
             .iter()
             .zip(&guards)
-            .map(|(s, g)| SearchDevice { device: &s.device, index: g, mount: &s.device.last_mount_point, online: s.online })
+            .map(|(s, g)| SearchDevice {
+                device: &s.device,
+                index: g,
+                mount: &s.device.last_mount_point,
+                online: s.online,
+                pc: &s.pc,
+            })
             .collect();
         let cancelled = || c2.generation.load(Ordering::SeqCst) != my_gen;
-        let hits = search(&devs, &expr, sort, descending, &cancelled)?;
-        let devices = snap.iter().zip(&guards).map(|(s, g)| (s.device.id, g.epoch())).collect();
+        let mut hits = search(&devs, &expr, sort, descending, &cancelled)?;
+        let masks: Vec<_> = snap
+            .iter()
+            .zip(&guards)
+            .map(|(s, g)| {
+                let hidden = state.hidden_for(&s.device, &c2.sid, c2.elevated, &c2.hidden);
+                state.hidden_mask(&s.device, g, &c2.sid, &hidden)
+            })
+            .collect();
+        if masks.iter().any(Option::is_some) {
+            hits.retain(|h| {
+                masks[h.dev as usize]
+                    .as_ref()
+                    .is_none_or(|m| !m[h.row as usize])
+            });
+        }
+        let devices = snap
+            .iter()
+            .zip(&guards)
+            .map(|(s, g)| (s.device.id, g.epoch()))
+            .collect();
         Some((hits, devices, started.elapsed().as_secs_f64() * 1000.0))
     })
     .await;
@@ -198,23 +401,42 @@ async fn run_search(state: Arc<State>, conn: Arc<Conn>, q: String, sort: SortKey
             let id = next_search_id();
             let total = hits.len() as u64;
             let mut searches = conn.searches.lock().unwrap();
-            searches.push_back(StoredSearch { id, devices, hits: Arc::new(hits) });
+            searches.push_back(StoredSearch {
+                id,
+                devices,
+                hits: Arc::new(hits),
+            });
             while searches.len() > KEPT_SEARCHES {
                 searches.pop_front();
             }
-            Response::SearchStarted { search_id: id, total, elapsed_ms }
+            Response::SearchStarted {
+                search_id: id,
+                total,
+                elapsed_ms,
+            }
         }
         Ok(None) => err("cancelled by a newer search"),
         Err(e) => err(format!("search failed: {e}")),
     }
 }
 
-async fn fetch_rows(state: Arc<State>, conn: Arc<Conn>, search_id: u64, offset: u32, limit: u32) -> Response {
+async fn fetch_rows(
+    state: Arc<State>,
+    conn: Arc<Conn>,
+    search_id: u64,
+    offset: u32,
+    limit: u32,
+) -> Response {
     let found = {
         let searches = conn.searches.lock().unwrap();
-        searches.iter().find(|s| s.id == search_id).map(|s| (s.devices.clone(), s.hits.clone()))
+        searches
+            .iter()
+            .find(|s| s.id == search_id)
+            .map(|s| (s.devices.clone(), s.hits.clone()))
     };
-    let Some((devices, hits)) = found else { return err("unknown or expired search") };
+    let Some((devices, hits)) = found else {
+        return err("unknown or expired search");
+    };
     let limit = limit.min(MAX_ROWS_PER_FETCH) as usize;
     let start = (offset as usize).min(hits.len());
     let end = (start + limit).min(hits.len());
@@ -226,40 +448,61 @@ async fn fetch_rows(state: Arc<State>, conn: Arc<Conn>, search_id: u64, offset: 
         let order: Vec<Option<usize>> = devices
             .iter()
             .map(|(id, epoch)| {
-                snap.iter().zip(&guards).position(|(s, g)| s.device.id == *id && g.epoch() == *epoch)
+                snap.iter()
+                    .zip(&guards)
+                    .position(|(s, g)| s.device.id == *id && g.epoch() == *epoch)
             })
             .collect();
         let devs: Vec<SearchDevice> = snap
             .iter()
             .zip(&guards)
-            .map(|(s, g)| SearchDevice { device: &s.device, index: g, mount: &s.device.last_mount_point, online: s.online })
+            .map(|(s, g)| SearchDevice {
+                device: &s.device,
+                index: g,
+                mount: &s.device.last_mount_point,
+                online: s.online,
+                pc: &s.pc,
+            })
             .collect();
         // All or nothing: rows are positional on the client, so a page must never have gaps.
         hits[start..end]
             .iter()
             .map(|h| {
                 let dev = (*order.get(h.dev as usize)?)?;
-                Some(materialize(&devs, Hit { dev: dev as u16, row: h.row }))
+                Some(materialize(
+                    &devs,
+                    Hit {
+                        dev: dev as u16,
+                        row: h.row,
+                    },
+                ))
             })
             .collect::<Option<Vec<_>>>()
     })
     .await;
     match rows {
-        Ok(Some(rows)) => Response::Rows { search_id, offset: start as u32, rows },
+        Ok(Some(rows)) => Response::Rows {
+            search_id,
+            offset: start as u32,
+            rows,
+        },
         Ok(None) => err("results changed; search again"),
         Err(e) => err(e.to_string()),
     }
 }
 
 fn forget(state: &Arc<State>, id: DeviceId) -> Response {
-    let Some(d) = state.device(id) else { return err("unknown device") };
+    let Some(d) = state.device(id) else {
+        return err("unknown drive");
+    };
     if matches!(d.state, DeviceState::Online | DeviceState::Scanning) {
-        return err("only offline devices can be forgotten");
+        return err("only offline drives can be forgotten");
     }
     state.registry.write().unwrap().remove(id);
     state.indexes.write().unwrap().remove(&id);
     state.dirty.lock().unwrap().remove(&id);
     let _ = std::fs::remove_file(state.index_path(id));
+    state.remove_journal(id);
     state.save_registry();
     state.emit(seek_ipc::Event::DevicesChanged);
     state.invalidate();
@@ -273,7 +516,12 @@ fn add_share(state: &Arc<State>, unc: &str) -> Response {
         return err("expected a share path like \\\\server\\share");
     }
     let identity = DeviceIdentity::Share { unc: unc.clone() };
-    if let Some(d) = state.registry.read().unwrap().find_by_identity(&identity) {
+    if let Some(d) = state
+        .registry
+        .read()
+        .unwrap()
+        .find_own_by_identity(&identity)
+    {
         return Response::Device { device: d.clone() };
     }
     let now = now_ms();
@@ -310,7 +558,12 @@ fn add_user_volume(state: &Arc<State>, v: UserVolume) -> Response {
     if !matches!(v.identity, DeviceIdentity::Volume { .. }) {
         return err("expected a volume identity");
     }
-    let seen_by_service = state.mounted.lock().unwrap().values().any(|m| m.identity == v.identity);
+    let seen_by_service = state
+        .mounted
+        .lock()
+        .unwrap()
+        .values()
+        .any(|m| m.identity == v.identity);
     if seen_by_service {
         return Response::Ok;
     }
@@ -323,7 +576,12 @@ fn add_user_volume(state: &Arc<State>, v: UserVolume) -> Response {
         total_bytes: v.total_bytes,
         free_bytes: v.free_bytes,
     };
-    let existing = state.registry.read().unwrap().find_by_identity(&v.identity).map(|d| d.id);
+    let existing = state
+        .registry
+        .read()
+        .unwrap()
+        .find_own_by_identity(&v.identity)
+        .map(|d| d.id);
     let id = existing.unwrap_or_else(|| monitor::register_volume(state, &info));
     state.user_volumes.lock().unwrap().insert(id);
     state.update_device(id, |d| {
@@ -337,15 +595,15 @@ fn add_user_volume(state: &Arc<State>, v: UserVolume) -> Response {
     });
     match state.device(id) {
         Some(device) => Response::Device { device },
-        None => err("unknown device"),
+        None => err("unknown drive"),
     }
 }
 
 fn push_share(state: &Arc<State>, id: DeviceId, data_b64: &str) -> Response {
     match state.device(id) {
         Some(d) if is_app_fed(state, &d) => {}
-        Some(_) => return err("device is indexed by the service"),
-        None => return err("unknown device"),
+        Some(_) => return err("drive is indexed by the service"),
+        None => return err("unknown drive"),
     }
     let bytes = match base64::engine::general_purpose::STANDARD.decode(data_b64) {
         Ok(b) => b,
@@ -356,7 +614,7 @@ fn push_share(state: &Arc<State>, id: DeviceId, data_b64: &str) -> Response {
         Err(e) => return err(format!("bad index: {e}")),
     };
     let count = ix.live_count() as u64;
-    state.indexes.write().unwrap().insert(id, Arc::new(std::sync::RwLock::new(ix)));
+    state.replace_index(id, ix);
     state.mark_dirty(id);
     state.save_index(id);
     state.update_device(id, |d| {
@@ -371,19 +629,26 @@ fn push_share(state: &Arc<State>, id: DeviceId, data_b64: &str) -> Response {
 }
 
 fn status(state: &Arc<State>) -> StatusInfo {
-    let reg = state.registry.read().unwrap();
-    let online = reg.devices.iter().filter(|d| matches!(d.state, DeviceState::Online | DeviceState::Scanning)).count();
+    let devices = state.visible_devices();
+    let online = devices
+        .iter()
+        .filter(|d| matches!(d.state, DeviceState::Online | DeviceState::Scanning))
+        .count();
     StatusInfo {
         service_version: env!("CARGO_PKG_VERSION").into(),
-        total_entries: reg.devices.iter().map(|d| d.entry_count).sum(),
+        total_entries: devices.iter().map(|d| d.entry_count).sum(),
         devices_online: online as u32,
-        devices_offline: (reg.devices.len() - online) as u32,
+        devices_offline: (devices.len() - online) as u32,
         indexing: state
             .scanning
             .lock()
             .unwrap()
             .iter()
-            .map(|(id, n)| IndexProgress { device_id: *id, scanned: *n, done: false })
+            .map(|(id, n)| IndexProgress {
+                device_id: *id,
+                scanned: *n,
+                done: false,
+            })
             .collect(),
     }
 }

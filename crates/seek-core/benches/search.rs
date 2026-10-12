@@ -39,6 +39,7 @@ fn bench(c: &mut Criterion) {
         index: &index,
         mount: "C:\\",
         online: true,
+        pc: "",
     }];
     let mut group = c.benchmark_group("search_10M");
     group.sample_size(10);

@@ -20,6 +20,15 @@ export function createTauriApi(): SeekApi {
     installService: () => invoke("install_service"),
     getSettings: () => invoke("get_settings"),
     setSettings: (settings) => invoke("set_settings", { settings }),
+    startPairing: () => invoke("start_pairing"),
+    discoveredPcs: () => invoke("discovered_pcs"),
+    joinPairing: (addr, code) => invoke("join_pairing", { addr, code }),
+    listPeers: () => invoke("list_peers"),
+    unlink: (hostId) => invoke("unlink", { hostId }),
+    renamePeer: (hostId, name) => invoke("rename_peer", { hostId, name }),
+    syncNow: () => invoke("sync_now"),
+    setSharing: (enabled) => invoke("set_sharing", { enabled }),
+    setDeviceShared: (deviceId, shared) => invoke("set_device_shared", { deviceId, shared }),
     onEvent(cb) {
       let disposed = false;
       let unlisten: (() => void) | null = null;

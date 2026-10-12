@@ -82,6 +82,67 @@ fn deep_and_wide_tree_keeps_every_parent_link() {
     assert_eq!(r.skipped, 0);
 }
 
+/// Every live entry as (relative path, size, is folder), sorted.
+fn snapshot(ix: &DeviceIndex) -> Vec<(String, u64, bool)> {
+    let mut v: Vec<_> = (0..ix.len() as u32)
+        .filter(|&r| ix.is_alive(r))
+        .map(|r| (rel_path(ix, r), ix.size(r), ix.is_dir(r)))
+        .collect();
+    v.sort();
+    v
+}
+
+#[test]
+fn rescanning_changed_folders_matches_a_full_walk() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let mount = root.to_string_lossy().to_string();
+    std::fs::create_dir_all(root.join("a/b")).unwrap();
+    std::fs::write(root.join("a/b/c.txt"), b"c").unwrap();
+    std::fs::write(root.join("a/keep.txt"), b"1").unwrap();
+    std::fs::create_dir_all(root.join("x")).unwrap();
+    std::fs::write(root.join("x/old.txt"), b"old").unwrap();
+    std::fs::write(root.join("x/flip"), b"file for now").unwrap();
+    std::fs::create_dir_all(root.join("untouched/deep")).unwrap();
+    std::fs::write(root.join("untouched/deep/u.txt"), b"u").unwrap();
+    let mut ix = scan_walk(root, &|_| {}).unwrap().index;
+    let x_id = ix.id(ix.find_folders(&mount, &[&format!("{mount}\\x")])[0].unwrap());
+    let u_id = ix.id((0..ix.len() as u32).find(|&r| ix.name(r) == "u.txt").unwrap());
+
+    std::fs::write(root.join("a/new.txt"), b"new").unwrap();
+    std::fs::write(root.join("a/keep.txt"), b"longer now").unwrap();
+    std::fs::rename(root.join("a/b"), root.join("a/B2")).unwrap();
+    std::fs::remove_file(root.join("x/old.txt")).unwrap();
+    std::fs::remove_file(root.join("x/flip")).unwrap();
+    std::fs::create_dir_all(root.join("x/flip/inner")).unwrap();
+    std::fs::create_dir_all(root.join("n/m")).unwrap();
+    std::fs::write(root.join("n/m/deep.txt"), b"deep").unwrap();
+
+    // What the watcher reports: the folders listing each changed path (n/m is not indexed yet).
+    let dirs: Vec<std::path::PathBuf> =
+        [root.to_path_buf(), root.join("a"), root.join("x"), root.join("n").join("m")].into();
+    let changes = seek_scan::rescan_dirs(&ix, &mount, &dirs).unwrap();
+    ix.apply(&changes);
+
+    let fresh = scan_walk(root, &|_| {}).unwrap().index;
+    assert_eq!(snapshot(&ix), snapshot(&fresh));
+    assert!(ix.row_of(x_id).is_some(), "unchanged folders keep their id");
+    assert!(ix.row_of(u_id).is_some(), "folders that were not listed are untouched");
+
+    // Nothing changed since: a second pass at most refreshes folder timestamps (NTFS updates a new
+    // folder's time in its parent's listing lazily), never adds or removes anything.
+    let again = seek_scan::rescan_dirs(&ix, &mount, &dirs).unwrap();
+    for c in &again {
+        match c {
+            seek_core::Change::Upsert(e) => {
+                let row = ix.row_of(e.id).expect("no new entries");
+                assert!(ix.is_dir(row) && ix.name(row) == e.name && ix.size(row) == e.size, "{c:?}");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+}
+
 #[test]
 fn missing_root_is_not_found() {
     let dir = tempfile::tempdir().unwrap();

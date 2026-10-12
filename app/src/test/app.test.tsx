@@ -126,4 +126,74 @@ describe("Seek app", () => {
     fireEvent.keyDown(window, { key: "F5" });
     await waitFor(() => expect(search.mock.calls.length).toBe(calls + 2));
   });
+
+  it("groups the sidebar by device: this device first, then the linked Laptop with its drives", async () => {
+    render(<App api={makeApi()} />);
+    const laptop = await screen.findByRole("group", { name: "Laptop" });
+    expect(within(laptop).getByRole("button", { name: /Laptop SSD \(C:\), online/ })).toBeInTheDocument();
+    expect(within(laptop).getByRole("button", { name: /Travel stick, offline/ })).toBeInTheDocument();
+    const desktop = screen.getByRole("group", { name: "DESKTOP" });
+    expect(within(desktop).getByText("This device")).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Devices" })).toBeInTheDocument();
+    expect(within(desktop).queryByRole("button", { name: /Laptop SSD/ })).toBeNull();
+    expect(screen.getByRole("button", { name: "Sync now" })).toBeInTheDocument();
+    expect(await screen.findByText(/2 devices/)).toBeInTheDocument();
+  });
+
+  it("shows a pairing code in the Link a device dialog (sidebar button)", async () => {
+    const user = userEvent.setup();
+    render(<App api={makeApi()} />);
+    await user.click(await screen.findByRole("button", { name: "Link a device" }));
+    const dialog = await screen.findByRole("dialog", { name: "Link a device" });
+    expect(await within(dialog).findByText("482 913")).toBeInTheDocument();
+    expect(within(dialog).getByText(/Valid for [12]:\d\d · works once/)).toBeInTheDocument();
+  });
+
+  it("links with a discovered PC by entering its code", async () => {
+    const base = makeApi();
+    const joinPairing = vi.fn(base.joinPairing);
+    const user = userEvent.setup();
+    render(<App api={{ ...base, joinPairing }} />);
+    await user.click(await screen.findByRole("button", { name: "Settings" }));
+    const settings = await screen.findByRole("dialog", { name: "Settings" });
+    await user.click(within(settings).getByRole("button", { name: /Link a device/ }));
+    const dialog = await screen.findByRole("dialog", { name: "Link a device" });
+    await user.click(within(dialog).getByRole("tab", { name: "Enter a code" }));
+    await user.click(await within(dialog).findByRole("button", { name: /Office-PC/ }));
+    const link = within(dialog).getByRole("button", { name: "Link" });
+    await user.type(within(dialog).getByLabelText("6-digit code"), "111111");
+    await user.click(link);
+    expect(await within(dialog).findByRole("alert")).toHaveTextContent("wrong code");
+    await user.clear(within(dialog).getByLabelText("6-digit code"));
+    await user.type(within(dialog).getByLabelText("6-digit code"), "482 913");
+    await user.click(link);
+    await waitFor(() => expect(joinPairing).toHaveBeenLastCalledWith("192.168.1.23:47321", "482913"));
+    expect(await within(dialog).findByText("Linked with Office-PC")).toBeInTheDocument();
+  });
+
+  it("calls them drives and still offers Link a device when no other device is linked", async () => {
+    const base = makeApi();
+    render(<App api={{ ...base, listPeers: async () => ({ ...(await base.listPeers()), peers: [] }) }} />);
+    expect(await screen.findByRole("heading", { name: "Drives" })).toBeInTheDocument();
+    expect(screen.queryByRole("group", { name: "Laptop" })).toBeNull();
+    expect(await screen.findByRole("button", { name: "Link a device" })).toBeEnabled();
+  });
+
+  it("names the PC in remote rows and disables Open for them", async () => {
+    const user = userEvent.setup();
+    render(<App api={makeApi()} />);
+    await user.type(await screen.findByRole("searchbox"), "pc:laptop online:");
+    const grid = await screen.findByRole("grid");
+    const first = await waitFor(() => {
+      const row = within(grid).getAllByRole("row").slice(1).find((r) => within(r).queryByText(/^Laptop › /));
+      expect(row).toBeTruthy();
+      return row as HTMLElement;
+    });
+    fireEvent.contextMenu(first);
+    const menu = await screen.findByRole("menu");
+    const open = within(menu).getByRole("menuitem", { name: /^Open(?! containing)/ });
+    expect(open).toBeDisabled();
+    expect(open).toHaveAttribute("title", "On Laptop — not on this device");
+    expect(within(menu).getByRole("menuitem", { name: /Copy path/ })).toBeEnabled();
+  });
 });

@@ -27,7 +27,7 @@ const COLS: Col[] = [
   { key: "path", label: "Folder", min: 140, weight: 5 },
   { key: "size", label: "Size", min: 70, fixed: 88, align: "right" },
   { key: "modified", label: "Modified", min: 90, fixed: 120 },
-  { key: "device", label: "Device", min: 190, weight: 4 },
+  { key: "device", label: "Drive", min: 190, weight: 4 },
 ];
 
 type Widths = Partial<Record<ColKey, number>>;
@@ -53,7 +53,11 @@ interface Props {
   scrollerRef?: React.RefObject<HTMLDivElement | null>;
   /** The service can no longer serve these rows (index renumbered): re-run the search. */
   onStale?: () => void;
+  /** Device id → linked PC name, for rows whose files live on another PC (they cannot be opened here). */
+  remotePc?: Map<string, string>;
 }
+
+const NO_REMOTE = new Map<string, string>();
 
 function Highlighted({ name, terms }: { name: string; terms: string[] }) {
   return (
@@ -81,7 +85,18 @@ function FolderCell({ folder }: { folder: string }) {
   );
 }
 
-export function ResultsTable({ searchId, total, query, sort, descending, onSort, notify, scrollerRef, onStale }: Props) {
+export function ResultsTable({
+  searchId,
+  total,
+  query,
+  sort,
+  descending,
+  onSort,
+  notify,
+  scrollerRef,
+  onStale,
+  remotePc = NO_REMOTE,
+}: Props) {
   const api = useApi();
   const innerRef = useRef<HTMLDivElement>(null);
   const scroller = scrollerRef ?? innerRef;
@@ -150,15 +165,17 @@ export function ResultsTable({ searchId, total, query, sort, descending, onSort,
     },
     [notify],
   );
+  /** On this device and connected: the path can be opened here. */
+  const openable = useCallback((r: ResultRow) => r.online && !remotePc.has(r.deviceId), [remotePc]);
   const open = useCallback(() => {
-    const rows = selectedRows().filter((r) => r.online);
+    const rows = selectedRows().filter(openable);
     rows.forEach((r) => void api.openPath(r.fullPath));
-  }, [api, selectedRows]);
+  }, [api, selectedRows, openable]);
   const reveal = useCallback(() => {
     selectedRows()
-      .filter((r) => r.online)
+      .filter(openable)
       .forEach((r) => void api.revealPath(r.fullPath));
-  }, [api, selectedRows]);
+  }, [api, selectedRows, openable]);
   const copyPaths = useCallback(() => {
     const rows = selectedRows();
     void copy(rows.map((r) => r.fullPath).join("\n"), rows.length > 1 ? `${rows.length} paths copied` : "Path copied");
@@ -233,11 +250,13 @@ export function ResultsTable({ searchId, total, query, sort, descending, onSort,
 
   const menuItems = (): MenuItem[] => {
     const rows = selectedRows();
+    const remote = rows.map((r) => remotePc.get(r.deviceId)).find((pc) => pc !== undefined);
     const anyOffline = rows.some((r) => !r.online);
-    const why = anyOffline ? "The device is offline" : undefined;
+    const why = remote ? `On ${remote} — not on this device` : anyOffline ? "The drive is offline" : undefined;
+    const blocked = !!remote || anyOffline || rows.length === 0;
     return [
-      { id: "open", label: "Open", icon: <ExternalLink size={14} />, shortcut: "Enter", disabled: anyOffline || rows.length === 0, title: why, onSelect: open },
-      { id: "reveal", label: "Open containing folder", icon: <FolderOpen size={14} />, shortcut: "Ctrl+Enter", disabled: anyOffline || rows.length === 0, title: why, onSelect: reveal },
+      { id: "open", label: "Open", icon: <ExternalLink size={14} />, shortcut: "Enter", disabled: blocked, title: why, onSelect: open },
+      { id: "reveal", label: "Open containing folder", icon: <FolderOpen size={14} />, shortcut: "Ctrl+Enter", disabled: blocked, title: why, onSelect: reveal },
       { id: "copyPath", label: rows.length > 1 ? "Copy paths" : "Copy path", icon: <ClipboardCopy size={14} />, shortcut: "Ctrl+C", separatorBefore: true, onSelect: copyPaths },
       { id: "copyName", label: rows.length > 1 ? "Copy names" : "Copy name", icon: <Type size={14} />, shortcut: "Ctrl+Shift+C", onSelect: copyNames },
     ];
@@ -304,7 +323,7 @@ export function ResultsTable({ searchId, total, query, sort, descending, onSort,
                 className={`tr${sel ? " is-selected" : ""}${v.index === focus ? " is-focus" : ""}${row && !row.online ? " is-offline" : ""}`}
                 style={{ gridTemplateColumns: template, transform: `translateY(${v.start}px)` }}
                 onClick={(e) => onRowClick(v.index, e)}
-                onDoubleClick={() => row?.online && void api.openPath(row.fullPath)}
+                onDoubleClick={() => row && openable(row) && void api.openPath(row.fullPath)}
                 onContextMenu={(e) => onRowContext(v.index, e)}
               >
                 {row ? (
@@ -327,7 +346,9 @@ export function ResultsTable({ searchId, total, query, sort, descending, onSort,
                     </div>
                     <div role="gridcell" className="td td-device">
                       <span className={`dot dot-${row.online ? "online" : "offline"}`} aria-hidden="true" />
-                      <span className="device-cell-name">{row.deviceName}</span>
+                      <span className="device-cell-name" title={remotePc.has(row.deviceId) ? `On ${remotePc.get(row.deviceId)}` : undefined}>
+                        {remotePc.has(row.deviceId) ? `${remotePc.get(row.deviceId)} › ${row.deviceName}` : row.deviceName}
+                      </span>
                       {!row.online && <span className="pill">offline</span>}
                     </div>
                   </>

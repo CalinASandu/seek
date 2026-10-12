@@ -36,7 +36,7 @@ export function ServiceSetup({ state }: { state: Exclude<ServiceState, "connecte
         <h1 id="setup-title">{failed ? "The Seek service isn't responding" : "Set up Seek"}</h1>
         <p>
           {failed
-            ? "Seek can't reach its background service. Reinstalling restarts it and keeps your saved devices."
+            ? "Seek can't reach its background service. Reinstalling restarts it and keeps your saved drives."
             : "Seek keeps a live index of your drives through a small background service, so searches stay instant."}
         </p>
         <div className="setup-note">

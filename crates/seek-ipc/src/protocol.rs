@@ -39,6 +39,21 @@ pub enum Request {
     Status,
     /// Switches the connection into an event stream of [`Response::Event`].
     Subscribe,
+    /// Shows a 6-digit code another PC can type to link with this one (replaces any previous code).
+    StartPairing,
+    /// Seek PCs seen on the local network that are not linked yet.
+    DiscoveredPcs,
+    /// Links with the PC at `addr` (`ip:port`) that shows `code`.
+    JoinPairing { addr: String, code: String },
+    ListPeers,
+    /// Removes the link with a PC on both sides, and everything copied from it.
+    Unlink { host_id: uuid::Uuid },
+    RenamePeer { host_id: uuid::Uuid, name: String },
+    /// Pushes changes to every linked PC now and asks them to do the same.
+    SyncNow,
+    /// "Share this PC's files with linked PCs".
+    SetSharing { enabled: bool },
+    SetDeviceShared { device_id: DeviceId, shared: bool },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -55,6 +70,31 @@ pub enum Response {
     Error { message: String },
     Status(StatusInfo),
     Event { event: Event },
+    PairingCode { code: String, expires_ms: i64 },
+    Pcs { pcs: Vec<PcInfo> },
+    Peers { this_pc: PcSummary, peers: Vec<PcSummary>, sharing: bool, unshared: Vec<DeviceId> },
+}
+
+/// A Seek PC on the local network.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PcInfo {
+    pub host_id: uuid::Uuid,
+    pub name: String,
+    pub addr: String,
+}
+
+/// This PC or a linked one.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PcSummary {
+    pub host_id: uuid::Uuid,
+    pub name: String,
+    pub online: bool,
+    /// Unix ms of the last update exchanged with this PC; 0 = never.
+    pub last_sync_ms: i64,
+    /// The PC came back with a different identity (reinstalled) and must be linked again.
+    pub needs_relink: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -94,6 +134,8 @@ pub enum Event {
     DevicesChanged,
     ResultsInvalidated,
     IndexProgress { device_id: DeviceId, scanned: u64, done: bool },
+    /// Linked PCs changed (linked, unlinked, connected, synced).
+    PeersChanged,
 }
 
 #[cfg(test)]
@@ -113,5 +155,15 @@ mod tests {
         assert_eq!(serde_json::to_string(&e).unwrap(), r#"{"type":"event","event":{"type":"resultsInvalidated"}}"#);
         let s = Response::SearchStarted { search_id: 3, total: 10, elapsed_ms: 1.5 };
         assert_eq!(serde_json::to_string(&s).unwrap(), r#"{"type":"searchStarted","searchId":3,"total":10,"elapsedMs":1.5}"#);
+        let j = Request::JoinPairing { addr: "1.2.3.4:47321".into(), code: "123456".into() };
+        assert_eq!(serde_json::to_string(&j).unwrap(), r#"{"type":"joinPairing","addr":"1.2.3.4:47321","code":"123456"}"#);
+        let pc = PcSummary { host_id: uuid::Uuid::nil(), name: "A".into(), online: true, last_sync_ms: 5, needs_relink: false };
+        let p = Response::Peers { this_pc: pc.clone(), peers: vec![pc], sharing: true, unshared: vec![] };
+        let js = serde_json::to_string(&p).unwrap();
+        assert!(js.starts_with(r#"{"type":"peers","thisPc":{"hostId":"#), "{js}");
+        assert!(js.contains(r#""lastSyncMs":5,"needsRelink":false"#), "{js}");
+        assert_eq!(serde_json::from_str::<Response>(&js).unwrap(), p);
+        let e = Response::Event { event: Event::PeersChanged };
+        assert_eq!(serde_json::to_string(&e).unwrap(), r#"{"type":"event","event":{"type":"peersChanged"}}"#);
     }
 }

@@ -104,6 +104,15 @@ pub fn run() {
             commands::install_service,
             commands::get_settings,
             commands::set_settings,
+            commands::start_pairing,
+            commands::discovered_pcs,
+            commands::join_pairing,
+            commands::list_peers,
+            commands::unlink,
+            commands::rename_peer,
+            commands::sync_now,
+            commands::set_sharing,
+            commands::set_device_shared,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Seek");

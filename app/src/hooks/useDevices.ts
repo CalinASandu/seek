@@ -1,12 +1,22 @@
 import { useCallback, useEffect, useState } from "react";
 import { useApi } from "../api/context";
-import type { Device, Status } from "../api/types";
+import type { Device, Peers, Status } from "../api/types";
 
 export function useDevices() {
   const api = useApi();
   const [devices, setDevices] = useState<Device[]>([]);
   const [status, setStatus] = useState<Status | null>(null);
   const [progress, setProgress] = useState<Record<string, number>>({});
+  /** `null` while unknown or when the service has sync turned off. */
+  const [peers, setPeers] = useState<Peers | null>(null);
+
+  const refreshPeers = useCallback(async () => {
+    try {
+      setPeers(await api.listPeers());
+    } catch {
+      setPeers(null);
+    }
+  }, [api]);
 
   const refresh = useCallback(async () => {
     try {
@@ -25,14 +35,19 @@ export function useDevices() {
 
   useEffect(() => {
     void refresh();
+    void refreshPeers();
     return api.onEvent((e) => {
       if (e.type === "devicesChanged") void refresh();
+      else if (e.type === "peersChanged") void refreshPeers();
       else if (e.type === "indexProgress") {
         setProgress((p) => ({ ...p, [e.deviceId]: e.scanned }));
         if (e.done) void refresh();
-      } else if (e.type === "serviceState" && e.state === "connected") void refresh();
+      } else if (e.type === "serviceState" && e.state === "connected") {
+        void refresh();
+        void refreshPeers();
+      }
     });
-  }, [api, refresh]);
+  }, [api, refresh, refreshPeers]);
 
-  return { devices, status, progress, refresh };
+  return { devices, status, progress, peers, refresh, refreshPeers };
 }

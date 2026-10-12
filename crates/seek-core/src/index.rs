@@ -36,6 +36,7 @@ fn next_epoch() -> u64 {
     NEXT_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
+#[derive(Clone)]
 pub struct DeviceIndex {
     pub(crate) ids: Vec<u64>,
     pub(crate) parents: Vec<u32>,
@@ -417,6 +418,95 @@ impl DeviceIndex {
         s
     }
 
+    /// Largest id ever used in this index (`root_id` when empty): ids above it are free.
+    pub fn max_id(&self) -> u64 {
+        self.ids.iter().copied().fold(self.root_id, u64::max)
+    }
+
+    /// Finds live folders by full path (as `full_path(row, mount)` builds it), ignoring case and trailing
+    /// backslashes. One pass over the folders for all `paths`; the result is parallel to `paths`. The
+    /// mount itself is not a row, so it is never found.
+    pub fn find_folders(&self, mount: &str, paths: &[&str]) -> Vec<Option<u32>> {
+        let mut by_name: HashMap<String, Vec<usize>> = HashMap::new();
+        let wanted: Vec<String> = paths.iter().map(|p| p.trim_end_matches('\\').to_lowercase()).collect();
+        for (i, p) in wanted.iter().enumerate() {
+            if let Some((_, last)) = p.rsplit_once('\\') {
+                if !last.is_empty() {
+                    by_name.entry(last.to_string()).or_default().push(i);
+                }
+            }
+        }
+        let mut found = vec![None; paths.len()];
+        if by_name.is_empty() {
+            return found;
+        }
+        for row in 0..self.len() as u32 {
+            if !self.alive[row as usize] || !self.is_dir(row) {
+                continue;
+            }
+            let Some(candidates) = by_name.get(self.name_lower(row)) else { continue };
+            let full = self.full_path(row, mount).to_lowercase();
+            for &i in candidates {
+                if found[i].is_none() && wanted[i] == full {
+                    found[i] = Some(row);
+                }
+            }
+        }
+        found
+    }
+
+    /// Live direct children of each row in `parents` (`NO_PARENT` = top-level entries), in one pass.
+    pub fn children_of(&self, parents: &std::collections::HashSet<u32>) -> HashMap<u32, Vec<u32>> {
+        let mut out: HashMap<u32, Vec<u32>> = parents.iter().map(|&p| (p, Vec::new())).collect();
+        for (row, p) in self.parents.iter().enumerate() {
+            if self.alive[row] {
+                if let Some(v) = out.get_mut(p) {
+                    v.push(row as u32);
+                }
+            }
+        }
+        out
+    }
+
+    /// `mask[row]` is true for every row in `roots` and every row below one of them. O(rows), memoised.
+    pub fn subtree_mask(&self, roots: &[u32]) -> Vec<bool> {
+        const IN: u8 = 1;
+        const OUT: u8 = 2;
+        let n = self.len();
+        let mut state = vec![0u8; n];
+        for &r in roots {
+            if (r as usize) < n {
+                state[r as usize] = IN;
+            }
+        }
+        let mut chain: Vec<u32> = Vec::new();
+        for start in 0..n {
+            if state[start] != 0 {
+                continue;
+            }
+            chain.clear();
+            let mut cur = start as u32;
+            let verdict = loop {
+                let c = cur as usize;
+                if state[c] != 0 {
+                    break state[c];
+                }
+                if chain.len() > MAX_DEPTH {
+                    break OUT;
+                }
+                chain.push(cur);
+                match self.parents[c] {
+                    NO_PARENT => break OUT,
+                    p => cur = p,
+                }
+            };
+            for &r in &chain {
+                state[r as usize] = verdict;
+            }
+        }
+        state.into_iter().map(|s| s == IN).collect()
+    }
+
     /// Byte range of the lower-case arena covering rows `start..end`, when their names are laid out in
     /// row order (true after a build/compact; renames break it).
     pub(crate) fn lower_span(&self, start: u32, end: u32) -> Option<(usize, usize)> {
@@ -761,6 +851,26 @@ mod tests {
         // deleting a file never touches anything else
         ix.apply(&[Change::Delete { id: 9 }]);
         assert_eq!(ix.live_count(), 1);
+    }
+
+    #[test]
+    fn folder_lookup_children_and_subtree_mask() {
+        let ix = sample();
+        let found = ix.find_folders("C:\\", &[r"c:\users\ME\", r"C:\Users", r"C:\", r"C:\Users\Nobody"]);
+        assert_eq!(found, vec![ix.row_of(11), ix.row_of(10), None, None]);
+        assert_eq!(ix.max_id(), 13, "dropped entries never became rows");
+
+        let me = ix.row_of(11).unwrap();
+        let kids = ix.children_of(&[me, NO_PARENT].into_iter().collect());
+        let mut mine: Vec<u64> = kids[&me].iter().map(|&r| ix.id(r)).collect();
+        mine.sort();
+        assert_eq!(mine, vec![12, 13]);
+        assert_eq!(kids[&NO_PARENT].iter().map(|&r| ix.id(r)).collect::<Vec<_>>(), vec![10]);
+
+        let mask = ix.subtree_mask(&[me]);
+        let hidden: Vec<u64> = (0..ix.len() as u32).filter(|&r| mask[r as usize]).map(|r| ix.id(r)).collect();
+        assert_eq!(hidden.len(), 3);
+        assert!(!mask[ix.row_of(10).unwrap() as usize]);
     }
 
     #[test]

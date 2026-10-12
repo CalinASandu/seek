@@ -37,8 +37,12 @@ pub enum Term {
         min: Option<i64>,
         max: Option<i64>,
     },
-    /// Lowercased substring of the device display name.
+    /// Lowercased substring of the drive's display name or of the device (PC) it belongs to.
     Device(String),
+    /// Lowercased substring of the drive's display name only.
+    Drive(String),
+    /// Lowercased substring of the name of the PC a device belongs to.
+    Pc(String),
     FoldersOnly,
     FilesOnly,
     OnlineOnly,
@@ -225,6 +229,8 @@ impl Parser {
                     | "path"
                     | "regex"
                     | "device"
+                    | "drive"
+                    | "pc"
                     | "folder"
                     | "file"
                     | "online"
@@ -285,6 +291,18 @@ impl Parser {
                     return err("device: needs a name", start);
                 }
                 t(Term::Device(value.to_lowercase()))
+            }
+            "drive" => {
+                if value.is_empty() {
+                    return err("drive: needs a name", start);
+                }
+                t(Term::Drive(value.to_lowercase()))
+            }
+            "pc" => {
+                if value.is_empty() {
+                    return err("pc: needs a name", start);
+                }
+                t(Term::Pc(value.to_lowercase()))
             }
             "path" => {
                 if !value.is_empty() {
@@ -654,4 +672,18 @@ mod tests {
             let _ = parse_at(&s, now());
         }
     }
+
+    #[test]
+    fn pc_term() {
+        let e = parse("pc:laptop report").unwrap();
+        match e {
+            Expr::And(v) => {
+                assert_eq!(v[0], Expr::Term(Term::Pc("laptop".into())));
+                assert!(matches!(v[1], Expr::Term(Term::Text { .. })));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(parse("pc:").unwrap_err().message, "pc: needs a name");
+    }
+
 }

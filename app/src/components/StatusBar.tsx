@@ -1,5 +1,6 @@
-import type { Device, Status } from "../api/types";
-import { formatCount, formatInt } from "../lib/format";
+import type { Device, Peers, Status } from "../api/types";
+import { formatCount, formatInt, formatRelative } from "../lib/format";
+import { hasPeers, lastSync } from "../lib/pcs";
 
 interface Props {
   total: number | null;
@@ -11,9 +12,10 @@ interface Props {
   status: Status | null;
   devices: Device[];
   progress: Record<string, number>;
+  peers?: Peers | null;
 }
 
-export function StatusBar({ total, elapsedMs, loading, stale, onRefresh, status, devices, progress }: Props) {
+export function StatusBar({ total, elapsedMs, loading, stale, onRefresh, status, devices, progress, peers = null }: Props) {
   const scanning = devices.filter((d) => d.state === "scanning");
   const first = scanning[0];
   return (
@@ -40,6 +42,21 @@ export function StatusBar({ total, elapsedMs, loading, stale, onRefresh, status,
         <span className="status-gap" />
         <span className="dot dot-offline" /> {status?.devicesOffline ?? 0} offline
       </span>
+      {hasPeers(peers) && (
+        <>
+          <span className="status-sep" />
+          <span
+            className="status-seg"
+            title={peers.peers.map((pc) => `${pc.name}: ${pc.online ? "connected" : "offline"}`).join(", ")}
+          >
+            {peers.peers.length + 1} devices
+            <span className="status-muted">
+              {" "}
+              · {lastSync(peers.peers) ? `synced ${formatRelative(lastSync(peers.peers))}` : "not synced yet"}
+            </span>
+          </span>
+        </>
+      )}
       <span className="status-fill" />
       {first && (
         <span className="status-seg status-index">

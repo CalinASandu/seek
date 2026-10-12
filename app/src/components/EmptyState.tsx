@@ -22,7 +22,7 @@ export function EmptyStart({ totalEntries, devices, onPick }: StartProps) {
         <Search size={26} />
       </div>
       <h1 className="empty-title">
-        Search across {formatCount(totalEntries)} files on {devices} {devices === 1 ? "device" : "devices"}
+        Search across {formatCount(totalEntries)} files on {devices} {devices === 1 ? "drive" : "drives"}
       </h1>
       <p className="empty-sub">Start typing. Results update as you type, including drives that are unplugged.</p>
       <ul className="examples" aria-label="Search examples">

@@ -99,6 +99,8 @@ enum Leaf {
     Size { min: u64, max: u64 },
     Modified { min: i64, max: i64 },
     Device(String),
+    Drive(String),
+    Pc(String),
     Folders,
     Files,
     Online,
@@ -134,6 +136,7 @@ pub struct Scratch {
     path_lower: String,
     path_ready: bool,
     pub dev_lower: String,
+    pub pc_lower: String,
 }
 
 pub struct Matcher {
@@ -171,6 +174,8 @@ fn compile_term(t: &Term) -> Node {
             max: max.unwrap_or(i64::MAX),
         },
         Term::Device(n) => Leaf::Device(n.clone()),
+        Term::Drive(n) => Leaf::Drive(n.clone()),
+        Term::Pc(n) => Leaf::Pc(n.clone()),
         Term::FoldersOnly => Leaf::Folders,
         Term::FilesOnly => Leaf::Files,
         Term::OnlineOnly => Leaf::Online,
@@ -255,7 +260,9 @@ fn eval(n: &Node, sd: &SearchDevice, row: u32, sc: &mut Scratch) -> bool {
                 }
                 Leaf::Size { min, max } => (*min..=*max).contains(&ix.size(row)),
                 Leaf::Modified { min, max } => (*min..=*max).contains(&ix.modified(row)),
-                Leaf::Device(n) => sc.dev_lower.contains(n.as_str()),
+                Leaf::Device(n) => sc.dev_lower.contains(n.as_str()) || sc.pc_lower.contains(n.as_str()),
+                Leaf::Drive(n) => sc.dev_lower.contains(n.as_str()),
+                Leaf::Pc(n) => sc.pc_lower.contains(n.as_str()),
                 Leaf::Folders => ix.is_dir(row),
                 Leaf::Files => !ix.is_dir(row),
                 Leaf::Online => sd.online,

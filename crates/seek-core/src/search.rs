@@ -19,6 +19,8 @@ pub struct SearchDevice<'a> {
     pub index: &'a DeviceIndex,
     pub mount: &'a str,
     pub online: bool,
+    /// Name of the PC the device belongs to (this PC's name for local devices).
+    pub pc: &'a str,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,6 +43,7 @@ pub fn search(
         .iter()
         .map(|d| d.device.display_name.to_lowercase())
         .collect();
+    let pc_lower: Vec<String> = devs.iter().map(|d| d.pc.to_lowercase()).collect();
 
     let mut tasks: Vec<(u16, u32, u32)> = Vec::new();
     for (d, sd) in devs.iter().enumerate() {
@@ -62,6 +65,7 @@ pub fn search(
             let sd = &devs[d as usize];
             let mut scratch = Scratch::default();
             scratch.dev_lower.clone_from(&dev_lower[d as usize]);
+            scratch.pc_lower.clone_from(&pc_lower[d as usize]);
             let mut hits = Vec::new();
             match prefilter.and_then(|f| sd.index.lower_span(start, end).map(|span| (f, span))) {
                 Some((f, (lo, hi))) => {
@@ -318,12 +322,14 @@ mod tests {
                 index: &f.ic,
                 mount: "C:\\",
                 online: true,
+                pc: "Laptop",
             },
             SearchDevice {
                 device: &f.dd,
                 index: &f.id_,
                 mount: "E:\\",
                 online: false,
+                pc: "Desk",
             },
         ]
     }
@@ -537,6 +543,7 @@ mod tests {
             index: &ix,
             mount: "C:\\",
             online: true,
+            pc: "",
         }];
         let hits = search(
             &devs,
@@ -555,6 +562,7 @@ mod tests {
             index: &big,
             mount: "C:\\",
             online: true,
+            pc: "",
         }];
         for q in ["report", "ort_1", "a", "-v1"] {
             let hits = search(
@@ -578,6 +586,7 @@ mod tests {
             index: &big,
             mount: "C:\\",
             online: true,
+            pc: "",
         }];
         let hits = search(
             &devs,
@@ -589,4 +598,20 @@ mod tests {
         .unwrap();
         assert_eq!(hits.len(), 1);
     }
+
+    #[test]
+    fn pc_filter_and_device_term_matching_the_pc_name() {
+        let f = fixture();
+        let devs = devs(&f);
+        let run = |q: &str| search(&devs, &parse_at(q, now()).unwrap(), SortKey::Name, false, &|| false).unwrap();
+        let only_on = |hits: Vec<Hit>, d: u16| !hits.is_empty() && hits.iter().all(|h| h.dev == d);
+        assert!(only_on(run("pc:lap"), 0));
+        assert!(only_on(run("PC:LAP report"), 0));
+        assert!(only_on(run("device:desk"), 1));
+        assert!(run("pc:nowhere").is_empty());
+        // drive: matches the drive's name only, never the device (PC) it belongs to
+        assert!(only_on(run("drive:backup"), 1));
+        assert!(run("drive:desk").is_empty());
+    }
+
 }

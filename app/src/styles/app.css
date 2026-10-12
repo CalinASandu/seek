@@ -115,6 +115,7 @@ kbd { font-size: 11px; color: var(--muted); border: 1px solid var(--border-stron
 .side-btn { display: flex; align-items: center; gap: var(--s3); height: 36px; padding: 0 10px; border-radius: var(--r-md); color: var(--text-2); text-align: left; transition: background var(--t); }
 .side-btn:hover { background: var(--hover); }
 .side-btn:active { background: var(--pressed); }
+.side-btn:disabled { opacity: .5; cursor: default; background: none; }
 .is-collapsed .side-btn { justify-content: center; padding: 0; }
 
 /* ---- main panel --------------------------------------------------------- */
@@ -287,3 +288,48 @@ kbd { font-size: 11px; color: var(--muted); border: 1px solid var(--border-stron
 
 .menu-kbd { font-family: var(--font); font-size: 12px; }
 .th:last-child .th-resize { display: none; }
+
+/* ---- linked PCs ---- */
+.sidebar-actions { display: flex; align-items: center; gap: 2px; }
+.pc-group { display: flex; flex-direction: column; gap: 2px; }
+.pc-group + .pc-group { margin-top: 10px; }
+.pc-head { display: flex; align-items: center; gap: 6px; height: 26px; padding: 0 8px 0 4px; border-radius: var(--r-sm); color: var(--text-2); font-size: var(--fs-xs); font-weight: 600; text-align: left; transition: background var(--t); }
+.pc-head:hover { background: var(--hover); }
+.pc-head svg { color: var(--muted); flex: none; }
+.pc-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pc-tag { flex: none; font-size: 11px; font-weight: 500; color: var(--muted); }
+.pc-warn { flex: none; display: inline-flex; align-items: center; gap: 4px; font-size: 11px; font-weight: 600; color: var(--warning); }
+.pc-warn svg { color: var(--warning); }
+.pc-sub { margin: -2px 0 2px 24px; font-size: 11px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.pc-empty { padding: 4px 10px 6px 24px; font-size: var(--fs-xs); color: var(--faint); }
+.pc-sep { height: 1px; margin: 6px 10px; background: var(--border-strong); }
+.is-collapsed .pc-group + .pc-group { margin-top: 0; }
+
+.link-tabs { grid-template-columns: repeat(2, 1fr); margin-bottom: 16px; }
+.link-panel { display: flex; flex-direction: column; gap: 8px; }
+.link-panel .dialog-lead { margin-bottom: 4px; }
+.pair-code { align-self: center; padding: 12px 22px; border-radius: var(--r-md); background: var(--surface-2); border: 1px solid var(--border); font-family: "Cascadia Mono", "Cascadia Code", Consolas, monospace; font-size: 34px; font-weight: 600; letter-spacing: 0.08em; font-variant-numeric: tabular-nums; user-select: all; }
+.pair-code.is-expired { color: var(--faint); text-decoration: line-through; }
+.pair-meta { display: flex; align-items: center; justify-content: center; gap: 12px; min-height: 32px; font-size: var(--fs-xs); color: var(--muted); }
+.pc-pick { display: flex; flex-direction: column; gap: 2px; border-radius: var(--r-md); background: var(--surface-2); padding: 4px; }
+.pc-pick button { width: 100%; display: flex; align-items: center; gap: 10px; height: 34px; padding: 0 10px; border-radius: var(--r-sm); text-align: left; transition: background var(--t); }
+.pc-pick button:hover { background: var(--hover); }
+.pc-pick button.is-on { background: var(--accent-soft); color: var(--accent-text); }
+.pc-pick-name { flex: 1; min-width: 0; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pc-pick-addr { flex: none; font-size: var(--fs-xs); color: var(--muted); font-variant-numeric: tabular-nums; }
+.link-code-label { margin-top: 8px; margin-bottom: 0; }
+.field-code { flex: none; width: 160px; }
+.field-code input { font-family: "Cascadia Mono", "Cascadia Code", Consolas, monospace; font-size: var(--fs-md); letter-spacing: 0.12em; }
+.link-actions { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.link-actions .field-help { margin-top: 0; flex: 1; }
+.link-done { display: flex; gap: 14px; align-items: flex-start; padding: 4px 0; }
+.link-done svg { color: var(--success); flex: none; }
+.link-done strong { display: block; font-size: var(--fs-md); margin: 4px 0 6px; }
+.link-done .dialog-lead { margin-bottom: 0; }
+
+.peer-list { border-radius: var(--r-md); background: var(--surface-2); padding: 4px; }
+.peer-list li { display: flex; align-items: center; gap: 10px; height: 32px; padding: 0 10px; }
+.peer-name { font-weight: 600; flex: none; }
+.peer-sub { flex: 1; min-width: 0; text-align: right; font-size: var(--fs-xs); color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.peer-sub.is-warn { color: var(--warning); font-weight: 600; }
+.setting-group > .btn { align-self: flex-start; }

@@ -1,5 +1,9 @@
 import type {
   Device,
+  PairingCode,
+  PcInfo,
+  PcSummary,
+  Peers,
   ResultRow,
   SearchOutcome,
   SeekApi,
@@ -22,6 +26,10 @@ export interface MockOptions {
 }
 
 const DAY = 86_400_000; // timestamps are unix epoch milliseconds, like the service
+export const MOCK_THIS_PC = "host-desktop";
+export const MOCK_LAPTOP = "host-laptop";
+/** The code the mock's other PCs "show"; any other code is wrong. */
+export const MOCK_PAIRING_CODE = "482913";
 const GB = 1024 ** 3;
 
 function mulberry32(seed: number): () => number {
@@ -60,6 +68,7 @@ const FOLDERS: Record<string, string[]> = {
   backup: ["Old\\Documents", "Old\\Pictures\\2019", "Laptop-2021\\Desktop", "Laptop-2021\\Documents\\Taxes", "Archive\\Finance"],
   usb: ["DCIM\\100CANON", "DCIM\\101CANON", "Exports\\Wedding", "Camera Roll"],
   nas: ["media\\Movies", "media\\Music", "media\\Photos\\2024", "shared\\Documents", "backups\\phone"],
+  laptop: ["Users\\Calin\\Documents\\Uni", "Users\\Calin\\Downloads", "Users\\Calin\\Desktop", "Projects\\travel"],
 };
 
 interface DeviceSpec {
@@ -70,10 +79,11 @@ interface DeviceSpec {
 }
 
 function makeDevices(now: number): DeviceSpec[] {
-  const base = { firstSeen: now - 400 * DAY, error: null };
+  const base = { firstSeen: now - 400 * DAY, error: null, indexedByHost: MOCK_THIS_PC };
+  const laptop = { ...base, indexedByHost: MOCK_LAPTOP };
   return [
     {
-      folderKey: "c", weight: 0.3, mount: "C:",
+      folderKey: "c", weight: 0.26, mount: "C:",
       device: {
         ...base, id: "dev-c", displayName: "System (C:)", label: "System", filesystem: "NTFS", kind: "fixed",
         totalBytes: 476 * GB, freeBytes: 118 * GB, lastMountPoint: "C:\\", lastSeen: now, indexUpdatedAt: now - 120_000,
@@ -81,7 +91,7 @@ function makeDevices(now: number): DeviceSpec[] {
       },
     },
     {
-      folderKey: "d", weight: 0.34, mount: "D:",
+      folderKey: "d", weight: 0.3, mount: "D:",
       device: {
         ...base, id: "dev-d", displayName: "Data (D:)", label: "Data", filesystem: "NTFS", kind: "fixed",
         totalBytes: 1863 * GB, freeBytes: 412 * GB, lastMountPoint: "D:\\", lastSeen: now, indexUpdatedAt: now - 30_000,
@@ -89,7 +99,7 @@ function makeDevices(now: number): DeviceSpec[] {
       },
     },
     {
-      folderKey: "backup", weight: 0.22, mount: "E:",
+      folderKey: "backup", weight: 0.2, mount: "E:",
       device: {
         ...base, id: "dev-backup", displayName: "Backup 2TB", label: "Backup", filesystem: "exFAT", kind: "removable",
         totalBytes: 1863 * GB, freeBytes: 301 * GB, lastMountPoint: "E:\\", lastSeen: now - 3 * DAY,
@@ -105,11 +115,27 @@ function makeDevices(now: number): DeviceSpec[] {
       },
     },
     {
-      folderKey: "nas", weight: 0.1, mount: "\\\\nas\\media",
+      folderKey: "nas", weight: 0.08, mount: "\\\\nas\\media",
       device: {
         ...base, id: "dev-nas", displayName: "NAS media", label: "media", filesystem: "SMB", kind: "network",
         totalBytes: 7452 * GB, freeBytes: 3120 * GB, lastMountPoint: "\\\\nas\\media", lastSeen: now,
         indexUpdatedAt: now - 900_000, state: "online", entryCount: 0,
+      },
+    },
+    {
+      folderKey: "laptop", weight: 0.08, mount: "C:",
+      device: {
+        ...laptop, id: "dev-laptop-c", displayName: "Laptop SSD (C:)", label: "OS", filesystem: "NTFS", kind: "fixed",
+        totalBytes: 953 * GB, freeBytes: 210 * GB, lastMountPoint: "C:\\", lastSeen: now, indexUpdatedAt: now - 20_000,
+        state: "online", entryCount: 0,
+      },
+    },
+    {
+      folderKey: "laptop", weight: 0.04, mount: "D:",
+      device: {
+        ...laptop, id: "dev-laptop-usb", displayName: "Travel stick", label: "TRAVEL", filesystem: "exFAT",
+        kind: "removable", totalBytes: 119 * GB, freeBytes: 40 * GB, lastMountPoint: "D:\\", lastSeen: now - 9 * DAY,
+        indexUpdatedAt: now - 9 * DAY, state: "offline", entryCount: 0,
       },
     },
   ];
@@ -186,6 +212,8 @@ interface ParsedQuery {
   terms: string[];
   exts: Set<string> | null;
   devices: string[];
+  drives: string[];
+  pcs: string[];
   kind: "file" | "folder" | null;
   online: boolean | null;
   regex: RegExp | null;
@@ -194,7 +222,7 @@ interface ParsedQuery {
 type Parsed = { ok: true; q: ParsedQuery } | { ok: false; message: string; position: number };
 
 function parseQuery(query: string): Parsed {
-  const q: ParsedQuery = { terms: [], exts: null, devices: [], kind: null, online: null, regex: null };
+  const q: ParsedQuery = { terms: [], exts: null, devices: [], drives: [], pcs: [], kind: null, online: null, regex: null };
   let i = 0;
   while (i < query.length) {
     while (i < query.length && /\s/.test(query[i]!)) i++;
@@ -214,6 +242,11 @@ function parseQuery(query: string): Parsed {
     const val = m?.[2] ?? "";
     if (key === "ext") q.exts = new Set(val.toLowerCase().split(";").filter(Boolean));
     else if (key === "device") q.devices.push(val.toLowerCase());
+    else if (key === "drive") q.drives.push(val.toLowerCase());
+    else if (key === "pc") {
+      if (!val) return { ok: false, message: "pc: needs a name", position: start };
+      q.pcs.push(val.toLowerCase());
+    }
     else if (key === "file") q.kind = "file";
     else if (key === "folder") q.kind = "folder";
     else if (key === "online") q.online = true;
@@ -257,6 +290,19 @@ export function createMockApi(opts: MockOptions = {}): SeekApi {
   let timer: ReturnType<typeof setInterval> | null = null;
 
   const specOf = (id: string) => specs.find((s) => s.device.id === id);
+
+  // ---- linked PCs ----
+  const thisPc: PcSummary = { hostId: MOCK_THIS_PC, name: "DESKTOP", online: true, lastSyncMs: now - 20_000, needsRelink: false };
+  let peers: PcSummary[] = [
+    { hostId: MOCK_LAPTOP, name: "Laptop", online: true, lastSyncMs: now - 20_000, needsRelink: false },
+  ];
+  let sharing = true;
+  let unshared: string[] = [];
+  const discovered: PcInfo[] = [{ hostId: "host-office", name: "Office-PC", addr: "192.168.1.23:47321" }];
+  /** Devices of PCs that were unlinked (rows stay in the store, so devices are hidden rather than spliced). */
+  const gone = new Set<string>();
+  const visible = () => specs.filter((s) => !gone.has(s.device.id));
+  const pcName = (host: string) => (host === MOCK_THIS_PC ? thisPc.name : peers.find((p) => p.hostId === host)?.name ?? "");
 
   function ensureTimer() {
     if (!opts.simulate || timer) return;
@@ -304,8 +350,13 @@ export function createMockApi(opts: MockOptions = {}): SeekApi {
       if (!parsed.ok) return parsed;
       const q = parsed.q;
       const deviceOk = specs.map((s) => {
+        if (gone.has(s.device.id)) return false;
         if (q.online !== null && (s.device.state !== "offline") !== q.online) return false;
-        if (q.devices.length && !q.devices.some((d) => s.device.displayName.toLowerCase().includes(d))) return false;
+        const pc = pcName(s.device.indexedByHost).toLowerCase();
+        const dev = s.device.displayName.toLowerCase();
+        if (q.devices.length && !q.devices.some((d) => dev.includes(d) || pc.includes(d))) return false;
+        if (q.drives.length && !q.drives.some((d) => dev.includes(d))) return false;
+        if (q.pcs.length && !q.pcs.some((p) => pc.includes(p))) return false;
         return true;
       });
       const hits: number[] = [];
@@ -341,7 +392,7 @@ export function createMockApi(opts: MockOptions = {}): SeekApi {
     },
     async listDevices() {
       await delay();
-      return specs.map((s) => ({ ...s.device }));
+      return visible().map((s) => ({ ...s.device }));
     },
     async renameDevice(id, name) {
       await delay();
@@ -366,6 +417,7 @@ export function createMockApi(opts: MockOptions = {}): SeekApi {
       const parts = unc.split("\\").filter(Boolean);
       const device: Device = {
         id: `dev-${Date.now()}`, displayName: parts.join(" / "), label: parts[1] ?? "", filesystem: "SMB", kind: "network",
+        indexedByHost: MOCK_THIS_PC,
         totalBytes: 2000 * GB, freeBytes: 1500 * GB, lastMountPoint: unc, firstSeen: now, lastSeen: now,
         indexUpdatedAt: now, state: "scanning", entryCount: 0, error: null,
       };
@@ -375,11 +427,12 @@ export function createMockApi(opts: MockOptions = {}): SeekApi {
     },
     async status(): Promise<Status> {
       await delay();
-      const offline = specs.filter((s) => s.device.state === "offline").length;
+      const shown = visible();
+      const offline = shown.filter((s) => s.device.state === "offline").length;
       return {
         serviceVersion: "0.1.0",
-        totalEntries: store.names.length,
-        devicesOnline: specs.length - offline,
+        totalEntries: shown.reduce((n, s) => n + s.device.entryCount, 0),
+        devicesOnline: shown.length - offline,
         devicesOffline: offline,
         indexing: specs
           .filter((s) => s.device.state === "scanning")
@@ -412,6 +465,57 @@ export function createMockApi(opts: MockOptions = {}): SeekApi {
     async setSettings(s) {
       await delay();
       settings = s;
+    },
+    async startPairing(): Promise<PairingCode> {
+      await delay();
+      return { code: MOCK_PAIRING_CODE, expiresMs: Date.now() + 120_000 };
+    },
+    async discoveredPcs() {
+      await delay();
+      return discovered.filter((d) => !peers.some((p) => p.hostId === d.hostId)).map((d) => ({ ...d }));
+    },
+    async joinPairing(addr, code) {
+      await delay();
+      if (code.replace(/\D/g, "") !== MOCK_PAIRING_CODE) throw new Error("wrong code");
+      if (peers.length + 1 >= 5) throw new Error("that device's group is full (5 devices)");
+      const found = discovered.find((d) => d.addr === addr.trim());
+      const hostId = found?.hostId ?? `host-${Date.now()}`;
+      peers = [...peers, { hostId, name: found?.name ?? addr.split(":")[0]!, online: true, lastSyncMs: Date.now(), needsRelink: false }];
+      emit({ type: "peersChanged" });
+    },
+    async listPeers(): Promise<Peers> {
+      await delay();
+      return { thisPc: { ...thisPc }, peers: peers.map((p) => ({ ...p })), sharing, unshared: [...unshared] };
+    },
+    async unlink(hostId) {
+      await delay();
+      peers = peers.filter((p) => p.hostId !== hostId);
+      specs.filter((s) => s.device.indexedByHost === hostId).forEach((s) => gone.add(s.device.id));
+      emit({ type: "peersChanged" });
+      emit({ type: "devicesChanged" });
+      emit({ type: "resultsInvalidated" });
+    },
+    async renamePeer(hostId, name) {
+      await delay();
+      peers = peers.map((p) => (p.hostId === hostId ? { ...p, name } : p));
+      emit({ type: "peersChanged" });
+    },
+    async syncNow() {
+      await delay();
+      const t = Date.now();
+      thisPc.lastSyncMs = t;
+      peers = peers.map((p) => (p.online ? { ...p, lastSyncMs: t } : p));
+      emit({ type: "peersChanged" });
+    },
+    async setSharing(enabled) {
+      await delay();
+      sharing = enabled;
+      emit({ type: "peersChanged" });
+    },
+    async setDeviceShared(deviceId, shared) {
+      await delay();
+      unshared = shared ? unshared.filter((d) => d !== deviceId) : [...unshared.filter((d) => d !== deviceId), deviceId];
+      emit({ type: "peersChanged" });
     },
     onEvent(cb) {
       listeners.add(cb);

@@ -37,6 +37,7 @@ fn hdr() -> IndexHeader {
         }),
         saved_at: 1_700_000_000_123,
         rows: 4,
+        sync_cursor: None,
     }
 }
 
@@ -169,4 +170,26 @@ fn registry_roundtrip() {
     assert_eq!(again.get(id).unwrap().display_name, "Renamed");
     assert!(again.remove(id).is_some());
     assert!(again.get(id).is_none());
+}
+
+#[test]
+fn level_one_encoding_roundtrips_and_changes_serialize() {
+    let mut ix = synth_index(50_000, 1);
+    let copy = ix.clone();
+    let hdr = IndexHeader {
+        format_version: 0,
+        device_id: uuid::Uuid::nil(),
+        host_id: uuid::Uuid::nil(),
+        checkpoint: None,
+        saved_at: 0,
+        rows: 0,
+        sync_cursor: None,
+    };
+    let bytes = encode_index_level(&hdr, &mut ix, 1).unwrap();
+    let (back_hdr, back) = decode_index(&bytes).unwrap();
+    assert_eq!(back.live_count(), copy.live_count());
+    assert_eq!(back_hdr.sync_cursor, None);
+    let change = Change::Upsert(e(3, 1, "a.txt", false));
+    let json = serde_json::to_string(&change).unwrap();
+    assert_eq!(serde_json::from_str::<Change>(&json).unwrap(), change);
 }

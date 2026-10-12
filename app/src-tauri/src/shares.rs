@@ -187,6 +187,7 @@ impl Worker {
                 checkpoint: None,
                 saved_at: 0,
                 rows: 0,
+            sync_cursor: None,
             };
             let bytes = encode_index(&header, &mut ix).map_err(|e| e.to_string())?;
             Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
@@ -204,7 +205,9 @@ impl Worker {
         }
         if let std::collections::hash_map::Entry::Vacant(slot) = self.watchers.entry(id) {
             let q = self.tx.clone();
-            if let Ok(w) = DirWatcher::new(&root, move || {
+            // Shares are re-walked whole and pushed (the service holds the index), so which folders
+            // changed does not matter here.
+            if let Ok(w) = DirWatcher::new(&root, move |_| {
                 let _ = q.send(ShareJob::Changed(id));
             }) {
                 slot.insert(w);

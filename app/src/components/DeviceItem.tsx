@@ -9,6 +9,8 @@ interface Props {
   collapsed: boolean;
   active: boolean;
   renaming: boolean;
+  /** Extra state appended to the second line (e.g. "not shared"). */
+  note?: string;
   onToggle: () => void;
   onContextMenu: (e: { x: number; y: number }) => void;
   onRename: () => void;
@@ -51,8 +53,9 @@ export function DeviceItem(p: Props) {
       : d.state === "scanning"
         ? `Scanning · ${formatCount(p.scanned ?? d.entryCount)} files`
         : d.state === "error"
-          ? (d.error ?? "Can't read this device")
+          ? (d.error ?? "Can't read this drive")
           : `${formatSize(d.freeBytes)} free · ${formatCount(d.entryCount)} files`;
+  const sub = p.note ? `${secondary} · ${p.note}` : secondary;
 
   const onKey = (e: KeyboardEvent) => {
     if (p.renaming) return;
@@ -80,7 +83,7 @@ export function DeviceItem(p: Props) {
       tabIndex={0}
       aria-pressed={p.active}
       aria-label={label}
-      title={p.collapsed ? `${label}\n${secondary}` : undefined}
+      title={p.collapsed ? `${label}\n${sub}` : undefined}
       className={`device${p.active ? " is-active" : ""}${offline ? " is-offline" : ""}`}
       onClick={() => !p.renaming && p.onToggle()}
       onContextMenu={ctx}
@@ -116,7 +119,7 @@ export function DeviceItem(p: Props) {
           <span className="cap" aria-hidden="true">
             <span className="cap-fill" style={{ width: `${Math.round(used * 100)}%` }} data-high={used > 0.9} />
           </span>
-          <span className="device-sub">{secondary}</span>
+          <span className="device-sub">{sub}</span>
         </span>
       )}
     </div>

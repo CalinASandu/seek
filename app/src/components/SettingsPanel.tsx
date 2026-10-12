@@ -1,11 +1,16 @@
 import { useEffect, useRef, useState } from "react";
-import { Monitor, Moon, Plus, Sun, X } from "lucide-react";
-import type { Settings } from "../api/types";
+import { Link2, Monitor, Moon, Plus, Sun, X } from "lucide-react";
+import type { Peers, Settings } from "../api/types";
+import { syncedText } from "./Sidebar";
 
 interface Props {
   settings: Settings;
   version: string | undefined;
+  /** `null` when the service has sync turned off. */
+  peers: Peers | null;
   onChange: (patch: Partial<Settings>) => void;
+  onSharing: (enabled: boolean) => void;
+  onLinkPc: () => void;
   onClose: () => void;
 }
 
@@ -15,7 +20,7 @@ const THEMES: { id: Settings["theme"]; label: string; icon: typeof Sun }[] = [
   { id: "dark", label: "Dark", icon: Moon },
 ];
 
-export function SettingsPanel({ settings, version, onChange, onClose }: Props) {
+export function SettingsPanel({ settings, version, peers, onChange, onSharing, onLinkPc, onClose }: Props) {
   const [folder, setFolder] = useState("");
   const ref = useRef<HTMLElement>(null);
 
@@ -84,6 +89,50 @@ export function SettingsPanel({ settings, version, onChange, onClose }: Props) {
                 <span />
               </button>
             </div>
+          </section>
+
+          <section className="setting-group" aria-labelledby="set-pcs">
+            <h3 id="set-pcs">Linked devices</h3>
+            {peers ? (
+              <>
+                <div className="setting-row">
+                  <div>
+                    <div className="setting-name" id="share-pc">Share this device's files with linked devices</div>
+                    <div className="setting-desc">Linked devices can search this device's file names, even while it is off.</div>
+                  </div>
+                  <button
+                    role="switch"
+                    aria-checked={peers.sharing}
+                    aria-labelledby="share-pc"
+                    className={`switch${peers.sharing ? " is-on" : ""}`}
+                    onClick={() => onSharing(!peers.sharing)}
+                  >
+                    <span />
+                  </button>
+                </div>
+                {peers.peers.length > 0 ? (
+                  <ul className="peer-list">
+                    {peers.peers.map((pc) => (
+                      <li key={pc.hostId}>
+                        <span className={`dot dot-${pc.online ? "online" : "offline"}`} aria-hidden="true" />
+                        <span className="peer-name">{pc.name}</span>
+                        <span className={`peer-sub${pc.needsRelink ? " is-warn" : ""}`}>{syncedText(pc)}</span>
+                      </li>
+                    ))}
+                  </ul>
+                ) : (
+                  <p className="setting-desc">
+                    Link your other PCs and laptops to search their drives from here. Files stay where they are; only
+                    names are shared, encrypted, over your local network.
+                  </p>
+                )}
+                <button className="btn" onClick={onLinkPc} disabled={peers.peers.length >= 4} title={peers.peers.length >= 4 ? "Up to 5 devices can be linked" : undefined}>
+                  <Link2 size={14} aria-hidden="true" /> Link a device
+                </button>
+              </>
+            ) : (
+              <p className="setting-desc">Sync with other devices is turned off in the Seek service on this device.</p>
+            )}
           </section>
 
           <section className="setting-group" aria-labelledby="set-excl">

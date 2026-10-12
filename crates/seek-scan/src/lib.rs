@@ -16,8 +16,8 @@ pub use ntfs::scan_ntfs;
 pub use time::filetime_to_unix_ms;
 pub use usn::{parse_usn_buffer, FollowError, UsnFollower, UsnRecord};
 pub use volumes::{list_volumes, scan_volume, VolumeInfo};
-pub use walk::scan_walk;
-pub use watch::DirWatcher;
+pub use walk::{rescan_dirs, scan_walk};
+pub use watch::{Changed, DirWatcher};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ScanError {
