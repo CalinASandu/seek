@@ -288,7 +288,7 @@ export function ResultsTable({
       tabIndex={0}
       onKeyDown={onKeyDown}
     >
-      <div className="grid-inner" style={{ minWidth }}>
+      <div className="grid-inner" style={{ minWidth: minWidth + 16 /* row inset */ }}>
         <div className="grid-header" role="row" style={{ gridTemplateColumns: template }}>
           {COLS.map((c) => {
             const on = sort === c.key;
@@ -320,7 +320,7 @@ export function ResultsTable({
                 aria-rowindex={v.index + 2}
                 aria-selected={sel}
                 data-index={v.index}
-                className={`tr${sel ? " is-selected" : ""}${v.index === focus ? " is-focus" : ""}${row && !row.online ? " is-offline" : ""}`}
+                className={`tr${v.index % 2 ? " is-odd" : ""}${sel ? " is-selected" : ""}${v.index === focus ? " is-focus" : ""}${row && !row.online ? " is-offline" : ""}`}
                 style={{ gridTemplateColumns: template, transform: `translateY(${v.start}px)` }}
                 onClick={(e) => onRowClick(v.index, e)}
                 onDoubleClick={() => row && openable(row) && void api.openPath(row.fullPath)}

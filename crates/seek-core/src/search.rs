@@ -614,4 +614,19 @@ mod tests {
         assert!(run("drive:desk").is_empty());
     }
 
+    #[test]
+    fn drive_on_pc_picks_one_of_two_same_named_drives() {
+        let mut f = fixture();
+        f.dd.display_name = "System".into();
+        let devs = devs(&f);
+        let run = |q: &str| search(&devs, &parse_at(q, now()).unwrap(), SortKey::Name, false, &|| false).unwrap();
+        let devs_of = |hits: Vec<Hit>| hits.iter().map(|h| h.dev).collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(devs_of(run("drive:system")), [0, 1].into());
+        assert_eq!(devs_of(run(r#"drive:"Laptop/System""#)), [0].into());
+        assert_eq!(devs_of(run(r#"drive:"desk/system" report"#)), [1].into());
+        // the PC name must match exactly
+        assert!(run(r#"drive:"lap/system""#).is_empty());
+        assert!(run(r#"drive:"desk/backup""#).is_empty());
+    }
+
 }

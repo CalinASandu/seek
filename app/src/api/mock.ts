@@ -125,7 +125,7 @@ function makeDevices(now: number): DeviceSpec[] {
     {
       folderKey: "laptop", weight: 0.08, mount: "C:",
       device: {
-        ...laptop, id: "dev-laptop-c", displayName: "Laptop SSD (C:)", label: "OS", filesystem: "NTFS", kind: "fixed",
+        ...laptop, id: "dev-laptop-c", displayName: "System (C:)", label: "OS", filesystem: "NTFS", kind: "fixed",
         totalBytes: 953 * GB, freeBytes: 210 * GB, lastMountPoint: "C:\\", lastSeen: now, indexUpdatedAt: now - 20_000,
         state: "online", entryCount: 0,
       },
@@ -355,7 +355,11 @@ export function createMockApi(opts: MockOptions = {}): SeekApi {
         const pc = pcName(s.device.indexedByHost).toLowerCase();
         const dev = s.device.displayName.toLowerCase();
         if (q.devices.length && !q.devices.some((d) => dev.includes(d) || pc.includes(d))) return false;
-        if (q.drives.length && !q.drives.some((d) => dev.includes(d))) return false;
+        const driveOk = (d: string) => {
+          const at = d.indexOf("/");
+          return dev.includes(d) || (at >= 0 && d.slice(0, at) === pc && dev.includes(d.slice(at + 1)));
+        };
+        if (q.drives.length && !q.drives.some(driveOk)) return false;
         if (q.pcs.length && !q.pcs.some((p) => pc.includes(p))) return false;
         return true;
       });

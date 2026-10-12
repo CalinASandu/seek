@@ -23,7 +23,7 @@ const VOLUME_POLL: Duration = Duration::from_secs(2);
 const JOURNAL_POLL: Duration = Duration::from_millis(500);
 const SAVE_EVERY: Duration = Duration::from_secs(5 * 60);
 
-/// TCP port linked PCs connect to (the firewall rule opens it on private networks).
+/// TCP port linked PCs connect to (the firewall rule opens it to the local subnet).
 pub const SYNC_PORT: u16 = 47321;
 
 /// Sync settings of the real service: all interfaces, the standard port, mDNS, this computer's name.

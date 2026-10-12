@@ -24,7 +24,9 @@ export function toggleToken(query: string, token: string, exclusive: string[] = 
   return addToken(q, token);
 }
 
-export const driveToken = (name: string): string => `drive:"${name}"`;
+/** Filter for one drive; with `pc`, only that PC's drive of that name (`drive:"PC/Drive"`). */
+export const driveToken = (name: string, pc?: string): string =>
+  pc ? `drive:"${pc}/${name}"` : `drive:"${name}"`;
 
 /** Split a query into whitespace-separated tokens; quotes may sit inside a token (`drive:"a b"`). */
 export function tokenize(query: string): string[] {

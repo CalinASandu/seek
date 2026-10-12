@@ -47,19 +47,15 @@ describe("Seek app", () => {
     render(<App api={makeApi()} />);
     await user.type(await screen.findByRole("searchbox"), "offline:");
     const grid = await screen.findByRole("grid");
-    const rows = await waitFor(() => {
-      const r = within(grid).getAllByRole("row").slice(1);
-      expect(r.length).toBeGreaterThan(0);
-      return r;
-    });
-    const first = await waitFor(() => {
-      const row = rows.find((r) => within(r).queryByText("offline"));
+    // the mock's scanning drive keeps refreshing pages: find the row and open the menu again on every try
+    const menu = await waitFor(() => {
+      const row = within(grid).getAllByRole("row").slice(1).find((r) => within(r).queryByText("offline"));
       expect(row).toBeTruthy();
-      return row as HTMLElement;
+      fireEvent.contextMenu(row as HTMLElement);
+      const m = screen.getByRole("menu");
+      expect(within(m).getByRole("menuitem", { name: /^Open(?! containing)/ })).toHaveAttribute("title", "The drive is offline");
+      return m;
     });
-    expect(within(first).getByText("offline")).toBeInTheDocument();
-    fireEvent.contextMenu(first);
-    const menu = await screen.findByRole("menu");
     expect(within(menu).getByRole("menuitem", { name: /^Open(?! containing)/ })).toBeDisabled();
     expect(within(menu).getByRole("menuitem", { name: /Copy path/ })).toBeEnabled();
   });
@@ -130,14 +126,30 @@ describe("Seek app", () => {
   it("groups the sidebar by device: this device first, then the linked Laptop with its drives", async () => {
     render(<App api={makeApi()} />);
     const laptop = await screen.findByRole("group", { name: "Laptop" });
-    expect(within(laptop).getByRole("button", { name: /Laptop SSD \(C:\), online/ })).toBeInTheDocument();
+    expect(within(laptop).getByRole("button", { name: /System \(C:\), online/ })).toBeInTheDocument();
     expect(within(laptop).getByRole("button", { name: /Travel stick, offline/ })).toBeInTheDocument();
     const desktop = screen.getByRole("group", { name: "DESKTOP" });
     expect(within(desktop).getByText("This device")).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "Devices" })).toBeInTheDocument();
-    expect(within(desktop).queryByRole("button", { name: /Laptop SSD/ })).toBeNull();
+    expect(within(desktop).queryByRole("button", { name: /Travel stick/ })).toBeNull();
     expect(screen.getByRole("button", { name: "Sync now" })).toBeInTheDocument();
     expect(await screen.findByText(/2 devices/)).toBeInTheDocument();
+  });
+
+  it("selects one of two same-named drives on different devices, not both", async () => {
+    const user = userEvent.setup();
+    render(<App api={makeApi()} />);
+    const laptop = await screen.findByRole("group", { name: "Laptop" });
+    const desktop = screen.getByRole("group", { name: "DESKTOP" });
+    await user.click(within(laptop).getByRole("button", { name: /System \(C:\), online/ }));
+    expect(screen.getByRole("searchbox")).toHaveValue('drive:"Laptop/System (C:)" ');
+    await waitFor(() =>
+      expect(within(laptop).getByRole("button", { name: /System \(C:\), online/ })).toHaveAttribute("aria-pressed", "true"),
+    );
+    expect(within(desktop).getByRole("button", { name: /System \(C:\), online/ })).toHaveAttribute("aria-pressed", "false");
+    // a name only one drive has stays short
+    await user.click(within(desktop).getByRole("button", { name: /^Data \(D:\)/ }));
+    expect(screen.getByRole("searchbox")).toHaveValue('drive:"Laptop/System (C:)" drive:"Data (D:)" ');
   });
 
   it("shows a pairing code in the Link a device dialog (sidebar button)", async () => {
@@ -182,18 +194,23 @@ describe("Seek app", () => {
   it("names the PC in remote rows and disables Open for them", async () => {
     const user = userEvent.setup();
     render(<App api={makeApi()} />);
+    // linked devices load separately from the drives; rows are only known as remote once they have
+    await screen.findByRole("group", { name: "Laptop" });
     await user.type(await screen.findByRole("searchbox"), "pc:laptop online:");
     const grid = await screen.findByRole("grid");
-    const first = await waitFor(() => {
+    // the mock's scanning drive keeps refreshing pages: find the row and open the menu again on every try
+    const menu = await waitFor(() => {
       const row = within(grid).getAllByRole("row").slice(1).find((r) => within(r).queryByText(/^Laptop › /));
       expect(row).toBeTruthy();
-      return row as HTMLElement;
+      fireEvent.contextMenu(row as HTMLElement);
+      const m = screen.getByRole("menu");
+      expect(within(m).getByRole("menuitem", { name: /^Open(?! containing)/ })).toHaveAttribute(
+        "title",
+        "On Laptop — not on this device",
+      );
+      return m;
     });
-    fireEvent.contextMenu(first);
-    const menu = await screen.findByRole("menu");
-    const open = within(menu).getByRole("menuitem", { name: /^Open(?! containing)/ });
-    expect(open).toBeDisabled();
-    expect(open).toHaveAttribute("title", "On Laptop — not on this device");
+    expect(within(menu).getByRole("menuitem", { name: /^Open(?! containing)/ })).toBeDisabled();
     expect(within(menu).getByRole("menuitem", { name: /Copy path/ })).toBeEnabled();
   });
 });

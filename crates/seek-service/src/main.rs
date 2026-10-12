@@ -61,6 +61,10 @@ fn run_console(data_dir: PathBuf, pipe_name: String, sync: bool) -> anyhow::Resu
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
+    if sync {
+        // Seek.bat runs the console service elevated; without admin this only prints a warning
+        svc::add_firewall_rule();
+    }
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
         let (tx, rx) = tokio::sync::watch::channel(false);

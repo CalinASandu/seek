@@ -22,9 +22,10 @@ fn netsh(args: &[&str]) -> std::io::Result<std::process::Output> {
     std::process::Command::new("netsh").args(["advfirewall", "firewall"]).args(args).output()
 }
 
-/// Lets linked PCs reach the sync port, on private networks only. A failure is a warning: Seek still works
-/// on this PC, and Windows asks the first time the service listens.
-fn add_firewall_rule() {
+/// Lets linked PCs reach the sync port on any network type (Windows marks new networks Public by default),
+/// but only from the local subnet, never from the internet. Sessions need a linked PC's key and pairing
+/// needs the code shown on screen. A failure is a warning: Seek still works on this PC.
+pub fn add_firewall_rule() {
     let _ = netsh(&["delete", "rule", &format!("name={FIREWALL_RULE}")]);
     let exe = match std::env::current_exe() {
         Ok(p) => p.display().to_string(),
@@ -42,10 +43,11 @@ fn add_firewall_rule() {
         &format!("program={exe}"),
         "protocol=TCP",
         &format!("localport={SYNC_PORT}"),
-        "profile=private",
+        "profile=any",
+        "remoteip=localsubnet",
     ]);
     match added {
-        Ok(o) if o.status.success() => println!("firewall rule \"{FIREWALL_RULE}\" added (private networks)"),
+        Ok(o) if o.status.success() => println!("firewall rule \"{FIREWALL_RULE}\" added (local network only)"),
         Ok(o) => eprintln!(
             "warning: firewall rule not added: {}",
             String::from_utf8_lossy(&o.stdout).trim()

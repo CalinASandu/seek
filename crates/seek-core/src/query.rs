@@ -39,7 +39,7 @@ pub enum Term {
     },
     /// Lowercased substring of the drive's display name or of the device (PC) it belongs to.
     Device(String),
-    /// Lowercased substring of the drive's display name only.
+    /// Lowercased substring of the drive's display name only; `pc/drive` = that drive on that PC (exact PC name).
     Drive(String),
     /// Lowercased substring of the name of the PC a device belongs to.
     Pc(String),

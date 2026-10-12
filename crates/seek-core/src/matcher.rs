@@ -231,6 +231,12 @@ impl Matcher {
     }
 }
 
+/// `drive:"pc/drive"` picks one drive when several PCs have one with the same name: the PC name must match
+/// exactly, the drive name as a substring. `/` can't appear in Windows PC names or volume labels.
+fn drive_on_pc(n: &str, dev_lower: &str, pc_lower: &str) -> bool {
+    n.split_once('/').is_some_and(|(pc, drive)| pc == pc_lower && dev_lower.contains(drive))
+}
+
 fn eval(n: &Node, sd: &SearchDevice, row: u32, sc: &mut Scratch) -> bool {
     match n {
         Node::And(v) => v.iter().all(|c| eval(c, sd, row, sc)),
@@ -261,7 +267,7 @@ fn eval(n: &Node, sd: &SearchDevice, row: u32, sc: &mut Scratch) -> bool {
                 Leaf::Size { min, max } => (*min..=*max).contains(&ix.size(row)),
                 Leaf::Modified { min, max } => (*min..=*max).contains(&ix.modified(row)),
                 Leaf::Device(n) => sc.dev_lower.contains(n.as_str()) || sc.pc_lower.contains(n.as_str()),
-                Leaf::Drive(n) => sc.dev_lower.contains(n.as_str()),
+                Leaf::Drive(n) => sc.dev_lower.contains(n.as_str()) || drive_on_pc(n, &sc.dev_lower, &sc.pc_lower),
                 Leaf::Pc(n) => sc.pc_lower.contains(n.as_str()),
                 Leaf::Folders => ix.is_dir(row),
                 Leaf::Files => !ix.is_dir(row),

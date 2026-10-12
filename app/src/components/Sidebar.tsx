@@ -78,6 +78,19 @@ export function Sidebar(p: Props) {
   const unshared = new Set(p.peers?.unshared ?? []);
   const sharingOn = p.peers?.sharing ?? true;
 
+  // A name several drives share (every PC has a "Local Disk (C:)") is filtered together with its PC's name.
+  const pcNames = new Map((p.peers ? [p.peers.thisPc, ...p.peers.peers] : []).map((pc) => [pc.hostId, pc.name]));
+  const nameCount = new Map<string, number>();
+  for (const d of p.devices) {
+    const k = d.displayName.toLowerCase();
+    nameCount.set(k, (nameCount.get(k) ?? 0) + 1);
+  }
+  const tokenFor = (d: Device) =>
+    driveToken(
+      d.displayName,
+      (nameCount.get(d.displayName.toLowerCase()) ?? 0) > 1 ? pcNames.get(d.indexedByHost) : undefined,
+    );
+
   const commitRename = async (d: Device, name: string) => {
     setRenaming(null);
     if (name && name !== d.displayName) {
@@ -112,10 +125,10 @@ export function Sidebar(p: Props) {
       device={d}
       scanned={p.progress[d.id]}
       collapsed={p.collapsed}
-      active={hasToken(p.query, driveToken(d.displayName))}
+      active={hasToken(p.query, tokenFor(d))}
       renaming={renaming === d.id}
       note={deviceNote(d)}
-      onToggle={() => p.onToggleDevice(driveToken(d.displayName))}
+      onToggle={() => p.onToggleDevice(tokenFor(d))}
       onContextMenu={(pt) => setMenu({ ...pt, device: d })}
       onRename={() => !isRemote(d) && setRenaming(d.id)}
       onRenameCommit={(n) => void commitRename(d, n)}

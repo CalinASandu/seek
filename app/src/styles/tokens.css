@@ -1,16 +1,26 @@
-/* Design tokens. Light/dark resolve through light-dark(); [data-theme] overrides the system setting. */
+/* Design tokens. Light/dark resolve through light-dark(); [data-theme] overrides the system setting.
+   The palette follows Apple's system colors (labels, fills, separators, systemBlue …), the type scale
+   macOS's (13 px body), motion a critically damped spring (no overshoot: nothing here is thrown). */
 :root {
   color-scheme: light dark;
 
-  --font: "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, sans-serif;
-  --font-display: "Segoe UI Variable Display", "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+  --font: "Inter Variable", "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, sans-serif;
+  --font-display: var(--font);
+  --font-mono: "Cascadia Mono", "Cascadia Code", Consolas, monospace;
+  --fs-2xs: 11px;
   --fs-xs: 12px;
   --fs-sm: 13px;
   --fs-md: 14px;
-  --fs-lg: 20px;
+  --fs-lg: 22px;
+  /* size-specific tracking (Inter's dynamic metrics): body ≈ 0, larger text tighter */
+  --tr-sm: -0.003em;
+  --tr-md: -0.006em;
+  --tr-lg: -0.017em;
 
-  --r-sm: 4px;
+  --r-sm: 6px;
   --r-md: 8px;
+  --r-lg: 12px;
+  --r-xl: 16px;
 
   /* 4-pt grid */
   --s1: 4px;
@@ -21,45 +31,80 @@
   --s6: 24px;
   --s8: 32px;
 
-  /* Window backdrop: solid fallback in a browser, translucent when Mica is available (html.mica). */
-  --bg: light-dark(#f3f3f3, #202020);
-  --surface: light-dark(#ffffffcc, #2b2b2bcc);
-  --surface-solid: light-dark(#ffffff, #2b2b2b);
-  --surface-2: light-dark(#0000000a, #ffffff0f);
+  /* Window backdrop: solid in a browser, translucent over Mica (html.mica). */
+  --bg: light-dark(#ececee, #2a2a2c);
+  /* sidebar material: lets the window backdrop through */
+  --material-side: transparent;
+  /* content surface: the one solid sheet everything reads on */
+  --surface: light-dark(#ffffff, #1e1e20);
+  --surface-solid: light-dark(#ffffff, #2c2c2e);
+  /* thick material: menus, dialogs, panels, HUD */
+  --material-thick: light-dark(#f6f6f8d9, #2a2a2cd9);
+  --material-blur: blur(40px) saturate(180%);
+  /* fills (Apple: systemFill family) */
+  --surface-2: light-dark(#7878801f, #7676803d);
+  --fill-quiet: light-dark(#7878800f, #7676801f);
   --hover: light-dark(#0000000a, #ffffff0f);
-  --pressed: light-dark(#00000012, #ffffff17);
+  --pressed: light-dark(#00000014, #ffffff1a);
+  --select-quiet: light-dark(#0000001a, #ffffff1f);
+  --stripe: light-dark(#f5f5f7, #232325);
+  /* separators */
   --border: light-dark(#0000000f, #ffffff14);
   --border-strong: light-dark(#0000001f, #ffffff24);
-  --text: light-dark(#1a1a1a, #ffffff);
-  --text-2: light-dark(#3d3d3d, #e0e0e0);
-  --muted: light-dark(#5f5f5f, #a0a0a0);
-  --faint: light-dark(#8a8a8a, #707070);
+  --hairline: 0.5px solid var(--border-strong);
+  /* labels */
+  --text: light-dark(#1d1d1f, #f5f5f7);
+  --text-2: light-dark(#3c3c43, #ebebf5d9);
+  --muted: light-dark(#6e6e73, #98989f);
+  --faint: light-dark(#8e8e93, #6e6e73);
 
-  --accent: light-dark(#3b82f6, #60a5fa);
-  --accent-fg: light-dark(#ffffff, #0b1220);
-  --accent-soft: light-dark(#3b82f61a, #60a5fa26);
-  --accent-text: light-dark(#1d5fd6, #7ab4ff);
-  --success: #10b981;
-  --offline: light-dark(#9ca3af, #6b7280);
-  --warning: #f59e0b;
-  --danger: #ef4444;
-  --danger-text: light-dark(#c62828, #f87171);
-  --danger-soft: light-dark(#ef44441a, #ef44442b);
+  --accent: light-dark(#007aff, #0a84ff);
+  --accent-fg: #ffffff;
+  --accent-soft: light-dark(#007aff1f, #0a84ff33);
+  --accent-text: light-dark(#0066d6, #409cff);
+  --focus-ring: light-dark(#007aff80, #0a84ff99);
+  --success: light-dark(#34c759, #30d158);
+  --offline: light-dark(#aeaeb2, #636366);
+  --warning: light-dark(#ff9500, #ff9f0a);
+  --danger: light-dark(#ff3b30, #ff453a);
+  --danger-text: light-dark(#d70015, #ff6961);
+  --danger-soft: light-dark(#ff3b301a, #ff453a2e);
 
-  --shadow-menu: 0 8px 24px light-dark(#00000026, #00000066), 0 0 0 1px var(--border-strong);
-  --shadow-dialog: 0 24px 64px light-dark(#00000033, #00000099), 0 0 0 1px var(--border-strong);
-  --scrim: light-dark(#00000040, #00000080);
+  --shadow-card: 0 0 0 0.5px light-dark(#0000001a, #ffffff1a), 0 1px 3px light-dark(#0000000f, #00000066);
+  --shadow-control: 0 0 0 0.5px light-dark(#0000002e, #ffffff1f), 0 1px 1.5px light-dark(#0000001a, #00000066);
+  --shadow-menu: 0 0 0 0.5px light-dark(#00000026, #ffffff26), 0 10px 32px light-dark(#00000029, #00000080), 0 2px 6px light-dark(#0000000f, #00000040);
+  --shadow-dialog: 0 0 0 0.5px light-dark(#00000026, #ffffff26), 0 28px 72px light-dark(#0000003d, #000000a6), 0 6px 18px light-dark(#0000001a, #00000059);
+  --scrim: light-dark(#0000002e, #00000073);
 
-  --ease: cubic-bezier(0.2, 0, 0, 1);
-  --t: 120ms var(--ease);
+  /* critically damped spring (damping 1.0), sampled for CSS; response ≈ duration / 2.4 */
+  --spring: linear(0, 0.0398, 0.1302, 0.2413, 0.3554, 0.4629, 0.5591, 0.6424, 0.7127, 0.771, 0.8188, 0.8574,
+    0.8883, 0.9129, 0.9323, 0.9476, 0.9596, 0.9689, 0.9761, 0.9817, 0.986, 0.9893, 0.9919, 0.9938, 0.9951, 1);
+  --ease: cubic-bezier(0.25, 0.1, 0.25, 1);
+  --ease-out: cubic-bezier(0.2, 0.8, 0.2, 1);
+  --t-fast: 100ms;
+  --t: 160ms var(--ease);
+  --t-spring: 420ms var(--spring);
 }
 :root[data-theme="light"] { color-scheme: light; }
 :root[data-theme="dark"] { color-scheme: dark; }
 
-/* Real Mica: let the OS backdrop show through; surfaces stay translucent. */
-:root.mica { --bg: light-dark(#f3f3f399, transparent); }
+/* Real Mica: the OS backdrop shows through the window and the sidebar. */
+:root.mica { --bg: light-dark(#ececee80, #2a2a2c80); }
 
 @media (prefers-reduced-motion: reduce) {
-  :root { --t: 0ms linear; }
-  *, *::before, *::after { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; }
+  /* motion becomes short cross-fades: no movement, no springs */
+  :root { --t-spring: 160ms linear; }
+  *, *::before, *::after { animation-duration: 160ms !important; animation-iteration-count: 1 !important; }
+  .dialog, .menu, .panel, .toast { animation-name: fade !important; }
+}
+@media (prefers-reduced-transparency: reduce) {
+  :root, :root.mica { --bg: light-dark(#ececee, #2a2a2c); --material-thick: var(--surface-solid); --material-blur: none; }
+}
+@media (prefers-contrast: more) {
+  :root {
+    --border: light-dark(#00000040, #ffffff4d);
+    --border-strong: light-dark(#00000073, #ffffff80);
+    --muted: light-dark(#3c3c43, #c7c7cc);
+    --material-thick: var(--surface-solid);
+  }
 }

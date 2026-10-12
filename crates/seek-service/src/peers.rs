@@ -2,8 +2,9 @@
 //!
 //! Every connection starts with one byte from the dialer: `b'P'` = pairing, `b'N'` = sync session.
 //! A pairing connection then gets a status byte from the host (`1` ok, `0` group full, `2` no code) before
-//! SPAKE2 runs. Between two linked PCs the one with the lower host id dials; the other dials only when it
-//! has not been connected for two intervals (one-sided reachability). A duplicate session is dropped.
+//! SPAKE2 runs. Between two linked PCs the one with the lower host id dials; the other dials too once it has
+//! not been connected for `FALLBACK_DIAL` (one-sided reachability, e.g. a firewall on one PC). A duplicate
+//! session is dropped.
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -30,6 +31,8 @@ const STATUS_OK: u8 = 1;
 const STATUS_NO_CODE: u8 = 2;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const PAIRING_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long the higher host id waits for the lower one to dial before dialing itself.
+const FALLBACK_DIAL: Duration = Duration::from_secs(10);
 pub const MDNS_SERVICE: &str = "_seek._tcp.local.";
 
 /// A Seek PC seen on the LAN (mDNS).
@@ -48,8 +51,10 @@ pub struct PeersRuntime {
     addr: SocketAddr,
     sessions: Mutex<HashMap<HostId, Arc<SessionCtl>>>,
     dialing: Mutex<HashSet<HostId>>,
-    /// When each peer was last connected (or first known); the higher id dials after 2 × interval.
+    /// When each peer was last connected (or first known); the higher id dials after `FALLBACK_DIAL`.
     last_heard: Mutex<HashMap<HostId, Instant>>,
+    /// Last dial error per peer, so a repeated failure is logged once.
+    dial_errors: Mutex<HashMap<HostId, String>>,
     /// The active code and the SID of the user who asked for it.
     pairing: Mutex<Option<(PairingCode, String)>>,
     discovered: Mutex<HashMap<HostId, Discovered>>,
@@ -73,6 +78,7 @@ impl PeersRuntime {
             sessions: Mutex::new(HashMap::new()),
             dialing: Mutex::new(HashSet::new()),
             last_heard: Mutex::new(HashMap::new()),
+            dial_errors: Mutex::new(HashMap::new()),
             pairing: Mutex::new(None),
             discovered: Mutex::new(HashMap::new()),
             kick: Notify::new(),
@@ -460,7 +466,7 @@ impl PeersRuntime {
     /// Dials every linked PC that has no session and is due (see module docs).
     fn dial_due(self: &Arc<Self>) {
         let me = self.host_id();
-        let patience = self.cfg.interval * 2;
+        let patience = FALLBACK_DIAL.min(self.cfg.interval * 2);
         let peers: Vec<Peer> = self
             .state
             .peers
@@ -478,6 +484,13 @@ impl PeersRuntime {
             }
             let heard = *self.last_heard.lock().unwrap().entry(p.host_id).or_insert_with(Instant::now);
             if me > p.host_id && heard.elapsed() < patience {
+                // look again when the wait is over instead of at the next interval
+                let rt = self.clone();
+                let wait = patience - heard.elapsed();
+                tokio::spawn(async move {
+                    tokio::time::sleep(wait).await;
+                    rt.kick();
+                });
                 continue;
             }
             if !self.dialing.lock().unwrap().insert(p.host_id) {
@@ -486,8 +499,20 @@ impl PeersRuntime {
             let rt = self.clone();
             tokio::spawn(async move {
                 let host = p.host_id;
-                if let Err(e) = rt.dial(p).await {
-                    tracing::debug!("dialing {host} failed: {e}");
+                let addr = p.addr.clone().unwrap_or_default();
+                let name = p.name.clone();
+                match rt.dial(p).await {
+                    Err(e) => {
+                        let repeat = rt.dial_errors.lock().unwrap().insert(host, e.clone()).as_ref() == Some(&e);
+                        if repeat {
+                            tracing::debug!("connecting to {name} at {addr} failed: {e}");
+                        } else {
+                            tracing::info!("connecting to {name} at {addr} failed: {e}");
+                        }
+                    }
+                    Ok(()) => {
+                        rt.dial_errors.lock().unwrap().remove(&host);
+                    }
                 }
                 rt.dialing.lock().unwrap().remove(&host);
             });

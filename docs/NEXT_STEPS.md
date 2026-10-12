@@ -192,8 +192,11 @@ Spec `docs/superpowers/specs/2026-10-11-seek-sync-design.md`, plan + per-task no
 - **IPC/app**: 9 new requests (pairing, peers, unlink, rename, Sync now, sharing). UI groups the sidebar by PC (only
   when a PC is linked), Link a PC dialog (show / enter a code, PCs found on the network), Settings → Linked PCs,
   remote rows say `PC › device` and can't be opened here, status bar `N PCs · synced …`.
-- **Install**: `seek-service install` adds the firewall rule `Seek sync` (TCP 47321, Private profile only);
-  `uninstall` removes it. Console mode syncs by default; `--no-sync` turns it off.
+- **Install**: `seek-service install` adds the firewall rule `Seek sync` (TCP 47321, **all network profiles,
+  remote IP = local subnet only** — Windows marks new networks Public, and a Private-only rule blocked sync,
+  2026-10-12); `uninstall` removes it. Console mode syncs by default and (re)adds the rule when elevated;
+  `--no-sync` turns it off. The higher host id dials too after 10 s without a session (was 2 min); failed
+  dials are logged once per distinct error in `service.log`.
 - **Perf** (`seek perf`, `== sync ==`): 2M-entry full copy over encrypted loopback 350 ms (target < 2 s; 69 MB, so
   ~0.6 s more on gigabit); applying 1,000 changes 0.4 ms (target < 50 ms).
 - Limitations: LAN only (no relay/server), remote files can't be opened from here, user links exist only between
@@ -209,6 +212,18 @@ Spec `docs/superpowers/specs/2026-10-11-seek-sync-design.md`, plan + per-task no
   `drive:` matches drive names only, `device:` matches a device or a drive name, `pc:` still works. The sidebar says
   *Drives* until a device is linked, then *Devices* grouped per device; **Link a device** sits in the sidebar footer.
 
+## UI redesign + drive filter (2026-10-12)
+
+- **Same-named drives**: clicking a drive whose name another drive shares (every PC has `Local Disk (C:)`) adds
+  `drive:"PC/Drive"` (exact PC name + drive name); unique names stay `drive:"Name"`. Core: `drive_on_pc` in
+  `matcher.rs`. Mock laptop C: renamed to `System (C:)` to show the case.
+- **Apple-style pass** (user's request): Inter Variable (bundled, `@fontsource-variable/inter`, opsz) with
+  size-specific tracking, Apple system colors, translucent sidebar over Mica + solid rounded content sheet,
+  Finder-style list (stripes, accent selection when focused / gray when not, blue folders), macOS menus
+  (thick material, accent highlight), floating Settings sheet, no-overshoot spring easing (`--spring`),
+  press feedback on pointer-down, reduced motion / transparency / more-contrast support. Windows caption
+  buttons stay on the right. Tests made robust against the mock's scanning drive (re-query rows).
+
 ## Next step
 
 1. Verification status (2026-10-11):
@@ -222,13 +237,14 @@ Spec `docs/superpowers/specs/2026-10-11-seek-sync-design.md`, plan + per-task no
 2. **Sync checklist (user)** — automated tests cover two to six services over loopback; still to see on real hardware:
    - ⏳ Rebuild + reinstall the service elevated (`Stop-Service SeekService`, `cargo build --release -p seek-service
      -p seek-cli`, `.\target\release\seek-service.exe install`), then
-     `netsh advfirewall firewall show rule name="Seek sync"` → one rule, Private, TCP 47321.
+     `netsh advfirewall firewall show rule name="Seek sync"` → one rule, Profiles Domain,Private,Public,
+     RemoteIP LocalSubnet, TCP 47321.
    - ⏳ Two-PC smoke test (see *Try it on two PCs*): link, search the other PC's files, create a file there → appears
      here within a minute (or after Sync now), switch it off → its files stay searchable (offline).
    - ⏳ Look over the new UI in the window (sidebar groups, Link a PC dialog, Settings → Linked PCs); the browser
      preview `cd app; pnpm dev` shows a mock linked "Laptop" (code `482913`).
-   - Note: `Seek.bat` runs the console service with sync on; the first run may show a Windows Firewall prompt
-     (the rule is created only by `seek-service install`).
+   - 2026-10-12 first two-PC try (desktop on Ethernet, laptop ROCKET on Wi-Fi, both Public): linking worked,
+     sessions never connected — the Private-only rule blocked the incoming side. Fixed as above; retest.
 
 ## Open findings / backlog (ranked)
 
