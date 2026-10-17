@@ -248,6 +248,8 @@ fn synthetic(r: &mut Report, o: &Opts) -> anyhow::Result<()> {
     drop(loaded);
     let _ = std::fs::remove_file(&path);
 
+    space(r, &a, o.runs);
+
     r.section("live changes");
     let (n, ms) = apply_batch(&mut a);
     r.add("apply/batch", ms, "ms", &format!("{n} changes incl. folder deletes"));
@@ -255,6 +257,21 @@ fn synthetic(r: &mut Report, o: &Opts) -> anyhow::Result<()> {
     r.section("process");
     r.add("process/peak working set", mb(peak_working_set(None)), "MB", "synthetic section");
     Ok(())
+}
+
+/// Space view on one device: folder totals (computed once per index change), then what each view asks for.
+fn space(r: &mut Report, ix: &DeviceIndex, runs: usize) {
+    r.section("space");
+    let note = format!("{} entries", ix.len());
+    let (best, _) = time_ms(runs, || drop(seek_core::FolderTotals::compute(ix, None)));
+    r.add("space/totals", best, "ms", &note);
+    let totals = seek_core::FolderTotals::compute(ix, None);
+    let (best, _) = time_ms(runs, || drop(seek_core::space_tree(ix, &totals, None, 3)));
+    r.add("space/tree depth 3", best, "ms", "drive root");
+    let (best, _) = time_ms(runs, || drop(seek_core::largest_files(ix, &totals, None, 50)));
+    r.add("space/largest 50", best, "ms", "drive root");
+    let (best, _) = time_ms(runs, || drop(seek_core::type_totals(ix, &totals, None)));
+    r.add("space/types", best, "ms", "drive root");
 }
 
 /// Entries in the index sent to a linked PC (a big system drive).

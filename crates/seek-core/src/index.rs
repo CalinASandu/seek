@@ -57,6 +57,8 @@ pub struct DeviceIndex {
     stale: usize,
     /// Process-unique id of this row numbering; changes whenever rows are renumbered.
     epoch: u64,
+    /// Bumped by every `apply`: rows can change in place without a new epoch or row count.
+    version: u64,
     pub checkpoint: Option<Checkpoint>,
 }
 
@@ -99,6 +101,7 @@ impl DeviceIndex {
             root_id,
             stale: 0,
             epoch: next_epoch(),
+            version: 0,
             checkpoint: None,
         }
     }
@@ -164,6 +167,7 @@ impl DeviceIndex {
             root_id,
             stale: 0,
             epoch: next_epoch(),
+            version: 0,
             checkpoint: None,
         })
     }
@@ -318,6 +322,11 @@ impl DeviceIndex {
     /// Appending rows keeps the epoch; compaction and rebuilding change it.
     pub fn epoch(&self) -> u64 {
         self.epoch
+    }
+
+    /// Changes on every `apply` (in-place updates keep the epoch and row count).
+    pub fn version(&self) -> u64 {
+        self.version
     }
 
     pub fn root_id(&self) -> u64 {
@@ -632,6 +641,7 @@ impl DeviceIndex {
     /// that contains it): upserts whose parent is not known yet are retried once the rest of the batch
     /// is in, and only dropped (or, for known entries, removed) when their parent never shows up.
     pub fn apply(&mut self, changes: &[Change]) {
+        self.version += 1;
         let mut sweep = false;
         let mut pending: Vec<&RawEntry> = Vec::new();
         for c in changes {

@@ -96,6 +96,28 @@ export type SeekEvent =
   | { type: "indexProgress"; deviceId: string; scanned: number; done: boolean }
   | { type: "serviceState"; state: ServiceState };
 
+/** `smaller`: that many items too small to show, merged; `hidden`: other users' folders. */
+export type SpaceKind = "folder" | "file" | "hidden" | { smaller: { count: number } };
+
+export interface SpaceNode {
+  name: string;
+  kind: SpaceKind;
+  bytes: number;
+  files: number;
+  modified: number;
+  /** Holds cloud-only files (OneDrive / Google Drive placeholders). */
+  cloud: boolean;
+  children: SpaceNode[];
+}
+
+export type TypeCategory = "video" | "pictures" | "music" | "documents" | "archives" | "apps" | "system" | "other";
+
+export interface TypeTotal {
+  category: TypeCategory;
+  bytes: number;
+  files: number;
+}
+
 export interface SeekApi {
   search(query: string, sort: SortKey, descending: boolean): Promise<SearchOutcome>;
   fetchRows(searchId: number, offset: number, limit: number): Promise<ResultRow[]>;
@@ -120,5 +142,9 @@ export interface SeekApi {
   syncNow(): Promise<void>;
   setSharing(enabled: boolean): Promise<void>;
   setDeviceShared(deviceId: string, shared: boolean): Promise<void>;
+  /** What fills `path` (a folder's full path; a drive root is its mount point, e.g. `D:\`). */
+  spaceTree(deviceId: string, path: string, depth: number): Promise<SpaceNode>;
+  spaceLargest(deviceId: string, path: string, limit: number): Promise<ResultRow[]>;
+  spaceTypes(deviceId: string, path: string): Promise<TypeTotal[]>;
   onEvent(cb: (e: SeekEvent) => void): () => void;
 }

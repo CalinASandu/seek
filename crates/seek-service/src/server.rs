@@ -8,7 +8,7 @@ use std::time::Instant;
 use base64::Engine;
 use seek_core::{
     decode_index, materialize, normalize_unc, query, search, Device, DeviceId, DeviceIdentity,
-    DeviceKind, DeviceState, Hit, SearchDevice, SortKey,
+    DeviceKind, DeviceIndex, DeviceState, FolderTotals, Hit, SearchDevice, SortKey,
 };
 use seek_ipc::{
     create_server, read_frame, write_frame, Envelope, IndexProgress, PcInfo, PcSummary, Request,
@@ -24,6 +24,9 @@ use crate::{access, monitor};
 
 const MAX_ROWS_PER_FETCH: u32 = 500;
 const KEPT_SEARCHES: usize = 2;
+const MAX_SPACE_DEPTH: u8 = 8;
+const MAX_SPACE_FILES: u32 = 1000;
+const FOLDER_GONE: &str = "That folder no longer exists";
 
 struct StoredSearch {
     id: u64,
@@ -226,6 +229,28 @@ async fn handle(state: Arc<State>, conn: Arc<Conn>, req: Request) -> Response {
                 err("unknown drive")
             }
         }
+        Request::SpaceTree { device_id, path, depth } => {
+            space(state, conn, device_id, path, move |sd, t, folder| Response::SpaceTree {
+                node: seek_core::space_tree(sd.index, t, folder, depth.min(MAX_SPACE_DEPTH)),
+            })
+            .await
+        }
+        Request::SpaceLargest { device_id, path, limit } => {
+            space(state, conn, device_id, path, move |sd, t, folder| {
+                let rows = seek_core::largest_files(sd.index, t, folder, limit.min(MAX_SPACE_FILES) as usize);
+                let devs = std::slice::from_ref(sd);
+                Response::SpaceFiles {
+                    files: rows.into_iter().map(|row| materialize(devs, Hit { dev: 0, row })).collect(),
+                }
+            })
+            .await
+        }
+        Request::SpaceTypes { device_id, path } => {
+            space(state, conn, device_id, path, |sd, t, folder| Response::SpaceTypes {
+                types: seek_core::type_totals(sd.index, t, folder),
+            })
+            .await
+        }
         Request::Status => Response::Status(status(&state)),
         Request::Subscribe => Response::Ok,
         Request::StartPairing
@@ -418,6 +443,55 @@ async fn run_search(
         Ok(None) => err("cancelled by a newer search"),
         Err(e) => err(format!("search failed: {e}")),
     }
+}
+
+/// Runs `f` for a Space view request: the device's index, the caller's folder totals and the folder
+/// `path` names (`None` = the drive root), off the async runtime.
+async fn space(
+    state: Arc<State>,
+    conn: Arc<Conn>,
+    device_id: DeviceId,
+    path: String,
+    f: impl FnOnce(&SearchDevice, &FolderTotals, Option<u32>) -> Response + Send + 'static,
+) -> Response {
+    tokio::task::spawn_blocking(move || {
+        let snap = state.snapshot();
+        let Some(s) = snap.iter().find(|s| s.device.id == device_id) else {
+            return err("Unknown drive");
+        };
+        let ix = s.index.read().unwrap();
+        let mount = s.device.last_mount_point.as_str();
+        let hidden = state.hidden_for(&s.device, &conn.sid, conn.elevated, &conn.hidden);
+        let mask = state.hidden_mask(&s.device, &ix, &conn.sid, &hidden);
+        let Some(folder) = space_folder(&ix, mount, &path) else {
+            return err(FOLDER_GONE);
+        };
+        if let (Some(row), Some(m)) = (folder, &mask) {
+            if m[row as usize] {
+                return err(FOLDER_GONE);
+            }
+        }
+        let totals = state.space_totals(&s.device, &ix, &conn.sid, mask.as_deref().map(Vec::as_slice));
+        let sd = SearchDevice {
+            device: &s.device,
+            index: &ix,
+            mount,
+            online: s.online,
+            pc: &s.pc,
+        };
+        f(&sd, &totals, folder)
+    })
+    .await
+    .unwrap_or_else(|e| err(format!("space view failed: {e}")))
+}
+
+/// `Some(None)` for the drive root, `Some(Some(row))` for a live folder, `None` when there is no such folder.
+fn space_folder(ix: &DeviceIndex, mount: &str, path: &str) -> Option<Option<u32>> {
+    let path = path.trim_end_matches('\\');
+    if path.eq_ignore_ascii_case(mount.trim_end_matches('\\')) {
+        return Some(None);
+    }
+    ix.find_folders(mount, &[path]).pop().flatten().map(Some)
 }
 
 async fn fetch_rows(

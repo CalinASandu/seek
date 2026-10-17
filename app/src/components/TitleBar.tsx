@@ -1,3 +1,4 @@
+import type { ReactNode } from "react";
 import { windowAction } from "../lib/window";
 
 export function AppMark({ size = 16 }: { size?: number }) {
@@ -10,13 +11,18 @@ export function AppMark({ size = 16 }: { size?: number }) {
   );
 }
 
-export function TitleBar() {
+export function TitleBar({ center }: { center?: ReactNode }) {
   return (
     <header className="titlebar" data-tauri-drag-region onDoubleClick={() => void windowAction("toggleMaximize")}>
       <div className="titlebar-brand" data-tauri-drag-region>
         <AppMark />
         <span data-tauri-drag-region>Seek</span>
       </div>
+      {center && (
+        <div className="titlebar-center" onDoubleClick={(e) => e.stopPropagation()}>
+          {center}
+        </div>
+      )}
       <div className="titlebar-controls" onDoubleClick={(e) => e.stopPropagation()}>
         <button className="wc" aria-label="Minimize" onClick={() => void windowAction("minimize")}>
           <svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true">

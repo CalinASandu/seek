@@ -8,6 +8,7 @@ pub mod persist;
 pub mod query;
 pub mod registry;
 pub mod search;
+pub mod space;
 pub mod synth;
 pub mod types;
 
@@ -16,6 +17,7 @@ pub use model::*;
 pub use persist::*;
 pub use registry::*;
 pub use search::*;
+pub use space::*;
 pub use synth::synth_index;
 pub use types::*;
 

@@ -446,6 +446,9 @@ mod tests {
             ),
             vec!["Report.PDF"]
         );
+        // what the Space view's "Search in this folder" types: a quoted full folder path
+        let q = r#"path:"C:\Users\me" report"#;
+        assert_eq!(names(&f, &run_sorted(&f, q, SortKey::Name, false)), vec!["Report.PDF"], "{q}");
     }
 
     #[test]

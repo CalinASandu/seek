@@ -1,6 +1,6 @@
 # Seek — Status & Next Steps
 
-_Last updated: 2026-10-12 (sync between PCs implemented, plan tasks 1–16). Read this first when starting a new session in this repo._
+_Last updated: 2026-10-16 (Space view implemented, plan tasks 1–8). Read this first when starting a new session in this repo._
 
 ## Where we are
 
@@ -13,11 +13,12 @@ _Last updated: 2026-10-12 (sync between PCs implemented, plan tasks 1–16). Rea
 | 2 | 7–8 | `seek-ipc` framing/client/server, `seek-service`, `seek-cli` | ✅ committed on `feat/v1` |
 | 3 | 10 | Tauri backend: real window ↔ service, tray, autostart, shares, launcher `Seek.bat` | ✅ committed on `feat/v1` |
 | 4 | 11 | Review + fixes ✅, perf suite ✅, walker memory ✅, NSIS installer ✅, Google Drive ✅, access rule ✅, changed-folder rescans ✅, README ✅, elevated MFT/USN verified ✅ · window live-update + installer check ⏳ (user) | 🔶 almost done |
-| 5 | sync 1–16 | **Sync between PCs** (`docs/superpowers/plans/2026-10-11-seek-sync.md`): seek-sync crate, service runtime, IPC, UI, perf, firewall · two-PC smoke test ⏳ (user) | ✅ uncommitted |
+| 5 | sync 1–16 | **Sync between PCs** (`docs/superpowers/plans/2026-10-11-seek-sync.md`): seek-sync crate, service runtime, IPC, UI, perf, firewall · two-PC smoke test ✅ (user, 2026-10-14) | ✅ committed (`3df1d0e`, `e5fd9b9`) |
+| 6 | space 1–8 | **Space view** (`docs/superpowers/plans/2026-10-16-seek-space-view.md`): folder totals in seek-core, 3 IPC requests, sunburst + list UI · real-window check ⏳ (user) | ✅ uncommitted |
 
-- Branch: `feat/v1`, pushed to `origin` (`github.com/CalinASandu/seek`). Last commit `0e49231` (2026-10-11).
-  Wave 4 part 2 and the whole sync feature (below) are **uncommitted** — commit only when the user says so.
-- UI: the user considers it finished for now ("very clean"); no visual pass planned.
+- Branch: `feat/v1`, pushed to `origin` (`github.com/CalinASandu/seek`). Last commit `e5fd9b9`.
+  The Space view (wave 6) is **uncommitted** — commit only when the user says so.
+- UI: Apple-style; the Space view had a screenshot critique pass (light, dark, 900×560) in the browser preview.
 - Spec: `docs/superpowers/specs/2026-10-04-seek-local-design.md`
 - Plan (task-by-task): `docs/superpowers/plans/2026-10-04-seek-v1.md`
 - Execution ledger + agent reports: `.superpowers/sdd/2026-10-04-seek-v1/` (git-ignored; `progress.md`, `agent-*-report.md`)
@@ -34,7 +35,7 @@ _Last updated: 2026-10-12 (sync between PCs implemented, plan tasks 1–16). Rea
 | Reload C: index from disk | 327 ms (45 MB file) | < 1 s ✅ |
 | Synthetic bench, 10M entries, `report` | 17.8 ms | < 50 ms ✅ |
 
-Tests (2026-10-12): `cargo test --workspace` → 123 passed, 2 ignored (admin-only); `cargo clippy --workspace --all-targets -- -D warnings` clean; `pnpm -C app test` → 18 passed; `pnpm -C app build` passes. (2026-10-11: 75 passed / 13 app tests.)
+Tests (2026-10-16): `cargo test --workspace` → 141 passed, 2 ignored (admin-only); `cargo clippy --workspace --all-targets -- -D warnings` clean; `pnpm -C app test` → 43 passed; `pnpm -C app build` passes. (2026-10-12: 123 passed / 18 app tests.)
 
 ## Working rules for this repo (from the user)
 
@@ -224,7 +225,31 @@ Spec `docs/superpowers/specs/2026-10-11-seek-sync-design.md`, plan + per-task no
   press feedback on pointer-down, reduced motion / transparency / more-contrast support. Windows caption
   buttons stay on the right. Tests made robust against the mock's scanning drive (re-query rows).
 
+## Done in wave 6: Space view (2026-10-16)
+
+Spec `docs/superpowers/specs/2026-10-16-seek-space-view-design.md`, plan `docs/superpowers/plans/2026-10-16-seek-space-view.md`.
+
+- **Core** `crates/seek-core/src/space.rs`: `FolderTotals::compute` (child lists + one post-order pass, ~21 B/row,
+  a visible-row bitset), `space_tree` (sorted; level 1 capped at 500 + "smaller items", deeper levels merge
+  items < 0.5 %), `largest_files`, `type_totals`, `type_of`. Hidden rows (other users) are summed into one
+  *Other users* node and never named. `DeviceIndex::version()` (bumped by `apply`) keeps cached totals honest.
+- **Service**: `SpaceTree` / `SpaceLargest` / `SpaceTypes` (path = full folder path, mount = drive root); totals
+  cached for the 2 most recent (device, user) pairs; a missing or hidden folder → "That folder no longer exists".
+- **App**: Search | Space segmented control centered in the title bar (`Ctrl+Shift+S`); `components/space/*`:
+  sunburst (3 rings, spring drill animation, hover links chart ↔ list ↔ capacity bar), Finder path bar,
+  capacity bar in the chart's colours (+ "not indexed" + free), Contents / Largest / By type. Colour always
+  means "this folder"; file kinds use the search-result icons with neutral bars. Mock data:
+  `api/mockSpace.ts` (realistic trees; `pnpm dev` → Space).
+- **Perf** (2M entries): totals 113 ms, tree 0.8 ms, largest 4.2 ms, types 29 ms (`seek perf`, `== space ==`).
+- Screenshots: `app/docs/screenshots/11-space-*.png`, `12-space-folder-dark.png`, `13-space-types-light.png`.
+
 ## Next step
+
+0. **Space view in the real window (user)** — the release binaries were locked while the session ran:
+   elevated: `Stop-Service SeekService`; close the Seek window; `cargo build --release -p seek-service -p seek-cli`;
+   `cd app; pnpm tauri build --no-bundle`; `Start-Service SeekService`; open Seek → Space. Check C: totals look
+   right next to Explorer's "used", drilling feels instant, and the laptop's drives open while it is off.
+   Then: **installer for sharing** (code signing, GitHub Releases, Tauri updater) — discussed 2026-10-16.
 
 1. Verification status (2026-10-11):
    - ✅ **Elevated**: both admin-only tests pass; C: 2.1M entries via MFT in 3.9 s; the installed service (rebuilt
@@ -244,9 +269,14 @@ Spec `docs/superpowers/specs/2026-10-11-seek-sync-design.md`, plan + per-task no
    - ⏳ Look over the new UI in the window (sidebar groups, Link a PC dialog, Settings → Linked PCs); the browser
      preview `cd app; pnpm dev` shows a mock linked "Laptop" (code `482913`).
    - 2026-10-12 first two-PC try (desktop on Ethernet, laptop ROCKET on Wi-Fi, both Public): linking worked,
-     sessions never connected — the Private-only rule blocked the incoming side. Fixed as above; retest.
+     sessions never connected — the Private-only rule blocked the incoming side. Fixed as above.
+   - ✅ 2026-10-14 retest on two PCs (user): sync works end to end.
 
 ## Open findings / backlog (ranked)
+
+0. Space (from the wave-6 self-review): computing totals holds the device's read lock (~0.1 s per 2M rows,
+   once per index change); the live refresh refetches the shown folder ~1 s after every index change, even when
+   the change was elsewhere on the drive; Space has no delete yet (Cleanup feature, reversible only).
 
 1. Empty query sorted by path over 10M ≈ 3.4 s (fix in 3).
 2. Every service start rescans walked drives (C: ≈ 60 s without admin); a verify pass would cost the same walk.
@@ -268,7 +298,8 @@ Spec `docs/superpowers/specs/2026-10-11-seek-sync-design.md`, plan + per-task no
 
 ```
 crates/seek-core     OS-agnostic: model.rs, index.rs (DeviceIndex), persist.rs (.seekidx), registry.rs (devices.json),
-                     query.rs (parser), matcher.rs, search.rs (parallel search + materialize), synth.rs, benches/search.rs
+                     query.rs (parser), matcher.rs, search.rs (parallel search + materialize), synth.rs, benches/search.rs,
+                     space.rs (folder totals, Space trees, largest files, file kinds)
 crates/seek-scan     volumes.rs (list_volumes, scan_volume), ntfs.rs + mft.rs (raw MFT), walk.rs (jwalk, private pool),
                      usn.rs (UsnFollower), watch.rs (DirWatcher: changed folders per 2 s burst), walk.rs also rescan_dirs
 crates/seek-sync     OS-agnostic sync: journal.rs, frame.rs, noise.rs (Noise IK), pairing.rs (SPAKE2), peers.rs (peers.json,
@@ -279,7 +310,8 @@ crates/seek-service  lib.rs (run loop), state.rs, monitor.rs (volumes, scans, jo
                      sync_host.rs (SyncHost for the service), peers.rs (PeersRuntime: listener, dialer, mDNS, pairing),
                      svc.rs (+ firewall rule) + main.rs
 crates/seek-cli      `seek` binary: volumes, scan, query, remote, devices, perf (perf.rs)
-app/                 React UI (src/api/{types,mock,tauri,index}.ts, components/, styles/tokens.css)
+app/                 React UI (src/api/{types,mock,mockSpace,tauri,index}.ts, components/ (+ space/ for the Space view),
+                     lib/sunburst.ts, styles/{tokens,app,space}.css)
 app/src-tauri        Tauri backend (pipe, commands, shares, tray, settings, service_ctl, shell)
 Seek.bat, Stop Seek.bat, scripts/   one-click launcher / stopper
 ```

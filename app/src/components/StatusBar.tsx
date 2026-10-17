@@ -37,8 +37,10 @@ export function StatusBar({ total, elapsedMs, loading, stale, onRefresh, status,
         )}
       </span>
       <span className="status-sep" />
+      {/* drives (disks, sticks, shares); "devices" are PCs */}
       <span className="status-seg">
-        <span className="dot dot-online" /> {status?.devicesOnline ?? 0} online
+        <span className="dot dot-online" /> {status?.devicesOnline ?? 0}{" "}
+        {(status?.devicesOnline ?? 0) === 1 ? "drive" : "drives"} online
         <span className="status-gap" />
         <span className="dot dot-offline" /> {status?.devicesOffline ?? 0} offline
       </span>

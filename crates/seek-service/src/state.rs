@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use seek_core::{
     load_index, save_index, Device, DeviceId, DeviceIndex, DeviceKind, DeviceRegistry, DeviceState,
-    HostId, IndexHeader, INDEX_FORMAT_VERSION,
+    FolderTotals, HostId, IndexHeader, INDEX_FORMAT_VERSION,
 };
 use seek_ipc::Event;
 use seek_scan::watch::MAX_CHANGED_DIRS;
@@ -40,6 +40,8 @@ pub struct SyncConfig {
 }
 
 pub type SharedIndex = Arc<RwLock<DeviceIndex>>;
+/// Cached folder totals of one device for one user (SID, or "" when nothing is hidden).
+pub type SpaceEntry = ((DeviceId, String), Arc<FolderTotals>);
 
 pub struct State {
     pub cfg: Config,
@@ -68,6 +70,9 @@ pub struct State {
     /// Rows hidden from a user on a device, by (device, user SID), with the index epoch and row count
     /// they were computed for. `None` = nothing to hide there.
     pub hidden_masks: Mutex<HashMap<(DeviceId, String), HiddenMask>>,
+    /// Folder totals for the Space view, by (device, SID or "" when nothing is hidden), most recent last.
+    /// Only the last few are kept: one costs ~21 bytes per row.
+    pub space_totals: Mutex<Vec<SpaceEntry>>,
     /// Change journals of own devices (see `journal_ops`).
     pub journals: Mutex<HashMap<DeviceId, seek_sync::DeviceJournal>>,
     /// Linked PCs, sharing settings (`peers.json`).
@@ -202,6 +207,7 @@ impl State {
             events,
             invalidated: AtomicBool::new(false),
             hidden_masks: Mutex::new(HashMap::new()),
+            space_totals: Mutex::new(Vec::new()),
             journals: Mutex::new(journals),
             peers: Mutex::new(seek_sync::peers::PeerStore::load(&cfg_dir)),
             remote_cursors: Mutex::new(remote_cursors),
@@ -413,6 +419,34 @@ impl State {
             },
         );
         mask
+    }
+
+    /// Folder totals of `ix` (the index of `device`) as `sid` may see them (`mask` = rows hidden from them).
+    /// Cached until the index changes; only the most recently used few are kept.
+    pub fn space_totals(
+        &self,
+        device: &Device,
+        ix: &DeviceIndex,
+        sid: &str,
+        mask: Option<&[bool]>,
+    ) -> Arc<FolderTotals> {
+        const KEPT: usize = 2;
+        let key = (device.id, if mask.is_some() { sid.to_string() } else { String::new() });
+        let mut cache = self.space_totals.lock().unwrap();
+        if let Some(i) = cache.iter().position(|(k, t)| *k == key && t.is_current(ix)) {
+            let hit = cache.remove(i);
+            let t = hit.1.clone();
+            cache.push(hit);
+            return t;
+        }
+        cache.retain(|(k, _)| *k != key);
+        drop(cache);
+        let t = Arc::new(FolderTotals::compute(ix, mask));
+        let mut cache = self.space_totals.lock().unwrap();
+        cache.push((key, t.clone()));
+        let excess = cache.len().saturating_sub(KEPT);
+        cache.drain(..excess);
+        t
     }
 
     /// Every device that has an index, in registry order.

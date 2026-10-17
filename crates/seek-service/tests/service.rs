@@ -851,3 +851,139 @@ async fn usb_stick_known_from_another_pc_gets_its_own_local_record() {
     );
     assert_eq!(*fake.scans.lock().unwrap(), 1);
 }
+
+async fn device_id(c: &mut Client) -> seek_core::DeviceId {
+    match c.request(Request::ListDevices).await.unwrap() {
+        Response::Devices { devices } => devices[0].id,
+        other => panic!("expected Devices, got {other:?}"),
+    }
+}
+
+async fn space_tree(c: &mut Client, device_id: seek_core::DeviceId, path: &str, depth: u8) -> Response {
+    c.request(Request::SpaceTree { device_id, path: path.into(), depth }).await.unwrap()
+}
+
+fn node(r: Response) -> seek_core::SpaceNode {
+    match r {
+        Response::SpaceTree { node } => node,
+        other => panic!("expected SpaceTree, got {other:?}"),
+    }
+}
+
+// Files 11..=1000 live in folder(id % 10 + 1); folder1 holds 20, 30, …, 1000.
+const ALL_BYTES: u64 = (11 + 1000) * 990 / 2;
+
+#[tokio::test(flavor = "multi_thread")]
+async fn space_tree_sums_the_drive() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = Arc::new(Fake::default());
+    fake.vols.lock().unwrap().push(volume());
+    let svc = start(dir.path(), fake.clone()).await;
+    let mut c = connect(&svc.pipe).await;
+    wait_for(&mut c, "device scanned", scanned_online).await;
+    let id = device_id(&mut c).await;
+
+    let root = node(space_tree(&mut c, id, "T:\\", 2).await);
+    assert_eq!((root.bytes, root.files), (ALL_BYTES, 990));
+    let names: Vec<&str> = root.children.iter().map(|n| n.name.as_str()).collect();
+    assert_eq!(names.len(), 10);
+    assert_eq!(&names[..3], ["folder1", "folder10", "folder9"]);
+    assert_eq!(root.children[0].bytes, 10 * (2..=100).sum::<u64>());
+    assert!(root.children[0].children.iter().all(|f| f.kind == seek_core::SpaceKind::File || f.files > 1));
+    assert_eq!(node(space_tree(&mut c, id, "t:", 1).await).bytes, ALL_BYTES, "mount without backslash, any case");
+
+    let _ = svc.stop.send(true);
+    svc.task.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn space_tree_of_a_folder_and_of_a_missing_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = Arc::new(Fake::default());
+    fake.vols.lock().unwrap().push(volume());
+    let svc = start(dir.path(), fake.clone()).await;
+    let mut c = connect(&svc.pipe).await;
+    wait_for(&mut c, "device scanned", scanned_online).await;
+    let id = device_id(&mut c).await;
+
+    let f3 = node(space_tree(&mut c, id, r"T:\FOLDER3\", 1).await);
+    assert_eq!((f3.name.as_str(), f3.files), ("folder3", 99));
+    assert_eq!(f3.children.len(), 99);
+    match space_tree(&mut c, id, r"T:\nope", 1).await {
+        Response::Error { message } => assert_eq!(message, "That folder no longer exists"),
+        other => panic!("expected Error, got {other:?}"),
+    }
+    match space_tree(&mut c, uuid::Uuid::new_v4(), "T:\\", 1).await {
+        Response::Error { message } => assert_eq!(message, "Unknown drive"),
+        other => panic!("expected Error, got {other:?}"),
+    }
+
+    let _ = svc.stop.send(true);
+    svc.task.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn space_largest_files_and_types() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = Arc::new(Fake::default());
+    fake.vols.lock().unwrap().push(volume());
+    let svc = start(dir.path(), fake.clone()).await;
+    let mut c = connect(&svc.pipe).await;
+    wait_for(&mut c, "device scanned", scanned_online).await;
+    let id = device_id(&mut c).await;
+
+    let files = match c.request(Request::SpaceLargest { device_id: id, path: "T:\\".into(), limit: 5 }).await.unwrap() {
+        Response::SpaceFiles { files } => files,
+        other => panic!("expected SpaceFiles, got {other:?}"),
+    };
+    let names: Vec<&str> = files.iter().map(|f| f.name.as_str()).collect();
+    assert_eq!(names, ["file1000.txt", "file999.txt", "file998.txt", "file997.txt", "file996.txt"]);
+    assert_eq!(files[0].full_path, r"T:\folder1\file1000.txt");
+    let types = match c.request(Request::SpaceTypes { device_id: id, path: r"T:\folder1".into() }).await.unwrap() {
+        Response::SpaceTypes { types } => types,
+        other => panic!("expected SpaceTypes, got {other:?}"),
+    };
+    assert_eq!(
+        types,
+        [seek_core::TypeTotal { category: seek_core::TypeCategory::Documents, bytes: 10 * (2..=100).sum::<u64>(), files: 99 }]
+    );
+
+    let _ = svc.stop.send(true);
+    svc.task.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn space_view_hides_other_users_folders() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = Arc::new(Fake::default());
+    fake.vols.lock().unwrap().push(volume());
+    *fake.profiles.lock().unwrap() = vec![(ME.into(), r"T:\folder1".into()), ("S-1-5-21-bob".into(), r"T:\FOLDER2\".into())];
+    let svc = start(dir.path(), fake.clone()).await;
+    let mut c = connect(&svc.pipe).await;
+    wait_for(&mut c, "device scanned", scanned_online).await;
+    let id = device_id(&mut c).await;
+
+    let bob_bytes = (11 + 991) * 99 / 2;
+    let root = node(space_tree(&mut c, id, "T:\\", 3).await);
+    assert_eq!(root.bytes, ALL_BYTES, "totals stay true");
+    assert!(!root.children.iter().any(|n| n.name == "folder2"));
+    let other = root.children.iter().find(|n| n.kind == seek_core::SpaceKind::Hidden).unwrap();
+    assert_eq!((other.name.as_str(), other.bytes, other.files), ("Other users", bob_bytes, 99));
+    assert!(matches!(space_tree(&mut c, id, r"T:\folder2", 1).await, Response::Error { .. }));
+    match c.request(Request::SpaceLargest { device_id: id, path: "T:\\".into(), limit: 1000 }).await.unwrap() {
+        Response::SpaceFiles { files } => {
+            assert_eq!(files.len(), 990 - 99);
+            assert!(files.iter().all(|f| !f.folder.ends_with("folder2")));
+        }
+        other => panic!("expected SpaceFiles, got {other:?}"),
+    }
+
+    *fake.elevated.lock().unwrap() = true;
+    let mut admin = connect(&svc.pipe).await;
+    let root = node(space_tree(&mut admin, id, "T:\\", 1).await);
+    assert!(root.children.iter().any(|n| n.name == "folder2"));
+    assert!(!root.children.iter().any(|n| n.kind == seek_core::SpaceKind::Hidden));
+
+    let _ = svc.stop.send(true);
+    svc.task.await.unwrap().unwrap();
+}

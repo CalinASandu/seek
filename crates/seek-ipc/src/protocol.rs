@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub use seek_core::{Device, DeviceId, ResultRow, SortKey};
+pub use seek_core::{Device, DeviceId, ResultRow, SortKey, SpaceNode, TypeTotal};
 
 pub const PIPE_NAME: &str = r"\\.\pipe\seek-v1";
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -54,6 +54,13 @@ pub enum Request {
     /// "Share this PC's files with linked PCs".
     SetSharing { enabled: bool },
     SetDeviceShared { device_id: DeviceId, shared: bool },
+    /// What fills `path` (a folder's full path; the drive root is its mount point, e.g. `D:\`), `depth`
+    /// levels deep, largest first.
+    SpaceTree { device_id: DeviceId, path: String, depth: u8 },
+    /// The `limit` largest files below `path`.
+    SpaceLargest { device_id: DeviceId, path: String, limit: u32 },
+    /// Bytes below `path` by kind of file.
+    SpaceTypes { device_id: DeviceId, path: String },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -73,6 +80,9 @@ pub enum Response {
     PairingCode { code: String, expires_ms: i64 },
     Pcs { pcs: Vec<PcInfo> },
     Peers { this_pc: PcSummary, peers: Vec<PcSummary>, sharing: bool, unshared: Vec<DeviceId> },
+    SpaceTree { node: SpaceNode },
+    SpaceFiles { files: Vec<ResultRow> },
+    SpaceTypes { types: Vec<TypeTotal> },
 }
 
 /// A Seek PC on the local network.
@@ -165,5 +175,44 @@ mod tests {
         assert_eq!(serde_json::from_str::<Response>(&js).unwrap(), p);
         let e = Response::Event { event: Event::PeersChanged };
         assert_eq!(serde_json::to_string(&e).unwrap(), r#"{"type":"event","event":{"type":"peersChanged"}}"#);
+    }
+
+    #[test]
+    fn space_json_shapes() {
+        let r = Request::SpaceTree { device_id: uuid::Uuid::nil(), path: r"D:\Games".into(), depth: 3 };
+        assert_eq!(
+            serde_json::to_string(&r).unwrap(),
+            r#"{"type":"spaceTree","deviceId":"00000000-0000-0000-0000-000000000000","path":"D:\\Games","depth":3}"#
+        );
+        let leaf = |name: &str, kind| seek_core::SpaceNode {
+            name: name.into(),
+            kind,
+            bytes: 2,
+            files: 1,
+            modified: 0,
+            cloud: false,
+            children: vec![],
+        };
+        let mut node = leaf("Games", seek_core::SpaceKind::Folder);
+        node.children = vec![
+            leaf("a.iso", seek_core::SpaceKind::File),
+            leaf("", seek_core::SpaceKind::Smaller { count: 3 }),
+            leaf("Other users", seek_core::SpaceKind::Hidden),
+        ];
+        let js = serde_json::to_string(&Response::SpaceTree { node: node.clone() }).unwrap();
+        assert!(js.starts_with(r#"{"type":"spaceTree","node":{"name":"Games","kind":"folder","bytes":2"#), "{js}");
+        assert!(js.contains(r#""kind":{"smaller":{"count":3}}"#), "{js}");
+        assert!(js.contains(r#""kind":"hidden""#), "{js}");
+        assert_eq!(serde_json::from_str::<Response>(&js).unwrap(), Response::SpaceTree { node });
+        let t = Response::SpaceTypes {
+            types: vec![seek_core::TypeTotal { category: seek_core::TypeCategory::Video, bytes: 9, files: 1 }],
+        };
+        assert_eq!(
+            serde_json::to_string(&t).unwrap(),
+            r#"{"type":"spaceTypes","types":[{"category":"video","bytes":9,"files":1}]}"#
+        );
+        let l = Request::SpaceLargest { device_id: uuid::Uuid::nil(), path: r"D:\".into(), limit: 50 };
+        assert!(serde_json::to_string(&l).unwrap().starts_with(r#"{"type":"spaceLargest","deviceId":"#));
+        assert_eq!(serde_json::to_string(&Response::SpaceFiles { files: vec![] }).unwrap(), r#"{"type":"spaceFiles","files":[]}"#);
     }
 }

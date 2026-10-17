@@ -194,3 +194,27 @@ pub async fn set_sharing(link: Link<'_>, enabled: bool) -> Result<(), String> {
 pub async fn set_device_shared(link: Link<'_>, device_id: DeviceId, shared: bool) -> Result<(), String> {
     expect_ok(&link, Request::SetDeviceShared { device_id, shared }).await
 }
+
+#[tauri::command]
+pub async fn space_tree(link: Link<'_>, device_id: DeviceId, path: String, depth: u8) -> Result<Value, String> {
+    match link.request(Request::SpaceTree { device_id, path, depth }).await? {
+        Response::SpaceTree { node } => serde_json::to_value(node).map_err(|e| e.to_string()),
+        other => Err(unexpected(other)),
+    }
+}
+
+#[tauri::command]
+pub async fn space_largest(link: Link<'_>, device_id: DeviceId, path: String, limit: u32) -> Result<Value, String> {
+    match link.request(Request::SpaceLargest { device_id, path, limit }).await? {
+        Response::SpaceFiles { files } => serde_json::to_value(files).map_err(|e| e.to_string()),
+        other => Err(unexpected(other)),
+    }
+}
+
+#[tauri::command]
+pub async fn space_types(link: Link<'_>, device_id: DeviceId, path: String) -> Result<Value, String> {
+    match link.request(Request::SpaceTypes { device_id, path }).await? {
+        Response::SpaceTypes { types } => serde_json::to_value(types).map_err(|e| e.to_string()),
+        other => Err(unexpected(other)),
+    }
+}

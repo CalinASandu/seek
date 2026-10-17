@@ -29,6 +29,9 @@ export function createTauriApi(): SeekApi {
     syncNow: () => invoke("sync_now"),
     setSharing: (enabled) => invoke("set_sharing", { enabled }),
     setDeviceShared: (deviceId, shared) => invoke("set_device_shared", { deviceId, shared }),
+    spaceTree: (deviceId, path, depth) => invoke("space_tree", { deviceId, path, depth }),
+    spaceLargest: (deviceId, path, limit) => invoke("space_largest", { deviceId, path, limit }),
+    spaceTypes: (deviceId, path) => invoke("space_types", { deviceId, path }),
     onEvent(cb) {
       let disposed = false;
       let unlisten: (() => void) | null = null;

@@ -13,6 +13,7 @@ import type {
   SortKey,
   Status,
 } from "./types";
+import { createMockSpace } from "./mockSpace";
 
 export interface MockOptions {
   /** Number of synthetic rows (default 300k). */
@@ -302,6 +303,16 @@ export function createMockApi(opts: MockOptions = {}): SeekApi {
   /** Devices of PCs that were unlinked (rows stay in the store, so devices are hidden rather than spliced). */
   const gone = new Set<string>();
   const visible = () => specs.filter((s) => !gone.has(s.device.id));
+  const space = createMockSpace(
+    () =>
+      visible().map((s) => ({
+        id: s.device.id,
+        displayName: s.device.displayName,
+        lastMountPoint: s.device.lastMountPoint,
+        online: s.device.state !== "offline",
+      })),
+    now,
+  );
   const pcName = (host: string) => (host === MOCK_THIS_PC ? thisPc.name : peers.find((p) => p.hostId === host)?.name ?? "");
 
   function ensureTimer() {
@@ -520,6 +531,18 @@ export function createMockApi(opts: MockOptions = {}): SeekApi {
       await delay();
       unshared = shared ? unshared.filter((d) => d !== deviceId) : [...unshared.filter((d) => d !== deviceId), deviceId];
       emit({ type: "peersChanged" });
+    },
+    async spaceTree(deviceId, path, depth) {
+      await delay();
+      return space.tree(deviceId, path, depth);
+    },
+    async spaceLargest(deviceId, path, limit) {
+      await delay();
+      return space.largest(deviceId, path, limit);
+    },
+    async spaceTypes(deviceId, path) {
+      await delay();
+      return space.types(deviceId, path);
     },
     onEvent(cb) {
       listeners.add(cb);

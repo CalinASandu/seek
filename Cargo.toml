@@ -42,9 +42,12 @@ postcard = { version = "1", features = ["use-std"] }
 rand = "0.8"
 mdns-sd = "0.13"
 
+# Everyday release builds compile in parallel and incrementally. The installer script turns on
+# thin LTO and a single codegen unit (a few percent faster, much slower to build) via env vars.
 [profile.release]
-lto = "thin"
-codegen-units = 1
+lto = false
+codegen-units = 16
+incremental = true
 debug = "line-tables-only"
 
 [profile.bench]

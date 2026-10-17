@@ -113,6 +113,9 @@ pub fn run() {
             commands::sync_now,
             commands::set_sharing,
             commands::set_device_shared,
+            commands::space_tree,
+            commands::space_largest,
+            commands::space_types,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Seek");

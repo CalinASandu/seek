@@ -2,6 +2,10 @@
 # The installer ships seek-service.exe next to the app and registers SeekService (runs as SYSTEM).
 # Native tools (cargo, pnpm) write progress to stderr; failures are detected via $LASTEXITCODE.
 $ErrorActionPreference = "Continue"
+# Shipped builds get the fully optimised profile; everyday builds keep the fast one in Cargo.toml.
+$env:CARGO_PROFILE_RELEASE_LTO = "thin"
+$env:CARGO_PROFILE_RELEASE_CODEGEN_UNITS = "1"
+$env:CARGO_PROFILE_RELEASE_INCREMENTAL = "false"
 $root = Split-Path $PSScriptRoot -Parent
 Push-Location $root
 try {

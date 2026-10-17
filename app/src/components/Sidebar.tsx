@@ -31,6 +31,9 @@ interface Props {
   query: string;
   collapsed: boolean;
   onCollapse: () => void;
+  /** Space view: the drive shown (clicking a drive selects it instead of filtering the search). */
+  selectedDevice?: string | null;
+  onSelectDevice: (d: Device) => void;
   onToggleDevice: (token: string) => void;
   onAddShare: () => void;
   onLinkPc: () => void;
@@ -125,10 +128,10 @@ export function Sidebar(p: Props) {
       device={d}
       scanned={p.progress[d.id]}
       collapsed={p.collapsed}
-      active={hasToken(p.query, tokenFor(d))}
+      active={p.selectedDevice !== undefined ? p.selectedDevice === d.id : hasToken(p.query, tokenFor(d))}
       renaming={renaming === d.id}
       note={deviceNote(d)}
-      onToggle={() => p.onToggleDevice(tokenFor(d))}
+      onToggle={() => (p.selectedDevice !== undefined ? p.onSelectDevice(d) : p.onToggleDevice(tokenFor(d)))}
       onContextMenu={(pt) => setMenu({ ...pt, device: d })}
       onRename={() => !isRemote(d) && setRenaming(d.id)}
       onRenameCommit={(n) => void commitRename(d, n)}

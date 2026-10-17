@@ -5,6 +5,7 @@ import { isTauri } from "./api";
 import "@fontsource-variable/inter/opsz.css";
 import "./styles/tokens.css";
 import "./styles/app.css";
+import "./styles/space.css";
 
 if (isTauri()) document.documentElement.classList.add("mica");
 

@@ -10,9 +10,11 @@ import { ResultsTable } from "./components/ResultsTable";
 import { SearchBar } from "./components/SearchBar";
 import { ServiceSetup } from "./components/ServiceSetup";
 import { SettingsPanel } from "./components/SettingsPanel";
+import { SpaceView } from "./components/space/SpaceView";
 import { Sidebar } from "./components/Sidebar";
 import { StatusBar } from "./components/StatusBar";
 import { TitleBar } from "./components/TitleBar";
+import { ViewSwitch, type View } from "./components/ViewSwitch";
 import { useDevices } from "./hooks/useDevices";
 import { useHotkeys } from "./hooks/useHotkeys";
 import { useSearch } from "./hooks/useSearch";
@@ -22,6 +24,15 @@ import { toggleToken } from "./lib/query";
 
 const SORT_KEYS: SortKey[] = ["name", "path", "size", "modified", "device"];
 const COLLAPSE_KEY = "seek.sidebarCollapsed";
+const VIEW_KEY = "seek.view";
+
+function readView(): View {
+  try {
+    return localStorage.getItem(VIEW_KEY) === "space" ? "space" : "search";
+  } catch {
+    return "search";
+  }
+}
 
 function readCollapsed(): boolean {
   try {
@@ -47,6 +58,8 @@ function Shell() {
   const [sort, setSort] = useState<SortKey>("name");
   const [descending, setDescending] = useState(false);
   const [collapsed, setCollapsed] = useState(readCollapsed);
+  const [view, setViewState] = useState<View>(readView);
+  const [spaceDevice, setSpaceDevice] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState(false);
   const [showShare, setShowShare] = useState(false);
   const [showLink, setShowLink] = useState(false);
@@ -92,11 +105,27 @@ function Shell() {
     inputRef.current?.select();
   };
 
+  const setView = useCallback((v: View) => {
+    setViewState(v);
+    try {
+      localStorage.setItem(VIEW_KEY, v);
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
   const hotkeys = useMemo(() => {
-    const map: Record<string, () => void> = { "ctrl+f": focusSearch, f5: search.refresh };
-    SORT_KEYS.forEach((k, i) => (map[`ctrl+${i + 1}`] = () => onSort(k)));
+    const map: Record<string, () => void> = {
+      "ctrl+f": () => {
+        setView("search");
+        setTimeout(focusSearch);
+      },
+      f5: search.refresh,
+      "ctrl+shift+s": () => setView(view === "space" ? "search" : "space"),
+    };
+    if (view === "search") SORT_KEYS.forEach((k, i) => (map[`ctrl+${i + 1}`] = () => onSort(k)));
     return map;
-  }, [onSort, search.refresh]);
+  }, [onSort, search.refresh, setView, view]);
   useHotkeys(hotkeys);
 
   const toggleCollapsed = () => {
@@ -129,10 +158,21 @@ function Shell() {
   }
 
   const hasQuery = query.trim() !== "";
+  // Space view: the chosen drive, else the first one of this PC that is online.
+  const spaceDrive =
+    devices.find((d) => d.id === spaceDevice) ??
+    devices.find((d) => !remotePc.has(d.id) && d.state !== "offline") ??
+    devices[0];
+
+  const searchIn = (folder: string) => {
+    setQuery(`path:"${folder}" `);
+    setView("search");
+    setTimeout(() => inputRef.current?.focus());
+  };
 
   return (
     <div className={`app${collapsed ? " is-collapsed" : ""}`}>
-      <TitleBar />
+      <TitleBar center={<ViewSwitch view={view} onChange={setView} />} />
       <Sidebar
         devices={devices}
         progress={progress}
@@ -140,6 +180,8 @@ function Shell() {
         query={query}
         collapsed={collapsed}
         onCollapse={toggleCollapsed}
+        selectedDevice={view === "space" ? (spaceDrive?.id ?? null) : undefined}
+        onSelectDevice={(d) => setSpaceDevice(d.id)}
         onToggleDevice={(t) => applyToken(t)}
         onAddShare={() => setShowShare(true)}
         onLinkPc={() => setShowLink(true)}
@@ -147,6 +189,23 @@ function Shell() {
         onChanged={() => void refresh()}
         notify={notify}
       />
+      {view === "space" ? (
+        <main className="main">
+          {spaceDrive ? (
+            <SpaceView
+              device={spaceDrive}
+              remotePc={remotePc.get(spaceDrive.id)}
+              scanned={progress[spaceDrive.id]}
+              notify={notify}
+              onSearchIn={searchIn}
+            />
+          ) : (
+            <div className="space-empty">
+              <p className="space-empty-title">No drives yet</p>
+            </div>
+          )}
+        </main>
+      ) : (
       <main className="main">
         <div className="main-head">
           <SearchBar value={query} onChange={setQuery} error={search.error} inputRef={inputRef} onArrowDown={focusGrid} />
@@ -180,11 +239,12 @@ function Shell() {
           ) : null}
         </div>
       </main>
+      )}
       <StatusBar
-        total={hasQuery && search.active ? search.total : null}
+        total={view === "search" && hasQuery && search.active ? search.total : null}
         elapsedMs={search.elapsedMs}
         loading={search.loading}
-        stale={hasQuery && search.active && search.stale}
+        stale={view === "search" && hasQuery && search.active && search.stale}
         onRefresh={search.refresh}
         status={status}
         devices={devices}

@@ -104,6 +104,23 @@ network. Other users can't see your profile folder.
 
 </details>
 
+## Space
+
+Switch to **Space** in the title bar (or press <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>S</kbd>) to see what fills a
+drive. It is computed from the index, so it opens instantly, stays current, and works for offline drives and
+your other PCs' drives too.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="app/docs/screenshots/11-space-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="app/docs/screenshots/11-space-light.png">
+  <img src="app/docs/screenshots/11-space-light.png" alt="Space view: a sunburst of the drive's folders next to a list of its largest items, with the drive's capacity bar above">
+</picture>
+
+- Click a ring (or double-click a row) to open a folder; click the center or press <kbd>Backspace</kbd> to go up.
+- **Largest** lists the biggest files below the folder; **By type** splits it into video, pictures, apps and more.
+- Right-click: *Show in Explorer*, *Copy path*, or *Search in this folder*.
+- Other users' folders are counted but never named: they show as one *Other users* item.
+
 ## Search syntax
 
 | Query | Finds |
@@ -139,6 +156,8 @@ and from synthetic benchmarks. Run them yourself with `seek perf`.
 | Index D: (718 k entries, folder walk) | 14 s | |
 | Service memory with 2.8 M entries | ~370 MB | |
 | New file visible in search (watched drive) | 2–4 s | < 2 s |
+| Space: folder sizes of a **2 M**-entry drive | 113 ms (then cached) | < 150 ms |
+| Space: open a folder (3 rings) | 0.8 ms | < 20 ms |
 
 ## Install
 
@@ -251,6 +270,8 @@ flowchart LR
 - [x] Live updates (USN journal; changed-folder rescans everywhere else)
 - [x] Windows installer with background service
 - [x] Sync between your own PCs on the local network
+- [x] Space view: what fills each drive, including offline drives and other PCs
+- [ ] Cleanup: duplicates across PCs, leftovers of uninstalled apps, reversible deletes
 - [ ] Optional self-hosted sync server
 - [ ] macOS and Linux
 - [ ] Content search and duplicate finder

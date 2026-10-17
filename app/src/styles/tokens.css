@@ -70,6 +70,23 @@
   --danger-text: light-dark(#d70015, #ff6961);
   --danger-soft: light-dark(#ff3b301a, #ff453a2e);
 
+  /* Space view: first-ring folders in Apple system hues, ordered so neighbours contrast (no red: it means danger) */
+  --chart-0: light-dark(#007aff, #0a84ff); /* blue */
+  --chart-1: light-dark(#ff9500, #ff9f0a); /* orange */
+  --chart-2: light-dark(#af52de, #bf5af2); /* purple */
+  --chart-3: light-dark(#34c759, #30d158); /* green */
+  --chart-4: light-dark(#ff2d55, #ff375f); /* pink */
+  --chart-5: light-dark(#30b0c7, #40c8e0); /* teal */
+  --chart-6: light-dark(#5856d6, #5e5ce6); /* indigo */
+  --chart-7: light-dark(#ffcc00, #ffd60a); /* yellow */
+  --chart-8: light-dark(#00c7be, #63e6e2); /* mint */
+  --chart-9: light-dark(#a2845e, #ac8e68); /* brown */
+  --chart-file: light-dark(#c7c7cc, #545458);
+  --chart-rest: light-dark(#d1d1d6, #48484a);
+  --chart-gap: var(--surface);
+  /* outer rings are mixed toward this: paler in light mode, softer (never muddy) in dark mode */
+  --chart-tone: light-dark(#ffffff, #aeaeb2);
+
   --shadow-card: 0 0 0 0.5px light-dark(#0000001a, #ffffff1a), 0 1px 3px light-dark(#0000000f, #00000066);
   --shadow-control: 0 0 0 0.5px light-dark(#0000002e, #ffffff1f), 0 1px 1.5px light-dark(#0000001a, #00000066);
   --shadow-menu: 0 0 0 0.5px light-dark(#00000026, #ffffff26), 0 10px 32px light-dark(#00000029, #00000080), 0 2px 6px light-dark(#0000000f, #00000040);
