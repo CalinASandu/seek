@@ -101,6 +101,8 @@ network. Other users can't see your profile folder.
 | Rename, rescan or forget a device | Results from offline drives say where the file lived |
 | ![Add network share](app/docs/screenshots/04-add-share-light.png) | ![Settings](app/docs/screenshots/05-settings-light.png) |
 | Add a NAS share by its path | Settings, in light mode |
+| ![Space view](app/docs/screenshots/11-space-dark.png) | ![Space by type](app/docs/screenshots/13-space-types-light.png) |
+| Space: what fills a drive | Space: the same drive split by file type |
 
 </details>
 
@@ -110,11 +112,13 @@ Switch to **Space** in the title bar (or press <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+
 drive. It is computed from the index, so it opens instantly, stays current, and works for offline drives and
 your other PCs' drives too.
 
+<div align="center">
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="app/docs/screenshots/11-space-dark.png">
-  <source media="(prefers-color-scheme: light)" srcset="app/docs/screenshots/11-space-light.png">
-  <img src="app/docs/screenshots/11-space-light.png" alt="Space view: a sunburst of the drive's folders next to a list of its largest items, with the drive's capacity bar above">
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/space-dark.svg">
+  <source media="(prefers-color-scheme: light)" srcset="docs/assets/space-light.svg">
+  <img src="docs/assets/space-dark.svg" width="860" alt="Space view of drive C: the folder sunburst sweeps in next to a list of the drive's contents, then a click on the Calin ring opens that folder">
 </picture>
+</div>
 
 - Click a ring (or double-click a row) to open a folder; click the center or press <kbd>Backspace</kbd> to go up.
 - **Largest** lists the biggest files below the folder; **By type** splits it into video, pictures, apps and more.
