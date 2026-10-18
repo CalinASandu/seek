@@ -6,3 +6,6 @@ app/src-tauri/binaries/
 app/src-tauri/gen/
 *.seekidx
 .DS_Store
+.superpowers/
+perf-results/
+app/src-tauri/binaries/

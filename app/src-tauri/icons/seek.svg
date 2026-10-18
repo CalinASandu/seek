@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#4f8ff7"/>
+      <stop offset="1" stop-color="#2557d6"/>
+    </linearGradient>
+  </defs>
+  <rect x="64" y="64" width="896" height="896" rx="208" fill="url(#bg)"/>
+  <!-- stacked drives -->
+  <rect x="236" y="560" width="300" height="74" rx="28" fill="#ffffff" opacity="0.35"/>
+  <rect x="236" y="664" width="300" height="74" rx="28" fill="#ffffff" opacity="0.55"/>
+  <!-- magnifier -->
+  <circle cx="560" cy="430" r="190" fill="none" stroke="#ffffff" stroke-width="76"/>
+  <line x1="700" y1="570" x2="800" y2="670" stroke="#ffffff" stroke-width="88" stroke-linecap="round"/>
+</svg>
