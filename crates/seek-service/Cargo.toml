@@ -9,6 +9,8 @@ description = "Seek background service: owns indexes, scans volumes, serves sear
 [dependencies]
 seek-core.workspace = true
 seek-scan.workspace = true
+seek-sync.workspace = true
+mdns-sd.workspace = true
 seek-ipc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
