@@ -267,6 +267,39 @@ flowchart LR
 
 </details>
 
+## Seek Hub (optional, self-hosted)
+
+PCs on the same network find each other directly. To sync PCs that are never on the same network, run the hub: a
+small container (first target: a Raspberry Pi 4) that stores each PC's index encrypted and is reachable only
+through a Tailscale Funnel address. The PCs stay the source of truth; the hub never connects out. Setup, the
+Tailscale checklist and the commands are in [`docker/README.md`](docker/README.md). One rule worth knowing: `init`
+runs while the hub is stopped (the one-shot form is `docker compose run --rm --no-deps seek-hub <command>`, the
+entrypoint already is the binary). The image is built on the Pi from binaries cross-compiled on Windows; no Docker
+is needed on the PC. Order of a first setup (details in `docker/README.md`):
+
+```powershell
+.\scripts\build-hub-image.ps1                    # Windows: docker\dist\{arm64,amd64}\seek-hub
+scp -r docker pi@<pi>:seek-hub               # dist/ is git-ignored, so copy the whole folder
+```
+
+```sh
+# on the Pi, in ~/seek-hub
+docker build --build-arg TARGETARCH=arm64 -t ghcr.io/calinasandu/seek-hub:0.1.0 .
+mkdir -p data keys tailscale && sudo chown 10001:10001 data keys && sudo chown root:root tailscale
+cp .env.example .env                             # then fill in TS_AUTHKEY and SEEK_HUB_PUBLIC
+docker run --rm -v "$PWD/data:/data" -v "$PWD/keys:/keys" ghcr.io/calinasandu/seek-hub:0.1.0 init --keys
+docker compose up -d && docker compose logs --tail 30 tailscale seek-hub
+# optional: hub name, quotas, LAN (after `up`: the hub shares the tailscale container's network)
+docker compose stop seek-hub; docker compose run --rm --no-deps seek-hub init; docker compose start seek-hub
+openssl s_client -connect seek-hub.<tailnet>.ts.net:443 -servername seek-hub.<tailnet>.ts.net -tls1_3 </dev/null
+docker exec seek-hub seek-hub doctor --public    # the certificate can take a few minutes: retry
+docker exec -it seek-hub seek-hub link           # once per PC, then: Link a device -> Hub in Seek
+docker exec seek-hub seek-hub status
+```
+
+A value in `docker/.env` (`SEEK_HUB_PUBLIC`, `SEEK_HUB_LAN`) overrides what `init` saved; leave it empty to use
+`init`'s value.
+
 ## Roadmap
 
 - [x] Instant search across every local drive, network share and cloud drive
@@ -276,7 +309,7 @@ flowchart LR
 - [x] Sync between your own PCs on the local network
 - [x] Space view: what fills each drive, including offline drives and other PCs
 - [ ] Cleanup: duplicates across PCs, leftovers of uninstalled apps, reversible deletes
-- [ ] Optional self-hosted sync server
+- [x] Optional self-hosted sync hub (Docker + Tailscale Funnel; not yet verified on a Pi)
 - [ ] macOS and Linux
 - [ ] Content search and duplicate finder
 

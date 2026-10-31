@@ -256,6 +256,9 @@ async fn handle(state: Arc<State>, conn: Arc<Conn>, req: Request) -> Response {
         Request::StartPairing
         | Request::DiscoveredPcs
         | Request::JoinPairing { .. }
+        | Request::LinkHub { .. }
+        | Request::UnlinkHub
+        | Request::HubStatus
         | Request::ListPeers
         | Request::Unlink { .. }
         | Request::RenamePeer { .. }
@@ -298,6 +301,15 @@ async fn sync_request(state: &Arc<State>, rt: &Arc<PeersRuntime>, conn: &Conn, r
                 Err(e) => err(e),
             }
         }
+        Request::LinkHub { addr, code } => match rt.link_hub(addr.trim(), &code, &conn.sid).await {
+            Ok(name) => Response::HubLinked { name },
+            Err(e) => err(e),
+        },
+        Request::UnlinkHub => match rt.unlink_hub().await {
+            Ok(()) => Response::Ok,
+            Err(e) => err(e),
+        },
+        Request::HubStatus => Response::Hub { hub: rt.hub_status() },
         Request::ListPeers => peers_info(state, rt),
         Request::Unlink { host_id } => match rt.unlink(host_id).await {
             Ok(()) => Response::Ok,
@@ -308,10 +320,9 @@ async fn sync_request(state: &Arc<State>, rt: &Arc<PeersRuntime>, conn: &Conn, r
             if name.is_empty() {
                 return err("name cannot be empty");
             }
-            if state.peers.lock().unwrap().get(host_id).is_none() {
-                return err("that device is not linked");
+            if let Err(e) = rt.rename_peer(host_id, name) {
+                return err(&e);
             }
-            rt.rename_peer(host_id, name);
             state.invalidate();
             Response::Ok
         }
@@ -350,10 +361,11 @@ fn peers_info(state: &Arc<State>, rt: &Arc<PeersRuntime>) -> Response {
             .file
             .peers
             .iter()
+            .filter(|p| p.role == seek_sync::Role::Pc)
             .map(|p| PcSummary {
                 host_id: p.host_id,
                 name: p.name.clone(),
-                online: rt.is_connected(p.host_id),
+                online: rt.peer_online(p),
                 last_sync_ms: p.last_sync_ms,
                 needs_relink: p.state == PeerState::NeedsRelink,
             })

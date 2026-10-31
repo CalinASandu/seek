@@ -45,6 +45,12 @@ pub enum Request {
     DiscoveredPcs,
     /// Links with the PC at `addr` (`ip:port`) that shows `code`.
     JoinPairing { addr: String, code: String },
+    /// Links this PC to the hub at `addr` (e.g. `tls://seek-hub.tailnet.ts.net`) that shows `code` (8 digits).
+    /// Fails with an error message that starts with one of the `HUB_ERR_*` prefixes when the cause is known.
+    LinkHub { addr: String, code: String },
+    /// Unlinks from the hub, or dismisses the *hub unlinked this PC* notice.
+    UnlinkHub,
+    HubStatus,
     ListPeers,
     /// Removes the link with a PC on both sides, and everything copied from it.
     Unlink { host_id: uuid::Uuid },
@@ -79,11 +85,21 @@ pub enum Response {
     Event { event: Event },
     PairingCode { code: String, expires_ms: i64 },
     Pcs { pcs: Vec<PcInfo> },
+    /// Answer to `LinkHub`: the hub's name.
+    HubLinked { name: String },
+    /// Answer to `HubStatus`: `None` when this PC is not linked to a hub.
+    Hub { hub: Option<HubStatus> },
     Peers { this_pc: PcSummary, peers: Vec<PcSummary>, sharing: bool, unshared: Vec<DeviceId> },
     SpaceTree { node: SpaceNode },
     SpaceFiles { files: Vec<ResultRow> },
     SpaceTypes { types: Vec<TypeTotal> },
 }
+
+/// Prefixes of the `Response::Error` message of `LinkHub` when the cause is one the app explains in its own words.
+/// The rest of the message is a plain-English text for other clients.
+pub const HUB_ERR_WRONG_CODE: &str = "[hub:wrong-code] ";
+pub const HUB_ERR_NO_WINDOW: &str = "[hub:no-window] ";
+pub const HUB_ERR_UNTRUSTED: &str = "[hub:untrusted] ";
 
 /// A Seek PC on the local network.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -105,6 +121,25 @@ pub struct PcSummary {
     pub last_sync_ms: i64,
     /// The PC came back with a different identity (reinstalled) and must be linked again.
     pub needs_relink: bool,
+}
+
+/// This PC's link to a self-hosted hub.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct HubStatus {
+    pub name: String,
+    /// The address the PC was linked with (as typed, canonicalised).
+    pub addr: String,
+    pub online: bool,
+    /// Unix ms of the last update exchanged with the hub; 0 = never.
+    pub last_sync_ms: i64,
+    /// Why the last attempt failed, or what the hub refused or did (e.g. *The hub unlinked this PC*).
+    pub last_error: Option<String>,
+    /// The other PCs of the hub, as far as the last catalog told.
+    pub pcs: Vec<PcSummary>,
+    /// The hub removed this PC's link: this is only the notice, and the PC is back in LAN mode.
+    #[serde(default)]
+    pub unlinked: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -175,6 +210,33 @@ mod tests {
         assert_eq!(serde_json::from_str::<Response>(&js).unwrap(), p);
         let e = Response::Event { event: Event::PeersChanged };
         assert_eq!(serde_json::to_string(&e).unwrap(), r#"{"type":"event","event":{"type":"peersChanged"}}"#);
+    }
+
+    #[test]
+    fn hub_json_shapes() {
+        let l = Request::LinkHub { addr: "tls://h.example".into(), code: "12345678".into() };
+        assert_eq!(serde_json::to_string(&l).unwrap(), r#"{"type":"linkHub","addr":"tls://h.example","code":"12345678"}"#);
+        assert_eq!(serde_json::to_string(&Request::UnlinkHub).unwrap(), r#"{"type":"unlinkHub"}"#);
+        assert_eq!(serde_json::to_string(&Request::HubStatus).unwrap(), r#"{"type":"hubStatus"}"#);
+        let n = Response::HubLinked { name: "Seek Hub".into() };
+        assert_eq!(serde_json::to_string(&n).unwrap(), r#"{"type":"hubLinked","name":"Seek Hub"}"#);
+        assert_eq!(serde_json::to_string(&Response::Hub { hub: None }).unwrap(), r#"{"type":"hub","hub":null}"#);
+        let hub = HubStatus {
+            name: "H".into(),
+            addr: "tls://h.example".into(),
+            online: true,
+            last_sync_ms: 9,
+            last_error: None,
+            pcs: vec![],
+            unlinked: false,
+        };
+        let r = Response::Hub { hub: Some(hub) };
+        let js = serde_json::to_string(&r).unwrap();
+        assert_eq!(
+            js,
+            r#"{"type":"hub","hub":{"name":"H","addr":"tls://h.example","online":true,"lastSyncMs":9,"lastError":null,"pcs":[],"unlinked":false}}"#
+        );
+        assert_eq!(serde_json::from_str::<Response>(&js).unwrap(), r);
     }
 
     #[test]

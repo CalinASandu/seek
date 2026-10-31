@@ -6,6 +6,7 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 
 use crate::noise::Keys;
+use crate::wire::Role;
 use crate::Error;
 
 /// A group holds at most this many PCs, this one included.
@@ -39,6 +40,16 @@ pub struct Peer {
     #[serde(default)]
     pub last_sync_ms: i64,
     pub state: PeerState,
+    /// A PC (LAN peer, or a PC known through the hub) or the hub itself.
+    #[serde(default)]
+    pub role: Role,
+    /// The hub's addresses, tried in order (empty for a PC). For the hub peer, `linked_users` holds one pair:
+    /// the local user who linked it (and the same SID again: one person on every PC of the hub).
+    #[serde(default)]
+    pub addrs: Vec<String>,
+    /// A PC only known from the hub's catalog: never dialed, not part of the LAN group.
+    #[serde(default)]
+    pub via_hub: bool,
 }
 
 fn yes() -> bool {
@@ -67,6 +78,13 @@ impl Default for PeerFile {
 pub struct PeerStore {
     dir: PathBuf,
     pub file: PeerFile,
+}
+
+impl PeerFile {
+    /// The hub this PC is linked to, if any.
+    pub fn hub(&self) -> Option<&Peer> {
+        self.peers.iter().find(|p| p.role == Role::Hub)
+    }
 }
 
 impl PeerStore {
@@ -165,6 +183,9 @@ mod tests {
             profiles: vec![],
             last_sync_ms: 0,
             state: PeerState::Linked,
+            role: Role::Pc,
+            addrs: Vec::new(),
+            via_hub: false,
         }
     }
 
@@ -196,6 +217,18 @@ mod tests {
         let s = PeerStore::load(dir.path());
         assert!(s.file.peers.is_empty() && s.file.sharing);
         assert!(dir.path().join("peers.json.bad").exists());
+    }
+
+    #[test]
+    fn peer_file_without_role_loads_as_pc() {
+        let f: PeerFile = serde_json::from_str(
+            r#"{"peers":[{"hostId":"00000000-0000-0000-0000-000000000007","name":"Laptop","publicKey":"AA==",
+                "addr":"10.0.0.2:47321","state":"linked"}]}"#,
+        )
+        .unwrap();
+        let p = &f.peers[0];
+        assert!(p.role == Role::Pc && p.addrs.is_empty() && !p.via_hub);
+        assert!(f.hub().is_none());
     }
 
     #[test]

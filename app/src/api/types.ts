@@ -84,6 +84,22 @@ export interface Peers {
   unshared: string[];
 }
 
+/** This PC's link to a self-hosted hub. */
+export interface HubStatus {
+  name: string;
+  /** The address the PC was linked with, e.g. `tls://seek-hub.your-tailnet.ts.net`. */
+  addr: string;
+  online: boolean;
+  /** Unix ms of the last update exchanged with the hub; 0 = never. */
+  lastSyncMs: number;
+  /** Why the last attempt failed, or what the hub did (*The hub unlinked this PC*). */
+  lastError: string | null;
+  /** The other PCs of the hub. */
+  pcs: PcSummary[];
+  /** The hub removed this PC's link: only the notice is left (until dismissed), the PC is back in LAN mode. */
+  unlinked?: boolean;
+}
+
 export interface PairingCode {
   code: string;
   expiresMs: number;
@@ -136,6 +152,12 @@ export interface SeekApi {
   startPairing(): Promise<PairingCode>;
   discoveredPcs(): Promise<PcInfo[]>;
   joinPairing(addr: string, code: string): Promise<void>;
+  /** Links to the hub at `addr` showing `code` (8 digits); resolves with the hub's name. */
+  linkHub(addr: string, code: string): Promise<string>;
+  /** Unlinks from the hub, or dismisses the *hub unlinked this PC* notice. */
+  unlinkHub(): Promise<void>;
+  /** `null` when this PC is not linked to a hub. */
+  hubStatus(): Promise<HubStatus | null>;
   listPeers(): Promise<Peers>;
   unlink(hostId: string): Promise<void>;
   renamePeer(hostId: string, name: string): Promise<void>;

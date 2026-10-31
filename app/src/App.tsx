@@ -68,7 +68,7 @@ function Shell() {
   const scrollerRef = useRef<HTMLDivElement>(null);
   const toastTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 
-  const { devices, status, progress, peers, refresh } = useDevices();
+  const { devices, status, progress, peers, hub, refresh } = useDevices();
   const remotePc = useMemo(() => remotePcNames(devices, peers), [devices, peers]);
   const { settings, update } = useSettings();
   const search = useSearch(query, sort, descending);
@@ -177,6 +177,7 @@ function Shell() {
         devices={devices}
         progress={progress}
         peers={peers}
+        hub={hub}
         query={query}
         collapsed={collapsed}
         onCollapse={toggleCollapsed}
@@ -250,6 +251,7 @@ function Shell() {
         devices={devices}
         progress={progress}
         peers={peers}
+        hub={hub}
       />
 
       {toast && (
@@ -263,9 +265,16 @@ function Shell() {
           settings={settings}
           version={status?.serviceVersion}
           peers={peers}
+          hub={hub}
           onChange={update}
           onSharing={(on) => void api.setSharing(on).catch((e: unknown) => notify(errText(e)))}
           onLinkPc={() => setShowLink(true)}
+          onUnlinkHub={(done) =>
+            void api.unlinkHub().then(
+              () => done && notify(done),
+              (e: unknown) => notify(errText(e)),
+            )
+          }
           onClose={() => setShowSettings(false)}
         />
       )}

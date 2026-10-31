@@ -152,7 +152,30 @@ fn check_arena_refs(offs: &[u32], lens: &[u16], arena: &str, what: &str) -> Resu
     Ok(())
 }
 
+/// Checks magic, version and header of a serialized index without decoding the body.
+pub fn check_index_head(bytes: &[u8]) -> Result<IndexHeader, Error> {
+    let mut cur = Cursor { b: bytes };
+    if cur.take(8)? != INDEX_MAGIC {
+        return Err(bad("bad magic"));
+    }
+    let version = u32::get(cur.take(4)?);
+    if version != INDEX_FORMAT_VERSION {
+        return Err(bad(format!("unsupported version {version}")));
+    }
+    let hdr_len = u32::get(cur.take(4)?) as usize;
+    serde_json::from_slice(cur.take(hdr_len)?).map_err(|e| bad(format!("bad header: {e}")))
+}
+
+/// Most a copy's body may decompress to (a compressed body can claim far more than it weighs).
+pub const MAX_INDEX_PLAIN: u64 = 512 << 20;
+
 pub fn decode_index(bytes: &[u8]) -> Result<(IndexHeader, DeviceIndex), Error> {
+    decode_index_limited(bytes, MAX_INDEX_PLAIN)
+}
+
+/// [`decode_index`] refusing a body that decompresses to more than `limit` bytes.
+pub fn decode_index_limited(bytes: &[u8], limit: u64) -> Result<(IndexHeader, DeviceIndex), Error> {
+    use std::io::Read;
     let mut cur = Cursor { b: bytes };
     if cur.take(8)? != INDEX_MAGIC {
         return Err(bad("bad magic"));
@@ -164,7 +187,12 @@ pub fn decode_index(bytes: &[u8]) -> Result<(IndexHeader, DeviceIndex), Error> {
     let hdr_len = u32::get(cur.take(4)?) as usize;
     let header: IndexHeader =
         serde_json::from_slice(cur.take(hdr_len)?).map_err(|e| bad(format!("bad header: {e}")))?;
-    let body = zstd::decode_all(cur.b).map_err(|e| bad(format!("bad body: {e}")))?;
+    let dec = zstd::Decoder::new(cur.b).map_err(|e| bad(format!("bad body: {e}")))?;
+    let mut body = Vec::new();
+    dec.take(limit + 1).read_to_end(&mut body).map_err(|e| bad(format!("bad body: {e}")))?;
+    if body.len() as u64 > limit {
+        return Err(bad(format!("body larger than {limit} bytes unpacked")));
+    }
 
     let rows = usize::try_from(header.rows).map_err(|_| bad("row count too large"))?;
     let mut c = Cursor { b: &body };

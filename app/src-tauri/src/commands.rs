@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use seek_core::{Device, DeviceId, ResultRow, SortKey};
-use seek_ipc::{PcInfo, Request, Response, StatusInfo};
+use seek_ipc::{HubStatus, PcInfo, Request, Response, StatusInfo};
 use serde_json::{json, Value};
 use tauri::{AppHandle, State};
 use tauri_plugin_autostart::ManagerExt;
@@ -158,6 +158,27 @@ pub async fn discovered_pcs(link: Link<'_>) -> Result<Vec<PcInfo>, String> {
 #[tauri::command]
 pub async fn join_pairing(link: Link<'_>, addr: String, code: String) -> Result<(), String> {
     expect_ok(&link, Request::JoinPairing { addr, code }).await
+}
+
+#[tauri::command]
+pub async fn link_hub(link: Link<'_>, addr: String, code: String) -> Result<String, String> {
+    match link.request(Request::LinkHub { addr, code }).await? {
+        Response::HubLinked { name } => Ok(name),
+        other => Err(unexpected(other)),
+    }
+}
+
+#[tauri::command]
+pub async fn unlink_hub(link: Link<'_>) -> Result<(), String> {
+    expect_ok(&link, Request::UnlinkHub).await
+}
+
+#[tauri::command]
+pub async fn hub_status(link: Link<'_>) -> Result<Option<HubStatus>, String> {
+    match link.request(Request::HubStatus).await? {
+        Response::Hub { hub } => Ok(hub),
+        other => Err(unexpected(other)),
+    }
 }
 
 #[tauri::command]

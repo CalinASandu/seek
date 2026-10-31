@@ -53,6 +53,7 @@ impl State {
         }
         if own {
             self.with_journal(id, |j| j.record(changes));
+            self.own_index_changed();
         }
         Some(ix.live_count() as u64)
     }
@@ -65,6 +66,14 @@ impl State {
         map.insert(id, std::sync::Arc::new(std::sync::RwLock::new(ix)));
         if own {
             self.with_journal(id, |j| j.reset());
+            self.own_index_changed();
+        }
+    }
+
+    /// Tells the hub session (if any) that an own index changed.
+    fn own_index_changed(&self) {
+        if let Some(rt) = self.peers_rt.get() {
+            rt.index_changed();
         }
     }
 

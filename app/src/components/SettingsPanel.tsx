@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from "react";
-import { Link2, Monitor, Moon, Plus, Sun, X } from "lucide-react";
-import type { Peers, Settings } from "../api/types";
+import { Link2, Link2Off, Monitor, Moon, Plus, Sun, X } from "lucide-react";
+import type { HubStatus, Peers, Settings } from "../api/types";
+import { hubSyncedText, hubUnlinked, inHubMode } from "../lib/pcs";
+import { Dialog } from "./Dialog";
 import { syncedText } from "./Sidebar";
 
 interface Props {
@@ -8,9 +10,13 @@ interface Props {
   version: string | undefined;
   /** `null` when the service has sync turned off. */
   peers: Peers | null;
+  /** The link to a hub, or the notice that the hub unlinked this PC; `null` without one. */
+  hub: HubStatus | null;
   onChange: (patch: Partial<Settings>) => void;
   onSharing: (enabled: boolean) => void;
   onLinkPc: () => void;
+  /** Unlinks from the hub, or dismisses the notice. `done` is shown as a toast when it worked. */
+  onUnlinkHub: (done?: string) => void;
   onClose: () => void;
 }
 
@@ -20,8 +26,9 @@ const THEMES: { id: Settings["theme"]; label: string; icon: typeof Sun }[] = [
   { id: "dark", label: "Dark", icon: Moon },
 ];
 
-export function SettingsPanel({ settings, version, peers, onChange, onSharing, onLinkPc, onClose }: Props) {
+export function SettingsPanel({ settings, version, peers, hub, onChange, onSharing, onLinkPc, onUnlinkHub, onClose }: Props) {
   const [folder, setFolder] = useState("");
+  const [unlinkingHub, setUnlinkingHub] = useState(false);
   const ref = useRef<HTMLElement>(null);
 
   useEffect(() => {
@@ -93,6 +100,36 @@ export function SettingsPanel({ settings, version, peers, onChange, onSharing, o
 
           <section className="setting-group" aria-labelledby="set-pcs">
             <h3 id="set-pcs">Linked devices</h3>
+            {hub && (
+              <div className={`hub-card${hubUnlinked(hub) ? " is-notice" : ""}`}>
+                <div className="hub-head">
+                  <span className={`dot dot-${hub.online ? "online" : "offline"}`} aria-hidden="true" />
+                  <span className="peer-name">Hub · {hub.name}</span>
+                  {!hubUnlinked(hub) && <span className="peer-sub">{hubSyncedText(hub)}</span>}
+                </div>
+                {hub.lastError && <p className="hub-error">{hub.lastError}</p>}
+                {hub.pcs.length > 0 && (
+                  <ul className="peer-list">
+                    {hub.pcs.map((pc) => (
+                      <li key={pc.hostId}>
+                        <span className={`dot dot-${pc.online ? "online" : "offline"}`} aria-hidden="true" />
+                        <span className="peer-name">{pc.name}</span>
+                        <span className="peer-sub">{syncedText(pc)}</span>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+                {hubUnlinked(hub) ? (
+                  <button className="btn" onClick={() => onUnlinkHub()}>
+                    Dismiss
+                  </button>
+                ) : (
+                  <button className="btn" onClick={() => setUnlinkingHub(true)}>
+                    <Link2Off size={14} aria-hidden="true" /> Unlink hub
+                  </button>
+                )}
+              </div>
+            )}
             {peers ? (
               <>
                 <div className="setting-row">
@@ -110,7 +147,7 @@ export function SettingsPanel({ settings, version, peers, onChange, onSharing, o
                     <span />
                   </button>
                 </div>
-                {peers.peers.length > 0 ? (
+                {inHubMode(hub) ? null : peers.peers.length > 0 ? (
                   <ul className="peer-list">
                     {peers.peers.map((pc) => (
                       <li key={pc.hostId}>
@@ -126,9 +163,11 @@ export function SettingsPanel({ settings, version, peers, onChange, onSharing, o
                     names are shared, encrypted, over your local network.
                   </p>
                 )}
-                <button className="btn" onClick={onLinkPc} disabled={peers.peers.length >= 4} title={peers.peers.length >= 4 ? "Up to 5 devices can be linked" : undefined}>
-                  <Link2 size={14} aria-hidden="true" /> Link a device
-                </button>
+                {!inHubMode(hub) && (
+                  <button className="btn" onClick={onLinkPc} disabled={peers.peers.length >= 4} title={peers.peers.length >= 4 ? "Up to 5 devices can be linked" : undefined}>
+                    <Link2 size={14} aria-hidden="true" /> Link a device
+                  </button>
+                )}
               </>
             ) : (
               <p className="setting-desc">Sync with other devices is turned off in the Seek service on this device.</p>
@@ -181,6 +220,34 @@ export function SettingsPanel({ settings, version, peers, onChange, onSharing, o
 
         <div className="panel-foot">Seek {version ?? ""} · service connected</div>
       </aside>
+      {unlinkingHub && hub && (
+        <Dialog
+          title={`Unlink ${hub.name}?`}
+          onClose={() => setUnlinkingHub(false)}
+          footer={
+            <>
+              <button className="btn" onClick={() => setUnlinkingHub(false)}>
+                Cancel
+              </button>
+              <button
+                className="btn btn-danger"
+                data-autofocus
+                onClick={() => {
+                  setUnlinkingHub(false);
+                  onUnlinkHub(`Unlinked from ${hub.name}`);
+                }}
+              >
+                Unlink hub
+              </button>
+            </>
+          }
+        >
+          <p className="dialog-lead">
+            This device stops syncing through {hub.name}, and the other PCs' files stop appearing in search here. You can link
+            the hub again at any time with a new code.
+          </p>
+        </Dialog>
+      )}
     </div>
   );
 }

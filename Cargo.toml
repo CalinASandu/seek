@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/seek-core", "crates/seek-scan", "crates/seek-ipc", "crates/seek-service", "crates/seek-cli", "crates/seek-sync", "app/src-tauri"]
+members = ["crates/seek-core", "crates/seek-scan", "crates/seek-ipc", "crates/seek-service", "crates/seek-cli", "crates/seek-sync", "crates/seek-hub", "app/src-tauri"]
 
 [workspace.package]
 version = "0.1.0"
@@ -13,6 +13,7 @@ seek-core = { path = "crates/seek-core" }
 seek-scan = { path = "crates/seek-scan" }
 seek-ipc = { path = "crates/seek-ipc" }
 seek-sync = { path = "crates/seek-sync" }
+seek-hub = { path = "crates/seek-hub" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
@@ -38,9 +39,14 @@ tempfile = "3"
 snow = "0.9"
 spake2 = "0.4"
 chacha20poly1305 = "0.10"
+blake2 = "0.10"
 postcard = { version = "1", features = ["use-std"] }
 rand = "0.8"
 mdns-sd = "0.13"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+webpki-roots = "1"
+rcgen = { version = "0.13", default-features = false, features = ["ring"] }
 
 # Everyday release builds compile in parallel and incrementally. The installer script turns on
 # thin LTO and a single codegen unit (a few percent faster, much slower to build) via env vars.

@@ -95,6 +95,12 @@ impl SyncHost for Counting {
     fn held(&self, owner: uuid::Uuid) -> Vec<(uuid::Uuid, Cursor)> {
         self.inner.held(owner)
     }
+    fn held_remote(&self) -> Vec<(uuid::Uuid, Cursor)> {
+        self.inner.held_remote()
+    }
+    fn catalog(&self, hub: uuid::Uuid, pcs: Vec<CatalogPc>, devices: Vec<Device>) {
+        self.inner.catalog(hub, pcs, devices)
+    }
     fn remote_devices(
         &self,
         owner: uuid::Uuid,
@@ -286,4 +292,197 @@ async fn unsharing_removes_the_copy() {
     assert!(!b.index_path(dev).exists());
     assert!(b.remote_cursors.lock().unwrap().get(&dev).is_none());
     p.stop().await;
+}
+
+fn record(id: DeviceId, host: HostId) -> Device {
+    use seek_core::{DeviceIdentity, DeviceKind};
+    Device {
+        id,
+        identity: DeviceIdentity::Volume { serial: id.as_u128() as u64, filesystem: "NTFS".into() },
+        display_name: "Data".into(),
+        label: String::new(),
+        filesystem: "NTFS".into(),
+        kind: DeviceKind::Fixed,
+        total_bytes: 0,
+        free_bytes: 0,
+        last_mount_point: "D:\\".into(),
+        indexed_by_host: host,
+        first_seen: 0,
+        last_seen: 0,
+        index_updated_at: 0,
+        state: DeviceState::Online,
+        entry_count: 0,
+        error: None,
+    }
+}
+
+fn catalog_pc(host: HostId, name: &str, sid: &str) -> CatalogPc {
+    CatalogPc {
+        host_id: host,
+        name: name.into(),
+        user_sid: sid.into(),
+        user_name: String::new(),
+        profiles: vec![(sid.into(), format!("C:\\Users\\{name}"))],
+        last_seen_ms: 7,
+    }
+}
+
+fn peer(host: HostId, role: seek_sync::Role) -> Peer {
+    Peer {
+        host_id: host,
+        name: "peer".into(),
+        public_key: String::new(),
+        addr: None,
+        linked_users: Vec::new(),
+        profiles: Vec::new(),
+        last_sync_ms: 0,
+        state: PeerState::Linked,
+        role,
+        addrs: Vec::new(),
+        via_hub: false,
+    }
+}
+
+/// A hub peer linked by the local user `S-me`.
+fn hub_peer(hub: HostId) -> Peer {
+    let mut p = peer(hub, seek_sync::Role::Hub);
+    p.linked_users = vec![("S-me".into(), "S-me".into())];
+    p
+}
+
+#[test]
+fn catalog_adds_and_drops_pcs() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = load(dir.path());
+    let (hub, b, c) = (HostId::from_u128(1), HostId::from_u128(2), HostId::from_u128(3));
+    let (db, dc) = (DeviceId::from_u128(20), DeviceId::from_u128(30));
+    st.peers.lock().unwrap().upsert(hub_peer(hub));
+    let host = ServiceSync(st.clone());
+
+    host.catalog(
+        hub,
+        vec![catalog_pc(b, "B", "S-b"), catalog_pc(c, "C", "S-c")],
+        vec![record(db, b), record(dc, c)],
+    );
+    {
+        let peers = st.peers.lock().unwrap();
+        let pb = peers.get(b).expect("B is stored");
+        assert!(pb.via_hub && pb.role == seek_sync::Role::Pc && pb.state == PeerState::Linked && pb.addrs.is_empty());
+        assert_eq!(pb.name, "B");
+        // one person on every PC of the hub: (local linking SID, that PC's SID)
+        assert_eq!(pb.linked_users, vec![("S-me".to_string(), "S-b".to_string())]);
+        assert_eq!(pb.profiles, vec![("S-b".to_string(), "C:\\Users\\B".to_string())]);
+        assert!(peers.get(c).is_some());
+        assert!(peers.get(hub).is_some(), "the hub itself stays");
+    }
+    assert_eq!(st.device(db).unwrap().indexed_by_host, b);
+    assert!(st.device(dc).is_some());
+    // the linking user sees B's own profile folder, so it is not hidden from them
+    let dev = st.device(db).unwrap();
+    assert!(st.hidden_for(&dev, "S-me", false, &[]).is_empty());
+    assert_eq!(st.hidden_for(&dev, "S-other", false, &[]), vec!["C:\\Users\\B".to_string()]);
+
+    // C left the hub: its record and copies go, B stays
+    host.catalog(hub, vec![catalog_pc(b, "B", "S-b")], vec![record(db, b)]);
+    let peers = st.peers.lock().unwrap();
+    assert!(peers.get(b).is_some() && peers.get(c).is_none());
+    drop(peers);
+    assert!(st.device(db).is_some() && st.device(dc).is_none());
+    // and it is persisted
+    assert!(seek_sync::peers::PeerStore::load(dir.path()).get(c).is_none());
+}
+
+#[test]
+fn linking_hub_removes_direct_peers_keeps_copies() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = load(dir.path());
+    let (lan, hub) = (HostId::from_u128(5), HostId::from_u128(1));
+    let dev = DeviceId::from_u128(50);
+    let mut direct = peer(lan, seek_sync::Role::Pc);
+    direct.addr = Some("10.0.0.2:47321".into());
+    st.peers.lock().unwrap().upsert(direct);
+    st.registry.write().unwrap().add(record(dev, lan));
+    st.indexes.write().unwrap().insert(dev, Arc::new(RwLock::new(synth_index(10, 1))));
+
+    st.enter_hub_mode(hub_peer(hub));
+
+    {
+        let peers = st.peers.lock().unwrap();
+        assert_eq!(peers.file.peers.len(), 1);
+        assert_eq!(peers.file.hub().map(|p| p.host_id), Some(hub));
+    }
+    assert!(st.device(dev).is_some() && st.indexes.read().unwrap().contains_key(&dev), "copies are kept");
+    assert!(seek_sync::peers::PeerStore::load(dir.path()).get(lan).is_none());
+
+    // the same PC shows up in the hub's catalog: its copy is adopted, not fetched again
+    ServiceSync(st.clone()).catalog(hub, vec![catalog_pc(lan, "Laptop", "S-l")], vec![record(dev, lan)]);
+    assert!(st.peers.lock().unwrap().get(lan).is_some_and(|p| p.via_hub));
+    assert!(st.indexes.read().unwrap().contains_key(&dev));
+
+    // unlinking from the hub drops the hub, its PCs and every copy received through it
+    assert_eq!(st.leave_hub().map(|p| p.host_id), Some(hub));
+    assert!(st.peers.lock().unwrap().file.peers.is_empty());
+    assert!(st.device(dev).is_none() && !st.indexes.read().unwrap().contains_key(&dev));
+}
+
+#[test]
+fn catalog_keeps_unlisted_ex_lan_copies_until_listed() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = load(dir.path());
+    let (hub, lan, other) = (HostId::from_u128(1), HostId::from_u128(5), HostId::from_u128(6));
+    let (dev, dother) = (DeviceId::from_u128(50), DeviceId::from_u128(60));
+    st.peers.lock().unwrap().upsert(peer(lan, seek_sync::Role::Pc));
+    st.registry.write().unwrap().add(record(dev, lan));
+    st.indexes.write().unwrap().insert(dev, Arc::new(RwLock::new(synth_index(10, 1))));
+    let cursor = Cursor { generation: uuid::Uuid::from_u128(9), seq: 4 };
+    st.remote_cursors.lock().unwrap().insert(dev, cursor);
+    st.enter_hub_mode(hub_peer(hub));
+    let host = ServiceSync(st.clone());
+
+    // the hub knows only another PC so far: the ex-LAN copy, index and cursor are untouched
+    host.catalog(hub, vec![catalog_pc(other, "Other", "S-o")], vec![record(dother, other)]);
+    assert!(st.device(dev).is_some() && st.indexes.read().unwrap().contains_key(&dev));
+    assert_eq!(st.remote_cursors.lock().unwrap().get(&dev), Some(&cursor));
+    assert!(st.peers.lock().unwrap().get(lan).is_none());
+
+    // that PC links to the hub later: it becomes a hub PC and keeps its cursor, so it gets deltas
+    host.catalog(
+        hub,
+        vec![catalog_pc(other, "Other", "S-o"), catalog_pc(lan, "Laptop", "S-l")],
+        vec![record(dother, other), record(dev, lan)],
+    );
+    assert!(st.peers.lock().unwrap().get(lan).is_some_and(|p| p.via_hub));
+    assert!(st.indexes.read().unwrap().contains_key(&dev));
+    assert_eq!(st.remote_cursors.lock().unwrap().get(&dev), Some(&cursor));
+    assert_eq!(host.held_remote(), vec![(dev, cursor)], "the next pull reports it, so the hub sends a delta");
+}
+
+#[test]
+fn identical_catalogs_announce_nothing() {
+    use std::sync::atomic::Ordering;
+
+    let dir = tempfile::tempdir().unwrap();
+    let st = load(dir.path());
+    let (hub, b) = (HostId::from_u128(1), HostId::from_u128(2));
+    st.peers.lock().unwrap().upsert(hub_peer(hub));
+    let host = ServiceSync(st.clone());
+    let (pcs, devs) = (vec![catalog_pc(b, "B", "S-b")], vec![record(DeviceId::from_u128(20), b)]);
+
+    let mut events = st.events.subscribe();
+    host.catalog(hub, pcs.clone(), devs.clone());
+    assert!(events.try_recv().is_ok(), "the first catalog changes things");
+    while events.try_recv().is_ok() {}
+    st.invalidated.store(false, Ordering::Relaxed);
+
+    // the hub sends the same catalog every poll
+    host.catalog(hub, pcs.clone(), devs.clone());
+    assert!(events.try_recv().is_err(), "no DevicesChanged / PeersChanged for an unchanged catalog");
+    assert!(!st.invalidated.load(Ordering::Relaxed), "results are not invalidated");
+
+    // a real change is announced again
+    let mut renamed = devs.clone();
+    renamed[0].display_name = "Data 2".into();
+    host.catalog(hub, pcs, renamed);
+    assert!(events.try_recv().is_ok());
+    assert!(st.invalidated.load(Ordering::Relaxed));
 }

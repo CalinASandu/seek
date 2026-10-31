@@ -1,0 +1,41 @@
+# Seek Hub on a Raspberry Pi 4 (or any Docker host). See docker/README.md.
+services:
+  tailscale:                        # owns the network; Funnel lives here
+    image: tailscale/tailscale:v1.98.10
+    hostname: seek-hub              # -> seek-hub.<tailnet>.ts.net
+    environment:
+      TS_AUTHKEY: "${TS_AUTHKEY}"   # tagged, single-use auth key (tag:seek-hub)
+      TS_STATE_DIR: /var/lib/tailscale
+      TS_USERSPACE: "true"          # no /dev/net/tun, no NET_ADMIN
+      TS_SERVE_CONFIG: /config/funnel.json
+    volumes:
+      - ./tailscale:/var/lib/tailscale
+      - ./funnel.json:/config/funnel.json:ro
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    # ports: ["47321:47321"]        # optional direct LAN access (uncomment + set SEEK_HUB_LAN=1)
+    restart: unless-stopped
+  seek-hub:
+    image: ghcr.io/calinasandu/seek-hub:${SEEK_HUB_VERSION:-0.1.0}
+    container_name: seek-hub
+    network_mode: service:tailscale # reachable only through the sidecar
+    read_only: true
+    user: "10001:10001"
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 1g
+    pids_limit: 64
+    volumes:
+      - ./data:/data
+      - ./keys:/keys:ro
+    environment:
+      # Empty = use what `init` saved in hub.json; a value here wins over it.
+      SEEK_HUB_LAN: "${SEEK_HUB_LAN:-}"
+      SEEK_HUB_PUBLIC: "${SEEK_HUB_PUBLIC:-}"
+    healthcheck:
+      test: ["CMD", "/seek-hub", "status", "--quiet"]
+      interval: 60s
+      timeout: 10s
+      start_period: 30s
+      retries: 3
+    restart: unless-stopped

@@ -75,6 +75,9 @@ enum Cmd {
         #[arg(long)]
         compare: Option<PathBuf>,
     },
+    /// Used by `seek perf`: compact one device of a hub store in this process.
+    #[command(hide = true)]
+    HubCompact { dir: PathBuf, device: uuid::Uuid },
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -105,6 +108,7 @@ fn main() -> anyhow::Result<()> {
         Cmd::Query { file, query, limit } => query_file(&file, &query, limit),
         Cmd::Remote { query, limit, sort, desc } => remote(&query, limit, sort.into(), desc),
         Cmd::Devices => devices(),
+        Cmd::HubCompact { dir, device } => perf::hub_compact(&dir, device),
         Cmd::Perf { entries, runs, scans, remote, json, compare } => {
             perf::run(perf::Opts { entries, runs, scans, remote, json, compare })
         }

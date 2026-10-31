@@ -243,6 +243,32 @@ Spec `docs/superpowers/specs/2026-10-16-seek-space-view-design.md`, plan `docs/s
 - **Perf** (2M entries): totals 113 ms, tree 0.8 ms, largest 4.2 ms, types 29 ms (`seek perf`, `== space ==`).
 - Screenshots: `app/docs/screenshots/11-space-*.png`, `12-space-folder-dark.png`, `13-space-types-light.png`.
 
+## Done in wave 7: Seek Hub (2026-10-24 .. 2026-10-25)
+
+A self-hosted hub (`crates/seek-hub`, binary `seek-hub`) that PCs on different networks sync through, reachable
+only via Tailscale Funnel. Spec `docs/superpowers/specs/2026-10-24-seek-hub-design.md`, plan
+`docs/superpowers/plans/2026-10-24-seek-hub.md`. Packaging: `docker/` (Dockerfile, compose, Funnel serve config,
+tailnet policy example, README with the setup flow and the Pi checklist), `scripts/build-hub-image.ps1`.
+
+- How to run (no Docker on the Windows PC): `.\scripts\build-hub-image.ps1` builds `docker\dist\{arm64,amd64}\seek-hub`;
+  `scp -r docker pi@<pi>:seek-hub`; on the Pi `docker build --build-arg TARGETARCH=arm64 -t
+  ghcr.io/calinasandu/seek-hub:0.1.0 .`, then follow `docker/README.md`. One-shot commands are `docker compose run
+  --rm --no-deps seek-hub <cmd>`; `init` runs only while the hub is stopped (`docker compose stop seek-hub; docker
+  compose run --rm --no-deps seek-hub init; docker compose start seek-hub`); `init --keys` and `rotate-key` run with
+  the hub stopped via `docker run --rm -v "$PWD/data:/data" -v "$PWD/keys:/keys" <image> <cmd>`; `link`, `status`,
+  `pcs`, `unlink`, `doctor` use `docker exec seek-hub seek-hub <cmd>`. `data/` and `keys/` need `chown 10001:10001`.
+  A value in `docker/.env` (`SEEK_HUB_PUBLIC`, `SEEK_HUB_LAN`) overrides what `init` saved.
+- Linux tests (done 2026-10-27, 79 unit + 11 CLI pass on Alpine under WSL): `wsl -d seek-alpine --cd
+  /mnt/d/Programming/seek -- sh -c ". /root/.cargo/env && CARGO_TARGET_DIR=/root/seek-target cargo test -p seek-hub"`.
+  The release binaries cross-build here (zig + cargo-zigbuild, both musl targets; arm64 about 4.4 MB).
+- Not run yet: the image build (`docker build` on the Pi), everything on the Pi, and the Funnel serve config against a
+  live tailscaled.
+
+**Pi checkpoint (user)** - the commands are in `docker/README.md`, last section, in this order: copy `docker/` to the
+Pi, `docker build`, `mkdir -p data keys tailscale && sudo chown 10001:10001 data keys && sudo chown root:root tailscale`, fill `.env`, `init --keys`,
+optional `init`, `compose up -d`, `compose logs`, `openssl s_client` (the certificate can take a few minutes: retry),
+`doctor --public`, link two PCs (one on a phone hotspot without Tailscale), search across them, `seek-hub status`.
+
 ## Next step
 
 0. **Space view in the real window (user)** — the release binaries were locked while the session ran:
@@ -273,6 +299,28 @@ Spec `docs/superpowers/specs/2026-10-16-seek-space-view-design.md`, plan `docs/s
    - ✅ 2026-10-14 retest on two PCs (user): sync works end to end.
 
 ## Open findings / backlog (ranked)
+
+H. ~~Linux check (hub)~~ **DONE 2026-10-27**: native `cargo test -p seek-hub` passes on Alpine under WSL (79 unit + 11 CLI) after
+   a test-only fix in `tests/cli.rs`. Rerun command is in the wave-7 section above.
+
+Hub (from the final review of wave 7; the first-link race, pre-auth lock, OOM caps, metadata caps and compaction
+   memory were fixed in the final fix pass):
+   - I6 append-only journal: `put_delta` rewrites and re-encrypts the whole journal per batch under the store lock (SD wear, latency).
+   - Noise msg-1 replay kills the live session before a frame proves the key.
+   - `pc_by_key` / `sessions.insert` race with unlink (a just-unlinked PC can briefly hold a session).
+   - Admin socket: bind-then-chmod gap (set a umask before binding).
+   - Global 60/min handshake limiter: behind Funnel everything comes from localhost, so a stranger can lock PCs out; check PROXY protocol.
+   - Idle trickle (a peer sending 1 byte per 3 min keeps a session alive).
+   - Minor: `PairingCode` digits 0, `HubAddr` trailing dot, `SEEK_HUB_LAN` only accepts "1", `commit_devices` after a `commit_pcs` failure,
+     split `store.rs` per R11 (copy-file helpers), serve the stored copy decrypted outside the store lock, count PC metadata toward its bytes.
+
+Hub, PC side (final review; I1-I4, M1, M2, M5, M6 were fixed in the final fix pass):
+   - M4 the upload debounce is a throttle: a busy drive sends hub traffic about every 2 s (consider a 10-15 s minimum gap).
+   - M8 `PairInfo.user_name` is never filled (needs `LookupAccountSid`), so the hub's PC list shows no user names.
+   - `start_lan` failing after a hub-initiated unlink is only logged; `link_hub` has no re-entry guard (two links at once).
+   - Catalog upsert merges `linked_users` forever (a user the hub dropped stays linked here).
+   - The hub's `last_seen_ms` is compared with the local clock (skew makes a PC look offline/online wrongly).
+   - `seek-cli` links `seek-hub`, which makes `seek.exe` bigger.
 
 0. Space (from the wave-6 self-review): computing totals holds the device's read lock (~0.1 s per 2M rows,
    once per index change); the live refresh refetches the shown folder ~1 s after every index change, even when

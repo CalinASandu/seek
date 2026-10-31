@@ -10,9 +10,12 @@ use seek_core::{
 use seek_ipc::Event;
 use seek_sync::pairing::MemberInfo;
 use seek_sync::peers::{Peer, PeerState};
-use seek_sync::{Cursor, Outgoing, Since, SyncHost};
+use seek_sync::{CatalogPc, Cursor, Outgoing, Refusal, Role, Since, SyncHost};
 
 use crate::state::{now_ms, State};
+
+/// `synced` tells the app of a PC's new last-sync time at most this often.
+const SYNCED_ANNOUNCE_MS: i64 = 5_000;
 
 pub struct ServiceSync(pub Arc<State>);
 
@@ -80,6 +83,43 @@ impl State {
         self.invalidate();
     }
 
+    /// The local user who linked the hub: the "same person" on every PC of the hub.
+    pub fn hub_user(&self) -> String {
+        let peers = self.peers.lock().unwrap();
+        peers.file.hub().and_then(|h| h.linked_users.first().map(|(sid, _)| sid.clone())).unwrap_or_default()
+    }
+
+    /// Linking a hub replaces LAN sync: the hub is stored and every direct peer forgotten. Their copies stay
+    /// until the hub's catalog adopts them (same PC) or shows they are gone.
+    pub fn enter_hub_mode(&self, hub: Peer) {
+        {
+            let mut peers = self.peers.lock().unwrap();
+            peers.file.peers.retain(|p| p.via_hub);
+            peers.upsert(hub);
+            if let Err(e) = peers.save() {
+                tracing::error!("saving linked PCs failed: {e}");
+            }
+        }
+        self.connected.lock().unwrap().clear();
+        self.hidden_masks.lock().unwrap().clear();
+        self.peers_changed();
+    }
+
+    /// Leaves the hub: forgets it, the PCs known through it and every copy received through it (copies of former LAN peers the
+    /// hub never listed stay as offline copies). Returns the hub.
+    pub fn leave_hub(&self) -> Option<Peer> {
+        let (hub, via): (Option<Peer>, Vec<HostId>) = {
+            let peers = self.peers.lock().unwrap();
+            (peers.file.hub().cloned(), peers.file.peers.iter().filter(|p| p.via_hub).map(|p| p.host_id).collect())
+        };
+        let hub = hub?;
+        for host in via {
+            self.drop_peer(host);
+        }
+        self.drop_peer(hub.host_id);
+        Some(hub)
+    }
+
     /// Marks every device copied from `host` online or offline (session started/ended).
     pub fn set_peer_devices_online(&self, host: HostId, online: bool) {
         let mut changed = false;
@@ -102,6 +142,79 @@ impl State {
             self.emit(Event::DevicesChanged);
             self.invalidate();
         }
+    }
+}
+
+impl ServiceSync {
+    /// Takes `owner`'s device records (and the profiles of its users) into the registry. Returns whether
+    /// anything differs from what was stored: callers save and announce only then.
+    fn apply_remote_devices(
+        &self,
+        owner: uuid::Uuid,
+        devices: Vec<Device>,
+        profiles: Vec<(String, String)>,
+    ) -> bool {
+        let st = &self.0;
+        let mut changed = false;
+        let connected = st.connected.lock().unwrap().contains(&owner);
+        let held: HashSet<DeviceId> = st.indexes.read().unwrap().keys().copied().collect();
+        let gone: Vec<DeviceId> = {
+            let mut reg = st.registry.write().unwrap();
+            for mut d in devices.iter().cloned() {
+                d.indexed_by_host = owner;
+                let online =
+                    connected && matches!(d.state, DeviceState::Online | DeviceState::Scanning);
+                d.state = if online {
+                    DeviceState::Online
+                } else {
+                    DeviceState::Offline
+                };
+                match reg.get_mut(d.id) {
+                    Some(existing) if existing.indexed_by_host == owner => {
+                        // keep what only this PC knows: when it first saw the copy
+                        d.first_seen = existing.first_seen;
+                        // and what is actually searchable here until the next delta arrives
+                        if held.contains(&d.id) {
+                            d.entry_count = existing.entry_count;
+                        }
+                        if *existing != d {
+                            *existing = d;
+                            changed = true;
+                        }
+                    }
+                    Some(_) => tracing::warn!(
+                        "{owner} sent device {} that belongs to another PC; ignored",
+                        d.id
+                    ),
+                    None => {
+                        reg.add(d);
+                        changed = true;
+                    }
+                }
+            }
+            reg.devices
+                .iter()
+                .filter(|d| d.indexed_by_host == owner && !devices.iter().any(|x| x.id == d.id))
+                .map(|d| d.id)
+                .collect()
+        };
+        changed |= !gone.is_empty();
+        for id in gone {
+            st.remove_remote_device(id);
+        }
+        {
+            let mut peers = st.peers.lock().unwrap();
+            if let Some(p) = peers.get_mut(owner) {
+                if p.profiles != profiles {
+                    p.profiles = profiles;
+                    let _ = peers.save();
+                    // who may see what on that PC changed
+                    st.hidden_masks.lock().unwrap().clear();
+                    changed = true;
+                }
+            }
+        }
+        changed
     }
 }
 
@@ -172,66 +285,106 @@ impl SyncHost for ServiceSync {
             .collect()
     }
 
+    fn held_remote(&self) -> Vec<(uuid::Uuid, Cursor)> {
+        let st = &self.0;
+        let me = st.host_id();
+        let reg = st.registry.read().unwrap();
+        let indexes = st.indexes.read().unwrap();
+        let cursors = st.remote_cursors.lock().unwrap();
+        reg.devices
+            .iter()
+            .filter(|d| d.indexed_by_host != me && indexes.contains_key(&d.id))
+            .filter_map(|d| cursors.get(&d.id).map(|c| (d.id, *c)))
+            .collect()
+    }
+
+    fn catalog(&self, hub: uuid::Uuid, pcs: Vec<CatalogPc>, devices: Vec<Device>) {
+        let st = &self.0;
+        let me = st.hub_user();
+        let listed: HashSet<HostId> = pcs.iter().map(|pc| pc.host_id).collect();
+        // The hub sends this every poll: only what actually differs is saved and announced.
+        let mut pcs_changed = false;
+        let mut devices_changed = false;
+        // PCs known through the hub that left it. Copies of a former LAN peer the hub does not list (yet) stay:
+        // they are only adopted, with their cursors, once a catalog lists that PC.
+        let gone: Vec<HostId> = {
+            let peers = st.peers.lock().unwrap();
+            peers.file.peers.iter().filter(|p| p.via_hub && !listed.contains(&p.host_id)).map(|p| p.host_id).collect()
+        };
+        for host in gone {
+            tracing::info!("PC {host} left the hub");
+            st.drop_peer(host);
+        }
+        {
+            let mut peers = st.peers.lock().unwrap();
+            let mut dirty = false;
+            for pc in &pcs {
+                if pc.host_id == hub || pc.host_id == st.host_id() {
+                    continue;
+                }
+                // the same person on every PC of the hub
+                let links = if me.is_empty() { Vec::new() } else { vec![(me.clone(), pc.user_sid.clone())] };
+                let before = peers.get(pc.host_id).cloned();
+                peers.upsert(Peer {
+                    host_id: pc.host_id,
+                    name: pc.name.clone(),
+                    public_key: String::new(),
+                    addr: None,
+                    linked_users: links,
+                    profiles: pc.profiles.clone(),
+                    last_sync_ms: pc.last_seen_ms,
+                    state: PeerState::Linked,
+                    role: Role::Pc,
+                    addrs: Vec::new(),
+                    via_hub: true,
+                });
+                dirty |= before.as_ref() != peers.get(pc.host_id);
+            }
+            if dirty {
+                pcs_changed = true;
+                if let Err(e) = peers.save() {
+                    tracing::error!("saving linked PCs failed: {e}");
+                }
+                // who may see what on those PCs' devices
+                st.hidden_masks.lock().unwrap().clear();
+            }
+        }
+        {
+            let mut connected = st.connected.lock().unwrap();
+            for pc in &pcs {
+                let online = crate::hub::recently_seen(pc.last_seen_ms);
+                let was = if online { !connected.insert(pc.host_id) } else { connected.remove(&pc.host_id) };
+                if was != online {
+                    pcs_changed = true;
+                }
+            }
+        }
+        for pc in pcs {
+            let theirs = devices.iter().filter(|d| d.indexed_by_host == pc.host_id).cloned().collect();
+            devices_changed |= self.apply_remote_devices(pc.host_id, theirs, pc.profiles);
+        }
+        if devices_changed {
+            st.save_registry();
+            st.emit(Event::DevicesChanged);
+            st.invalidate();
+        }
+        if pcs_changed {
+            st.peers_changed();
+        }
+    }
+
     fn remote_devices(
         &self,
         owner: uuid::Uuid,
         devices: Vec<Device>,
         profiles: Vec<(String, String)>,
     ) {
-        let st = &self.0;
-        let connected = st.connected.lock().unwrap().contains(&owner);
-        let held: HashSet<DeviceId> = st.indexes.read().unwrap().keys().copied().collect();
-        let gone: Vec<DeviceId> = {
-            let mut reg = st.registry.write().unwrap();
-            for mut d in devices.iter().cloned() {
-                d.indexed_by_host = owner;
-                let online =
-                    connected && matches!(d.state, DeviceState::Online | DeviceState::Scanning);
-                d.state = if online {
-                    DeviceState::Online
-                } else {
-                    DeviceState::Offline
-                };
-                match reg.get_mut(d.id) {
-                    Some(existing) if existing.indexed_by_host == owner => {
-                        // keep what only this PC knows: when it first saw the copy
-                        d.first_seen = existing.first_seen;
-                        // and what is actually searchable here until the next delta arrives
-                        if held.contains(&d.id) {
-                            d.entry_count = existing.entry_count;
-                        }
-                        *existing = d;
-                    }
-                    Some(_) => tracing::warn!(
-                        "{owner} sent device {} that belongs to another PC; ignored",
-                        d.id
-                    ),
-                    None => reg.add(d),
-                }
-            }
-            reg.devices
-                .iter()
-                .filter(|d| d.indexed_by_host == owner && !devices.iter().any(|x| x.id == d.id))
-                .map(|d| d.id)
-                .collect()
-        };
-        for id in gone {
-            st.remove_remote_device(id);
+        if self.apply_remote_devices(owner, devices, profiles) {
+            let st = &self.0;
+            st.save_registry();
+            st.emit(Event::DevicesChanged);
+            st.invalidate();
         }
-        {
-            let mut peers = st.peers.lock().unwrap();
-            if let Some(p) = peers.get_mut(owner) {
-                if p.profiles != profiles {
-                    p.profiles = profiles;
-                    let _ = peers.save();
-                    // who may see what on that PC changed
-                    st.hidden_masks.lock().unwrap().clear();
-                }
-            }
-        }
-        st.save_registry();
-        st.emit(Event::DevicesChanged);
-        st.invalidate();
     }
 
     fn apply_delta(
@@ -298,12 +451,18 @@ impl SyncHost for ServiceSync {
     }
 
     fn synced(&self, peer: uuid::Uuid) {
+        // Called for every frame of a session: the app is told at most every few seconds.
+        let now = now_ms();
         let mut peers = self.0.peers.lock().unwrap();
-        if let Some(p) = peers.get_mut(peer) {
-            p.last_sync_ms = now_ms();
-        }
+        let announce = peers.get_mut(peer).is_some_and(|p| {
+            let fresh = p.last_sync_ms == 0 || now - p.last_sync_ms >= SYNCED_ANNOUNCE_MS;
+            p.last_sync_ms = now;
+            fresh
+        });
         drop(peers);
-        self.0.peers_changed();
+        if announce {
+            self.0.peers_changed();
+        }
     }
 
     fn member_joined(&self, m: MemberInfo) {
@@ -323,6 +482,9 @@ impl SyncHost for ServiceSync {
                 profiles: Vec::new(),
                 last_sync_ms: 0,
                 state: PeerState::Linked,
+                role: Role::Pc,
+                addrs: Vec::new(),
+                via_hub: false,
             });
             let _ = peers.save();
         }
@@ -334,8 +496,36 @@ impl SyncHost for ServiceSync {
     }
 
     fn unlinked_by(&self, peer: uuid::Uuid) {
+        let st = &self.0;
+        let is_hub = st.peers.lock().unwrap().get(peer).is_some_and(|p| p.role == Role::Hub);
+        if is_hub {
+            tracing::info!("the hub removed the link");
+            if let Some(hub) = st.leave_hub() {
+                if let Some(rt) = st.peers_rt.get() {
+                    rt.hub_unlinked(&hub);
+                }
+            }
+            return;
+        }
         tracing::info!("linked PC {peer} removed the link");
-        self.0.drop_peer(peer);
+        st.drop_peer(peer);
+    }
+
+    fn hub_refused(&self, reason: Refusal) {
+        tracing::warn!("the hub refused a request: {reason:?}");
+        if let Some(rt) = self.0.peers_rt.get() {
+            rt.hub_note(refusal_text(&reason));
+        }
+    }
+}
+
+fn refusal_text(r: &Refusal) -> &'static str {
+    match r {
+        Refusal::NotOwner { .. } => "A drive of this PC is already claimed by another PC at the hub",
+        Refusal::HubFull => "The hub's disk is full, so this PC's drives are not uploaded",
+        Refusal::QuotaFull => "This PC's space on the hub is full, so its drives are not uploaded",
+        Refusal::TooManyDevices => "This PC has more drives than the hub accepts, so they are not uploaded",
+        Refusal::NotSupported => "The hub does not support that request",
     }
 }
 

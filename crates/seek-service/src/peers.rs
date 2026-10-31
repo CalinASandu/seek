@@ -5,6 +5,9 @@
 //! SPAKE2 runs. Between two linked PCs the one with the lower host id dials; the other dials too once it has
 //! not been connected for `FALLBACK_DIAL` (one-sided reachability, e.g. a firewall on one PC). A duplicate
 //! session is dropped.
+//!
+//! A PC linked to a hub (see `link_hub`) syncs only through it: the listener, mDNS and direct dialing stop, and
+//! one dialer loop keeps a session with the hub instead.
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -15,22 +18,23 @@ use seek_core::{DeviceId, HostId};
 use seek_sync::noise::{self, Keys};
 use seek_sync::pairing::{pair_guest, pair_host, MemberInfo, PairInfo, PairingCode};
 use seek_sync::peers::{key_from_b64, key_to_b64, load_or_create_keys, Peer, PeerState, MAX_PCS};
-use seek_sync::{run_session, Msg, SessionCtl};
+use seek_sync::{run_session, Msg, Role, SessionCtl};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Notify;
 
+use crate::hub::HubLive;
 use crate::state::{now_ms, State, SyncConfig};
 use crate::sync_host::ServiceSync;
 
-const PAIRING: u8 = b'P';
-const SESSION: u8 = b'N';
+pub(crate) const PAIRING: u8 = b'P';
+pub(crate) const SESSION: u8 = b'N';
 const STATUS_FULL: u8 = 0;
-const STATUS_OK: u8 = 1;
+pub(crate) const STATUS_OK: u8 = 1;
 const STATUS_NO_CODE: u8 = 2;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
-const PAIRING_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const PAIRING_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long the higher host id waits for the lower one to dial before dialing itself.
 const FALLBACK_DIAL: Duration = Duration::from_secs(10);
 pub const MDNS_SERVICE: &str = "_seek._tcp.local.";
@@ -45,11 +49,12 @@ pub struct Discovered {
 }
 
 pub struct PeersRuntime {
-    state: Arc<State>,
-    cfg: SyncConfig,
-    keys: Keys,
-    addr: SocketAddr,
-    sessions: Mutex<HashMap<HostId, Arc<SessionCtl>>>,
+    pub(crate) state: Arc<State>,
+    pub(crate) cfg: SyncConfig,
+    pub(crate) keys: Keys,
+    /// Where the LAN listener is bound (the configured address while there is none).
+    addr: Mutex<SocketAddr>,
+    pub(crate) sessions: Mutex<HashMap<HostId, Arc<SessionCtl>>>,
     dialing: Mutex<HashSet<HostId>>,
     /// When each peer was last connected (or first known); the higher id dials after `FALLBACK_DIAL`.
     last_heard: Mutex<HashMap<HostId, Instant>>,
@@ -57,24 +62,29 @@ pub struct PeersRuntime {
     dial_errors: Mutex<HashMap<HostId, String>>,
     /// The active code and the SID of the user who asked for it.
     pairing: Mutex<Option<(PairingCode, String)>>,
-    discovered: Mutex<HashMap<HostId, Discovered>>,
+    pub(crate) discovered: Mutex<HashMap<HostId, Discovered>>,
     kick: Notify,
     mdns: Mutex<Option<mdns_sd::ServiceDaemon>>,
-    tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// Listener and dialer of LAN mode.
+    lan_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// The hub dialer loop (hub mode).
+    pub(crate) hub_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    pub(crate) hub_live: Mutex<HubLive>,
+    /// Wakes the hub dialer before its retry delay is over.
+    pub(crate) hub_kick: Notify,
+    /// An own index changed; the hub session turns bursts of these into one upload.
+    pub(crate) index_dirty: Notify,
 }
 
 impl PeersRuntime {
     pub async fn start(state: Arc<State>, cfg: SyncConfig) -> anyhow::Result<Arc<PeersRuntime>> {
         let dir = state.cfg.data_dir.clone();
         let keys = tokio::task::spawn_blocking(move || load_or_create_keys(&dir)).await??;
-        let listener = TcpListener::bind((cfg.bind, cfg.port)).await?;
-        let addr = listener.local_addr()?;
-        tracing::info!("sync listening on {addr}");
         let rt = Arc::new(PeersRuntime {
             state: state.clone(),
-            cfg: cfg.clone(),
             keys,
-            addr,
+            addr: Mutex::new(SocketAddr::new(cfg.bind, cfg.port)),
+            cfg,
             sessions: Mutex::new(HashMap::new()),
             dialing: Mutex::new(HashSet::new()),
             last_heard: Mutex::new(HashMap::new()),
@@ -83,53 +93,69 @@ impl PeersRuntime {
             discovered: Mutex::new(HashMap::new()),
             kick: Notify::new(),
             mdns: Mutex::new(None),
-            tasks: Mutex::new(Vec::new()),
+            lan_tasks: Mutex::new(Vec::new()),
+            hub_task: Mutex::new(None),
+            hub_live: Mutex::new(HubLive::default()),
+            hub_kick: Notify::new(),
+            index_dirty: Notify::new(),
         });
+        // linked to a hub: no listener, no discovery, no direct dialing
+        let hub = state.peers.lock().unwrap().file.hub().is_some();
+        if !hub {
+            rt.start_lan().await?;
+        }
         let _ = state.peers_rt.set(rt.clone());
-
-        let accepting = {
-            let rt = rt.clone();
-            tokio::spawn(async move {
-                loop {
-                    match listener.accept().await {
-                        Ok((stream, from)) => {
-                            let rt = rt.clone();
-                            tokio::spawn(async move { rt.incoming(stream, from).await });
-                        }
-                        Err(e) => {
-                            tracing::warn!("sync accept failed: {e}");
-                            tokio::time::sleep(Duration::from_millis(200)).await;
-                        }
-                    }
-                }
-            })
-        };
-        let dialer = {
-            let rt = rt.clone();
-            tokio::spawn(async move {
-                let mut tick = tokio::time::interval(rt.cfg.interval);
-                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                loop {
-                    tokio::select! {
-                        _ = tick.tick() => {}
-                        _ = rt.kick.notified() => {}
-                    }
-                    rt.dial_due();
-                }
-            })
-        };
-        rt.tasks.lock().unwrap().extend([accepting, dialer]);
-        if cfg.mdns {
-            if let Err(e) = rt.start_mdns() {
-                tracing::warn!("mDNS unavailable ({e}); linked PCs are reached at their last address");
-            }
+        if hub {
+            rt.start_hub();
         }
         Ok(rt)
     }
 
-    /// Stops listening, dialing and every session.
-    pub fn shutdown(&self) {
-        for t in self.tasks.lock().unwrap().drain(..) {
+    /// LAN mode: listens for linked PCs, dials them, advertises and discovers PCs with mDNS.
+    pub(crate) async fn start_lan(self: &Arc<Self>) -> anyhow::Result<()> {
+        let listener = TcpListener::bind((self.cfg.bind, self.cfg.port)).await?;
+        let addr = listener.local_addr()?;
+        *self.addr.lock().unwrap() = addr;
+        tracing::info!("sync listening on {addr}");
+        let rt = self.clone();
+        let accepting = tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((stream, from)) => {
+                        let rt = rt.clone();
+                        tokio::spawn(async move { rt.incoming(stream, from).await });
+                    }
+                    Err(e) => {
+                        tracing::warn!("sync accept failed: {e}");
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                    }
+                }
+            }
+        });
+        let rt = self.clone();
+        let dialer = tokio::spawn(async move {
+            let mut tick = tokio::time::interval(rt.cfg.interval);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = tick.tick() => {}
+                    _ = rt.kick.notified() => {}
+                }
+                rt.dial_due();
+            }
+        });
+        self.lan_tasks.lock().unwrap().extend([accepting, dialer]);
+        if self.cfg.mdns {
+            if let Err(e) = self.start_mdns() {
+                tracing::warn!("mDNS unavailable ({e}); linked PCs are reached at their last address");
+            }
+        }
+        Ok(())
+    }
+
+    /// Stops the LAN listener, dialer, discovery and sessions.
+    pub(crate) fn stop_lan(&self) {
+        for t in self.lan_tasks.lock().unwrap().drain(..) {
             t.abort();
         }
         for ctl in self.sessions.lock().unwrap().values() {
@@ -138,13 +164,26 @@ impl PeersRuntime {
         if let Some(d) = self.mdns.lock().unwrap().take() {
             let _ = d.shutdown();
         }
+        self.discovered.lock().unwrap().clear();
+        *self.pairing.lock().unwrap() = None;
+    }
+
+    /// Stops listening, dialing and every session.
+    pub fn shutdown(&self) {
+        self.stop_lan();
+        if let Some(t) = self.hub_task.lock().unwrap().take() {
+            t.abort();
+        }
+        if let Some(ctl) = self.hub_live.lock().unwrap().ctl.take() {
+            ctl.stop.notify_one();
+        }
     }
 
     pub fn local_addr(&self) -> SocketAddr {
-        self.addr
+        *self.addr.lock().unwrap()
     }
 
-    fn host_id(&self) -> HostId {
+    pub(crate) fn host_id(&self) -> HostId {
         self.state.host_id()
     }
 
@@ -175,7 +214,11 @@ impl PeersRuntime {
         for ctl in self.sessions.lock().unwrap().values() {
             ctl.sync_now.notify_one();
         }
+        if let Some(ctl) = &self.hub_live.lock().unwrap().ctl {
+            ctl.sync_now.notify_one();
+        }
         self.kick.notify_one();
+        self.hub_kick.notify_one();
     }
 
     /// Re-checks which linked PCs need dialing (new peer, new address).
@@ -202,16 +245,20 @@ impl PeersRuntime {
         self.sync_now();
     }
 
-    pub fn rename_peer(&self, host: HostId, name: String) {
+    /// Names of PCs known through a hub come from the hub's catalog (the next one would revert a rename).
+    pub fn rename_peer(&self, host: HostId, name: String) -> Result<(), String> {
         let mut peers = self.state.peers.lock().unwrap();
-        if let Some(p) = peers.get_mut(host) {
-            p.name = name;
-            if let Err(e) = peers.save() {
-                tracing::error!("saving linked PCs failed: {e}");
-            }
+        match peers.get_mut(host) {
+            None => return Err("that device is not linked".into()),
+            Some(p) if p.via_hub || p.role == Role::Hub => return Err("that PC is managed by the hub".into()),
+            Some(p) => p.name = name,
+        }
+        if let Err(e) = peers.save() {
+            tracing::error!("saving linked PCs failed: {e}");
         }
         drop(peers);
         self.state.peers_changed();
+        Ok(())
     }
 
     fn edit_store(&self, f: impl FnOnce(&mut seek_sync::peers::PeerFile)) {
@@ -226,8 +273,10 @@ impl PeersRuntime {
 
     /// Removes the link to `host` on both PCs (the other one is told if it is connected).
     pub async fn unlink(&self, host: HostId) -> Result<(), String> {
-        if self.state.peers.lock().unwrap().get(host).is_none() {
-            return Err("that device is not linked".into());
+        match self.state.peers.lock().unwrap().get(host) {
+            None => return Err("that device is not linked".into()),
+            Some(p) if p.via_hub || p.role == Role::Hub => return Err("that PC is managed by the hub".into()),
+            Some(_) => {}
         }
         let ctl = self.sessions.lock().unwrap().get(&host).cloned();
         if let Some(ctl) = ctl {
@@ -245,7 +294,7 @@ impl PeersRuntime {
         Ok(())
     }
 
-    fn my_info(&self, user_sid: &str) -> PairInfo {
+    pub(crate) fn my_info(&self, user_sid: &str) -> PairInfo {
         let members = self
             .state
             .peers
@@ -268,7 +317,11 @@ impl PeersRuntime {
             public_key: key_to_b64(&self.keys.public),
             user_sid: user_sid.to_string(),
             members,
-            port: self.addr.port(),
+            port: self.local_addr().port(),
+            role: seek_sync::Role::Pc,
+            addrs: Vec::new(),
+            // the service does not track display names of users; filled in when the hub work needs it
+            user_name: String::new(),
         }
     }
 
@@ -286,6 +339,9 @@ impl PeersRuntime {
 
     /// Links this PC with the PC at `addr` that shows `code`. Returns that PC's name.
     pub async fn join(&self, addr: &str, code: &str, user_sid: &str) -> Result<String, String> {
+        if self.state.peers.lock().unwrap().file.hub().is_some() {
+            return Err("this PC syncs through a hub; unlink it first".into());
+        }
         let me = self.host_id();
         let mut io = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr))
             .await
@@ -320,6 +376,9 @@ impl PeersRuntime {
             profiles: Vec::new(),
             last_sync_ms: 0,
             state: PeerState::Linked,
+            role: Role::Pc,
+            addrs: Vec::new(),
+            via_hub: false,
         });
         for m in host.members.into_iter().filter(|m| m.host_id != me) {
             self.store_peer(Peer {
@@ -331,6 +390,9 @@ impl PeersRuntime {
                 profiles: Vec::new(),
                 last_sync_ms: 0,
                 state: PeerState::Linked,
+                role: Role::Pc,
+                addrs: Vec::new(),
+                via_hub: false,
             });
         }
         tracing::info!("linked with {}", host.name);
@@ -395,6 +457,9 @@ impl PeersRuntime {
             profiles: Vec::new(),
             last_sync_ms: 0,
             state: PeerState::Linked,
+            role: Role::Pc,
+            addrs: Vec::new(),
+            via_hub: false,
         });
         *self.pairing.lock().unwrap() = None;
         tracing::info!("linked with {}", guest.name);
@@ -454,9 +519,14 @@ impl PeersRuntime {
                             protocol: seek_sync::SYNC_PROTOCOL,
                             host_id: self.host_id(),
                             name: self.state.pc_name(),
+                            role: seek_sync::Role::Pc,
                         };
                         let _ = wr.send(&seek_sync::Frame::new(&hello, Vec::new())).await;
                         let _ = wr.send(&seek_sync::Frame::new(&Msg::Unlinked, Vec::new())).await;
+                        // Let the dialer read it and hang up. Closing now, with its first frames (the device
+                        // list) still unread here, resets the connection and the dialer loses the frame.
+                        let _ = tokio::time::timeout(Duration::from_secs(2), async { while rd.recv().await.is_ok() {} })
+                            .await;
                     }
                 }
             }
@@ -578,7 +648,7 @@ impl PeersRuntime {
         let host_name = format!("seek-{}.local.", self.host_id().simple());
         let name = self.state.pc_name();
         let props = [("id", id.as_str()), ("name", name.as_str())];
-        let info = mdns_sd::ServiceInfo::new(MDNS_SERVICE, &id, &host_name, (), self.addr.port(), &props[..])?
+        let info = mdns_sd::ServiceInfo::new(MDNS_SERVICE, &id, &host_name, (), self.local_addr().port(), &props[..])?
             .enable_addr_auto();
         daemon.register(info)?;
         let events = daemon.browse(MDNS_SERVICE)?;

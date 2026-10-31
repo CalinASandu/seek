@@ -28,3 +28,7 @@ windows-sys.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+seek-hub.workspace = true
+rustls.workspace = true
+tokio-rustls.workspace = true
+rcgen.workspace = true

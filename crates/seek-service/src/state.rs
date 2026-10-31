@@ -35,8 +35,10 @@ pub struct SyncConfig {
     pub mdns: bool,
     /// This PC's name as shown on linked PCs.
     pub name: String,
-    /// How often changes are pushed to linked PCs.
+    /// How often changes are pushed to linked PCs, and the hub is polled and redialed.
     pub interval: Duration,
+    /// TLS trust for a `tls://` hub address; `None` = the public web roots (tests trust their own root).
+    pub hub_tls: Option<seek_sync::transport::TlsConfig>,
 }
 
 pub type SharedIndex = Arc<RwLock<DeviceIndex>>;

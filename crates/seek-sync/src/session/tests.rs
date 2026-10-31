@@ -181,9 +181,18 @@ impl SyncHost for TestHost {
             .map(|(id, (c, _))| (*id, *c))
             .collect()
     }
+    fn held_remote(&self) -> Vec<(uuid::Uuid, Cursor)> {
+        self.copies.lock().unwrap().iter().map(|(id, (c, _))| (*id, *c)).collect()
+    }
     fn remote_devices(&self, _owner: uuid::Uuid, devices: Vec<Device>, _profiles: Vec<(String, String)>) {
         self.copies.lock().unwrap().retain(|id, _| devices.iter().any(|d| d.id == *id));
         *self.remote.lock().unwrap() = devices;
+    }
+    fn catalog(&self, _hub: uuid::Uuid, pcs: Vec<CatalogPc>, devices: Vec<Device>) {
+        for pc in pcs {
+            let theirs = devices.iter().filter(|d| d.indexed_by_host == pc.host_id).cloned().collect();
+            self.remote_devices(pc.host_id, theirs, pc.profiles);
+        }
     }
     fn apply_delta(
         &self,
@@ -372,9 +381,58 @@ async fn unlink_reaches_the_peer_and_ends_both_sessions() {
     assert!(b.unlinked.load(Ordering::SeqCst));
 }
 
+#[tokio::test]
+async fn hub_role_on_lan_session_fails() {
+    let a = TestHost::new("A");
+    let (ka, kb) = (Keys::generate(), Keys::generate());
+    let (ia, ib) = tokio::io::duplex(1 << 16);
+    let kb2 = kb.clone();
+    let accepting = tokio::spawn(async move { accept(ib, &kb2, |_| true).await.unwrap() });
+    let (ra, wa) = connect(ia, &ka, &kb.public).await.unwrap();
+    let (_, _rb, mut wb) = accepting.await.unwrap();
+    let peer = uuid::Uuid::new_v4();
+    let (ctl, outbox) = SessionCtl::new();
+    let t = tokio::spawn(run_session(a, peer, ra, wa, ctl, outbox, LONG));
+    let hello = Msg::Hello { protocol: SYNC_PROTOCOL, host_id: peer, name: "hub".into(), role: Role::Hub };
+    wb.send(&Frame::new(&hello, vec![])).await.unwrap();
+    assert!(matches!(t.await.unwrap(), Err(Error::Protocol(_))));
+}
+
 #[test]
 fn delta_payload_roundtrip_and_garbage() {
     let ch = vec![Change::Delete { id: 9 }];
     assert_eq!(decode_delta(&encode_delta(&ch)).unwrap(), ch);
     assert!(decode_delta(b"nope").is_err());
+}
+
+#[test]
+fn an_answer_behind_what_was_sent_is_ignored() {
+    let (device, generation) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    let at = |seq| Cursor { generation, seq };
+    let mut owner = Owner::new();
+    owner.peer_has(device, at(0));
+    owner.sent.insert(device, at(1)); // a delta to 1 went out
+    // the `Have` of the `Devices` sent before it, and the `Ack` of an even older delta, arrive late
+    owner.peer_has(device, at(0));
+    assert_eq!(owner.sent[&device], at(1));
+    // newer, none and another generation always replace it
+    owner.peer_has(device, at(2));
+    assert_eq!(owner.sent[&device], at(2));
+    owner.peer_has(device, Cursor::none());
+    assert_eq!(owner.sent[&device], Cursor::none());
+    owner.peer_has(device, at(5));
+    owner.peer_has(device, Cursor { generation: uuid::Uuid::new_v4(), seq: 1 });
+    assert_ne!(owner.sent[&device], at(5));
+}
+
+#[test]
+fn delta_that_unpacks_past_the_limit_is_refused() {
+    let changes: Vec<Change> = (0..1000u64).map(|id| Change::Delete { id }).collect();
+    let delta = encode_delta(&changes);
+    assert_eq!(decode_delta_limited(&delta, 1 << 20).unwrap().len(), 1000);
+    assert!(matches!(decode_delta_limited(&delta, 100), Err(Error::Protocol(m)) if m.contains("larger than")));
+    // a bomb: a few hundred bytes that claim megabytes
+    let bomb = zstd::encode_all(vec![0u8; 8 << 20].as_slice(), 1).unwrap();
+    assert!(bomb.len() < 4096);
+    assert!(decode_delta_limited(&bomb, 1 << 20).is_err());
 }

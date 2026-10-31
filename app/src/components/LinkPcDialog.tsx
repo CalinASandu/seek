@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { CircleCheck, Monitor } from "lucide-react";
 import { useApi } from "../api/context";
 import type { PairingCode, PcInfo, Peers } from "../api/types";
-import { errText, spacedCode } from "../lib/pcs";
+import { errText, hubLinkError, spacedCode } from "../lib/pcs";
 import { Dialog } from "./Dialog";
 
 interface Props {
@@ -11,7 +11,7 @@ interface Props {
   onLinked: (name: string) => void;
 }
 
-type Tab = "show" | "enter";
+type Tab = "show" | "enter" | "hub";
 
 export function LinkPcDialog({ peers, onClose, onLinked }: Props) {
   const [tab, setTab] = useState<Tab>("show");
@@ -61,8 +61,17 @@ export function LinkPcDialog({ peers, onClose, onLinked }: Props) {
             <button role="tab" aria-selected={tab === "enter"} className={tab === "enter" ? "is-on" : ""} onClick={() => setTab("enter")}>
               Enter a code
             </button>
+            <button role="tab" aria-selected={tab === "hub"} className={tab === "hub" ? "is-on" : ""} onClick={() => setTab("hub")}>
+              Hub
+            </button>
           </div>
-          {tab === "show" ? <ShowCode /> : <EnterCode onLinked={done} />}
+          {tab === "show" ? (
+            <ShowCode />
+          ) : tab === "enter" ? (
+            <EnterCode onLinked={done} />
+          ) : (
+            <HubLink direct={peers?.peers.length ?? 0} onLinked={done} />
+          )}
         </>
       )}
     </Dialog>
@@ -222,6 +231,97 @@ function EnterCode({ onLinked }: { onLinked: (name: string) => void }) {
         </p>
         <button type="submit" className="btn btn-primary" disabled={!ready}>
           {busy ? "Linking…" : "Link"}
+        </button>
+      </div>
+    </form>
+  );
+}
+
+function HubLink({ direct, onLinked }: { direct: number; onLinked: (name: string) => void }) {
+  const api = useApi();
+  const [addr, setAddr] = useState("");
+  const [code, setCode] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [confirm, setConfirm] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const digits = code.replace(/\D/g, "");
+  const ready = addr.trim() !== "" && digits.length === 8 && !busy;
+
+  const link = async () => {
+    if (!ready) return;
+    // linking replaces the direct links: say so first
+    if (direct > 0 && !confirm) {
+      setConfirm(true);
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      onLinked(await api.linkHub(addr.trim(), digits));
+    } catch (e) {
+      setError(hubLinkError(e));
+      setConfirm(false);
+      setBusy(false);
+    }
+  };
+
+  return (
+    <form
+      role="tabpanel"
+      aria-label="Hub"
+      className="link-panel"
+      onSubmit={(e) => {
+        e.preventDefault();
+        void link();
+      }}
+    >
+      <label className="field-label" htmlFor="hub-addr">
+        Hub address
+      </label>
+      <div className="field">
+        <input
+          id="hub-addr"
+          value={addr}
+          placeholder="tls://seek-hub.your-tailnet.ts.net"
+          spellCheck={false}
+          onChange={(e) => {
+            setAddr(e.target.value);
+            setConfirm(false);
+          }}
+        />
+      </div>
+      <label className="field-label link-code-label" htmlFor="hub-code">
+        Code
+      </label>
+      <div className={`field field-code${error ? " is-invalid" : ""}`}>
+        <input
+          id="hub-code"
+          value={code}
+          inputMode="numeric"
+          autoComplete="one-time-code"
+          maxLength={9}
+          placeholder="0000 0000"
+          spellCheck={false}
+          onChange={(e) => {
+            const d = e.target.value.replace(/\D/g, "").slice(0, 8);
+            setCode(spacedCode(d));
+            setConfirm(false);
+          }}
+        />
+      </div>
+      {confirm && (
+        <p className="setting-desc" role="status">
+          Linking to a hub replaces your direct links with {direct} {direct === 1 ? "PC" : "PCs"}. Their files stay searchable and
+          update through the hub once those PCs link to it too.
+        </p>
+      )}
+      <div className="link-actions">
+        <p className={`field-help${error ? " is-error" : ""}`} role={error ? "alert" : undefined}>
+          {error ?? "Run `seek-hub link` on the hub to get a code."}
+        </p>
+        <button type="submit" className="btn btn-primary" disabled={!ready}>
+          {busy ? "Linking…" : "Link hub"}
         </button>
       </div>
     </form>

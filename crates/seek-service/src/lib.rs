@@ -2,6 +2,7 @@
 //! over a named pipe.
 
 pub mod access;
+mod hub;
 mod journal_ops;
 pub mod monitor;
 pub mod peers;
@@ -34,6 +35,7 @@ pub fn default_sync_config() -> SyncConfig {
         mdns: true,
         name: std::env::var("COMPUTERNAME").unwrap_or_else(|_| "This PC".into()),
         interval: Duration::from_secs(60),
+        hub_tls: None,
     }
 }
 

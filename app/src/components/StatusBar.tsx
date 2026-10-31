@@ -1,6 +1,6 @@
-import type { Device, Peers, Status } from "../api/types";
+import type { Device, HubStatus, Peers, Status } from "../api/types";
 import { formatCount, formatInt, formatRelative } from "../lib/format";
-import { hasPeers, lastSync } from "../lib/pcs";
+import { hasPeers, hubSyncedText, inHubMode, lastSync } from "../lib/pcs";
 
 interface Props {
   total: number | null;
@@ -13,9 +13,10 @@ interface Props {
   devices: Device[];
   progress: Record<string, number>;
   peers?: Peers | null;
+  hub?: HubStatus | null;
 }
 
-export function StatusBar({ total, elapsedMs, loading, stale, onRefresh, status, devices, progress, peers = null }: Props) {
+export function StatusBar({ total, elapsedMs, loading, stale, onRefresh, status, devices, progress, peers = null, hub = null }: Props) {
   const scanning = devices.filter((d) => d.state === "scanning");
   const first = scanning[0];
   return (
@@ -44,7 +45,16 @@ export function StatusBar({ total, elapsedMs, loading, stale, onRefresh, status,
         <span className="status-gap" />
         <span className="dot dot-offline" /> {status?.devicesOffline ?? 0} offline
       </span>
-      {hasPeers(peers) && (
+      {inHubMode(hub) && (
+        <>
+          <span className="status-sep" />
+          <span className="status-seg" title={hub.lastError ?? hub.addr}>
+            {hub.online ? "Hub" : "Hub offline"}
+            <span className="status-muted"> · {hubSyncedText(hub)}</span>
+          </span>
+        </>
+      )}
+      {!inHubMode(hub) && hasPeers(peers) && (
         <>
           <span className="status-sep" />
           <span
