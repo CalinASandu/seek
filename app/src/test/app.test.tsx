@@ -165,14 +165,62 @@ describe("Seek app", () => {
     const laptop = await screen.findByRole("group", { name: "Laptop" });
     const desktop = screen.getByRole("group", { name: "DESKTOP" });
     await user.click(within(laptop).getByRole("button", { name: /System \(C:\), online/ }));
-    expect(screen.getByRole("searchbox")).toHaveValue('drive:"Laptop/System (C:)" ');
+    expect(screen.getByRole("searchbox")).toHaveValue("");
+    expect(screen.getByRole("button", { name: "Remove filter Laptop › System (C:)" })).toBeInTheDocument();
     await waitFor(() =>
       expect(within(laptop).getByRole("button", { name: /System \(C:\), online/ })).toHaveAttribute("aria-pressed", "true"),
     );
     expect(within(desktop).getByRole("button", { name: /System \(C:\), online/ })).toHaveAttribute("aria-pressed", "false");
     // a name only one drive has stays short
     await user.click(within(desktop).getByRole("button", { name: /^Data \(D:\)/ }));
-    expect(screen.getByRole("searchbox")).toHaveValue('drive:"Laptop/System (C:)" drive:"Data (D:)" ');
+    await waitFor(() => expect(screen.getByRole("button", { name: "Remove filter Data (D:)" })).toBeInTheDocument());
+  });
+
+  it("keeps filters out of the search box and adds them to what is searched", async () => {
+    const base = makeApi();
+    const search = vi.fn(base.search);
+    const user = userEvent.setup();
+    render(<App api={{ ...base, search }} />);
+    const box = await screen.findByRole("searchbox");
+    await user.type(box, "report");
+    await user.click(screen.getByRole("button", { name: "Files" }));
+    await user.click(screen.getByRole("button", { name: /^Data \(D:\)/ }));
+    await user.click(screen.getByRole("button", { name: /^NAS media/ }));
+    expect(box).toHaveValue("report");
+    expect(screen.getByRole("button", { name: "Files" })).toHaveAttribute("aria-pressed", "true");
+    await waitFor(() =>
+      expect(search).toHaveBeenLastCalledWith('drive:"Data (D:)"|drive:"NAS media" file: report', "name", false),
+    );
+
+    await user.click(screen.getByRole("button", { name: "Remove filter NAS media" }));
+    await waitFor(() => expect(search).toHaveBeenLastCalledWith('drive:"Data (D:)" file: report', "name", false));
+
+    // clearing the box leaves the filters on
+    await user.click(screen.getByRole("button", { name: "Clear search" }));
+    await waitFor(() => expect(search).toHaveBeenLastCalledWith('drive:"Data (D:)" file:', "name", false));
+    expect(screen.getByRole("button", { name: "Remove filter Data (D:)" })).toBeInTheDocument();
+  });
+
+  it("turns off a filter that was typed by hand", async () => {
+    const user = userEvent.setup();
+    render(<App api={makeApi()} />);
+    const box = await screen.findByRole("searchbox");
+    await user.type(box, "report file:");
+    await user.click(screen.getByRole("button", { name: "Folders" }));
+    expect(box).toHaveValue("report");
+    expect(screen.getByRole("button", { name: "Folders" })).toHaveAttribute("aria-pressed", "true");
+  });
+
+  it("points a parse error at the typed text, past the filters", async () => {
+    const q = 'file: ab"';
+    const api = makeApi({ search: async () => ({ ok: false, message: "unclosed quote", position: q.indexOf('"') }) });
+    const user = userEvent.setup();
+    render(<App api={api} />);
+    await user.click(await screen.findByRole("button", { name: "Files" }));
+    await user.type(screen.getByRole("searchbox"), 'ab"');
+    expect(await screen.findByRole("alert")).toHaveTextContent("unclosed quote");
+    // the caret sits under the quote: 2 typed characters in, not 8
+    expect(document.querySelector<HTMLElement>(".search-caret")?.style.left).toBe("57px");
   });
 
   it("shows a pairing code in the Link a device dialog (sidebar button)", async () => {

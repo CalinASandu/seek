@@ -269,6 +269,24 @@ Pi, `docker build`, `mkdir -p data keys tailscale && sudo chown 10001:10001 data
 optional `init`, `compose up -d`, `compose logs`, `openssl s_client` (the certificate can take a few minutes: retry),
 `doctor --public`, link two PCs (one on a phone hotspot without Tailscale), search across them, `seek-hub status`.
 
+## Quality of life pass (2026-11-02)
+
+- **Mouse side buttons + Alt+←/→**: Space keeps a browser-style history (`hooks/useSpaceNav.ts`): every folder and drive
+  change is a step, a new move drops the steps ahead, a vanished folder replaces its entry instead of adding one. It lives
+  in `Shell`, so the folder, history and tab survive switching to Search. In Search, back only returns to Space after
+  "Search in this folder". Buttons do nothing behind a dialog. `hooks/useMouseNav.ts` listens on the window.
+  **Not yet pressed with a real mouse in the Tauri window**: tests dispatch events for buttons 3 and 4.
+- **Search box holds only typed text**: `SearchInput { text, filters }` in `lib/query.ts`. `composeQuery` puts filters first,
+  so an unfinished quote can't swallow them; parse errors are shifted back to the typed text. Files/Folders/Online/Offline
+  light up; drive and folder filters also get a removable pill. X and Esc clear only the text.
+- **Several drives now mean "any of these"** (`drive:"A"|drive:"B"`): spaces AND terms, so two selected drives used to
+  return nothing.
+- **Beam switch** (the user's pick from a five-way test page, since deleted): `components/Segmented.tsx` is the Search/Space
+  switch and the Space tabs. A capsule on two spring edges, with the labels repeated in its ink colour and clipped to it.
+  **Not yet seen in the real window or at the app's 32 px title bar** (the dev server was stopped for low memory). Settings
+  and the Link dialog keep the older `.segmented` control.
+- Maybe later (user): a shortcuts page in Settings.
+
 ## Next step
 
 0. **Space view in the real window (user)** — the release binaries were locked while the session ran:

@@ -12,16 +12,46 @@ export function removeToken(query: string, token: string): string {
   return query.replace(tokenRe(token), " ").replace(/\s+/g, " ").trimStart();
 }
 
-export function addToken(query: string, token: string): string {
-  const base = query.trimEnd();
-  return base ? `${base} ${token} ` : `${token} `;
+/** A filter set from the UI. It never appears in the search box, which holds only what was typed. */
+export interface Filter {
+  token: string;
+  /** `flag` filters light up their chip; `drive` and `folder` filters also get a removable pill. */
+  kind: "flag" | "drive" | "folder";
+  label: string;
+  title?: string;
 }
 
-export function toggleToken(query: string, token: string, exclusive: string[] = []): string {
-  if (hasToken(query, token)) return removeToken(query, token).trimEnd();
-  let q = query;
-  for (const other of exclusive) q = removeToken(q, other);
-  return addToken(q, token);
+export interface SearchInput {
+  text: string;
+  filters: Filter[];
+}
+
+export const filterOn = (s: SearchInput, token: string): boolean =>
+  s.filters.some((f) => f.token === token) || hasToken(s.text, token);
+
+/** Turn a filter on or off, also when it was typed by hand; turning it on drops the `exclusive` tokens. */
+export function toggleFilter(s: SearchInput, filter: Filter, exclusive: string[] = []): SearchInput {
+  const on = filterOn(s, filter.token);
+  const drop = on ? [filter.token] : [filter.token, ...exclusive];
+  const filters = s.filters.filter((f) => !drop.includes(f.token));
+  const text = drop.reduce((t, tok) => (hasToken(t, tok) ? removeToken(t, tok).trimEnd() : t), s.text);
+  return { text, filters: on ? filters : [...filters, filter] };
+}
+
+/**
+ * The query sent to the service: filters first, so an unfinished quote in the typed text can't swallow them.
+ * Several drives mean "on any of these" (terms separated by spaces must all match).
+ */
+export function composeQuery({ text, filters }: SearchInput): string {
+  const drives = filters.filter((f) => f.kind === "drive").map((f) => f.token).join("|");
+  const rest = filters.filter((f) => f.kind !== "drive").map((f) => f.token);
+  return [drives, ...rest, text].filter(Boolean).join(" ");
+}
+
+/** Filter for everything under one folder. */
+export function folderFilter(folder: string): Filter {
+  const name = folder.replace(/\\+$/, "").split("\\").pop() ?? folder;
+  return { token: `path:"${folder}"`, kind: "folder", label: `in ${name}`, title: folder };
 }
 
 /** Filter for one drive; with `pc`, only that PC's drive of that name (`drive:"PC/Drive"`). */

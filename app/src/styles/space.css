@@ -1,25 +1,23 @@
-/* ---- view switch (segctl control, as in a macOS toolbar) ------------- */
+/* ---- segmented control (title bar view switch, Space tabs) ------------- */
 .titlebar { position: relative; }
 .titlebar-center { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); -webkit-app-region: no-drag; }
 
-.segctl { --n: 2; position: relative; display: inline-grid; grid-template-columns: repeat(var(--n), 1fr); padding: 2px; border-radius: 8px; background: light-dark(#7676801f, #7676803d); isolation: isolate; }
-.segctl:has(> :nth-child(4)) { --n: 3; }
-.segment { position: relative; z-index: 1; height: 22px; padding: 0 16px; border-radius: 6px; font-size: var(--fs-xs); font-weight: 500; letter-spacing: var(--tr-sm); color: var(--text-2); white-space: nowrap; transition: color var(--t), opacity var(--t); }
-.segment:hover:not([aria-checked="true"]):not([aria-selected="true"]) { opacity: 0.72; }
-.segment[aria-checked="true"], .segment[aria-selected="true"] { color: var(--text); }
-.segment:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 1px; }
-/* separators between unselected neighbours, like NSSegmentedControl */
-.segment + .segment::before { content: ""; position: absolute; left: 0; top: 6px; bottom: 6px; width: 0.5px; background: var(--border-strong); transition: opacity var(--t); }
-.segctl[data-index="0"] .segment:nth-child(2)::before, .segctl[data-index="0"] .segment:nth-child(3)::before,
-.segctl[data-index="1"] .segment:nth-child(3)::before, .segctl[data-index="1"] .segment:nth-child(4)::before,
-.segctl[data-index="2"] .segment:nth-child(4)::before { opacity: 0; }
-/* pinned to a cell: an auto-placed absolute child would add an implicit column */
-.segctl-thumb { grid-area: 1 / 1; position: absolute; z-index: 0; top: 2px; bottom: 2px; left: 2px; width: calc((100% - 4px) / var(--n)); border-radius: 6px; background: light-dark(#ffffff, #636366); box-shadow: 0 0 0 0.5px light-dark(#0000000f, #ffffff0f), 0 2px 6px light-dark(#0000001f, #00000040), 0 0.5px 1px light-dark(#0000001a, #00000040); transform: translateX(calc(var(--i, 0) * 100%)); transition: transform var(--t-spring); }
-.segctl[data-index="1"] .segctl-thumb { --i: 1; }
-.segctl[data-index="2"] .segctl-thumb { --i: 2; }
-/* slimmer in the title bar, so it sits inside it instead of filling it */
-.view-switch .segment { height: 20px; padding: 0 18px; }
-.segctl.is-small .segment { height: 20px; padding: 0 10px; font-size: var(--fs-2xs); }
+.seg { --pad: 2px; --h: 22px; --x: 18px; --fs: var(--fs-xs); position: relative; display: inline-grid; grid-auto-flow: column; grid-auto-columns: 1fr; padding: var(--pad); border-radius: 999px; background: light-dark(#78788017, #ffffff0f); box-shadow: inset 0 0 0 0.5px light-dark(#0000000a, #ffffff0d); isolation: isolate; touch-action: manipulation; }
+.seg.is-small { --x: 14px; --fs: var(--fs-2xs); }
+.seg-btn { position: relative; z-index: 2; display: inline-flex; align-items: center; justify-content: center; height: var(--h); padding: 0 var(--x); border-radius: 999px; font-size: var(--fs); font-weight: 550; letter-spacing: var(--tr-sm); color: var(--muted); white-space: nowrap; transition: color var(--t); }
+button.seg-btn:hover { color: var(--text-2); }
+button.seg-btn:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 1px; border-radius: 999px; }
+/* position and width are written by Segmented, frame by frame */
+.seg-thumb { position: absolute; z-index: 0; top: var(--pad); bottom: var(--pad); left: 0; width: 0; border-radius: 999px; will-change: transform, width; }
+.seg-face { display: block; height: 100%; border-radius: inherit; background: light-dark(#1d1d1f, #f5f5f7); box-shadow: 0 2px 10px light-dark(#00000033, #ffffff1f); transition: transform 220ms var(--spring); }
+.seg:has(button.is-active:active) .seg-face { transform: scale(0.95); transition-duration: 60ms; }
+.seg-halo { position: absolute; z-index: 0; top: var(--pad); bottom: var(--pad); left: 0; width: 0; border-radius: 999px; background: light-dark(#0000000a, #ffffff0d); opacity: 0; pointer-events: none; transition: transform 280ms var(--spring), width 280ms var(--spring), opacity 120ms linear; }
+/* the labels again in the capsule's ink colour, clipped to the capsule */
+.seg-ink { position: absolute; z-index: 3; inset: 0; display: grid; grid-auto-flow: column; grid-auto-columns: 1fr; padding: var(--pad); pointer-events: none; }
+.seg-ink .seg-btn { color: light-dark(#ffffff, #1d1d1f); transition: none; }
+@media (prefers-reduced-motion: reduce) {
+  .seg-face, .seg-halo { transition: none; }
+}
 
 /* ---- Space view layout ------------------------------------------------- */
 .space { flex: 1; min-height: 0; display: flex; flex-direction: column; }
