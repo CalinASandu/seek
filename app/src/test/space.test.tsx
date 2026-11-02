@@ -77,7 +77,97 @@ describe("Space view", () => {
     const { user, list } = await openSpace();
     fireEvent.contextMenu(within(list).getByRole("option", { name: /^Users/ }));
     await user.click(within(screen.getByRole("menu")).getByRole("menuitem", { name: /Search in this folder/ }));
-    expect(await screen.findByRole("searchbox")).toHaveValue('path:"C:\\Users" ');
+    expect(await screen.findByRole("searchbox")).toHaveValue("");
+    const pill = screen.getByRole("button", { name: "Remove filter in Users" });
+    expect(pill).toHaveAttribute("title", "C:\\Users");
+    // back returns to Space, in the same place
+    fireEvent.mouseUp(window, { button: 3 });
+    expect(await screen.findByRole("listbox", { name: "Contents" })).toBeInTheDocument();
+    // once back in Space, the button walks history again; Search does nothing more
+    await user.click(screen.getByRole("radio", { name: "Search" }));
+    fireEvent.mouseUp(window, { button: 3 });
+    expect(await screen.findByRole("searchbox")).toBeInTheDocument();
+  });
+
+  it("walks back and forward through folders with the mouse's side buttons", async () => {
+    const { user, list } = await openSpace();
+    await user.dblClick(within(list).getByRole("option", { name: /^Users/ }));
+    await user.dblClick(await within(list).findByRole("option", { name: /^Calin/ }));
+    await within(path()).findByRole("button", { name: "Calin" });
+
+    fireEvent.mouseUp(window, { button: 3 });
+    await waitFor(() => expect(within(path()).queryByRole("button", { name: "Calin" })).toBeNull());
+    expect(within(path()).getByRole("button", { name: "Users" })).toBeInTheDocument();
+    fireEvent.mouseUp(window, { button: 3 });
+    await waitFor(() => expect(within(path()).queryByRole("button", { name: "Users" })).toBeNull());
+    fireEvent.mouseUp(window, { button: 3 }); // nothing further back
+    fireEvent.mouseUp(window, { button: 4 });
+    fireEvent.mouseUp(window, { button: 4 });
+    expect(await within(path()).findByRole("button", { name: "Calin" })).toBeInTheDocument();
+  });
+
+  it("counts a drive change as a step and keeps the place when leaving Space", async () => {
+    const { user, list } = await openSpace();
+    await user.dblClick(within(list).getByRole("option", { name: /^Users/ }));
+    await within(path()).findByRole("button", { name: "Users" });
+    await user.click(screen.getByRole("button", { name: /^Data \(D:\)/ }));
+    await within(path()).findByRole("button", { name: /Data \(D:\)/ });
+    await user.keyboard("{Alt>}{ArrowLeft}{/Alt}");
+    expect(await within(path()).findByRole("button", { name: "Users" })).toBeInTheDocument();
+    expect(within(path()).getByRole("button", { name: /System \(C:\)/ })).toBeInTheDocument();
+    await user.keyboard("{Alt>}{ArrowRight}{/Alt}");
+    await within(path()).findByRole("button", { name: /Data \(D:\)/ });
+    await user.keyboard("{Alt>}{ArrowLeft}{/Alt}");
+
+    await user.click(screen.getByRole("radio", { name: "Search" }));
+    await user.click(await screen.findByRole("radio", { name: "Space" }));
+    expect(await within(path()).findByRole("button", { name: "Users" })).toBeInTheDocument();
+  });
+
+  it("moves between tabs with the arrow keys without leaving the folder", async () => {
+    const { user, list } = await openSpace();
+    await user.dblClick(within(list).getByRole("option", { name: /^Users/ }));
+    await within(path()).findByRole("button", { name: "Users" });
+    const tabs = screen.getByRole("tablist", { name: "Show" });
+    await user.click(within(tabs).getByRole("tab", { name: "Largest" }));
+    await user.keyboard("{ArrowRight}");
+    expect(within(tabs).getByRole("tab", { name: "By type" })).toHaveAttribute("aria-selected", "true");
+    await user.keyboard("{ArrowLeft}");
+    expect(within(tabs).getByRole("tab", { name: "Largest" })).toHaveAttribute("aria-selected", "true");
+    expect(within(path()).getByRole("button", { name: "Users" })).toBeInTheDocument();
+    // Alt+← still walks history from a focused tab
+    await user.keyboard("{Alt>}{ArrowLeft}{/Alt}");
+    await waitFor(() => expect(within(path()).queryByRole("button", { name: "Users" })).toBeNull());
+  });
+
+  it("leaves a dialog alone: side buttons do nothing behind it", async () => {
+    const { user, list } = await openSpace();
+    await user.dblClick(within(list).getByRole("option", { name: /^Users/ }));
+    await within(path()).findByRole("button", { name: "Users" });
+    await user.click(screen.getByRole("button", { name: "Settings" }));
+    await screen.findByRole("dialog", { name: "Settings" });
+    fireEvent.mouseUp(window, { button: 3 });
+    await new Promise((r) => setTimeout(r, 50));
+    expect(within(path()).getByRole("button", { name: "Users" })).toBeInTheDocument();
+  });
+
+  it("drops a vanished folder from history instead of adding a step", async () => {
+    const base = makeApi();
+    let gone = false;
+    const api = makeApi({
+      spaceTree: (id, p, depth) =>
+        gone && p.endsWith("Calin") ? Promise.reject(new Error("That folder no longer exists")) : base.spaceTree(id, p, depth),
+    });
+    const { user, list } = await openSpace(api);
+    await user.dblClick(within(list).getByRole("option", { name: /^Users/ }));
+    await user.dblClick(await within(list).findByRole("option", { name: /^Calin/ }));
+    await within(path()).findByRole("button", { name: "Calin" });
+    gone = true;
+    fireEvent.mouseUp(window, { button: 3 });
+    await waitFor(() => expect(within(path()).queryByRole("button", { name: "Calin" })).toBeNull());
+    fireEvent.mouseUp(window, { button: 4 }); // Calin again, which is gone: climbs back to Users
+    await waitFor(() => expect(within(path()).queryByRole("button", { name: "Calin" })).toBeNull());
+    expect(within(path()).getByRole("button", { name: "Users" })).toBeInTheDocument();
   });
 
   it("climbs to the parent when a folder no longer exists", async () => {

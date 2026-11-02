@@ -630,6 +630,9 @@ mod tests {
         // the PC name must match exactly
         assert!(run(r#"drive:"lap/system""#).is_empty());
         assert!(run(r#"drive:"desk/backup""#).is_empty());
+        // the UI selects several drives like this
+        assert_eq!(devs_of(run(r#"drive:"Laptop/System"|drive:"desk/system""#)), [0, 1].into());
+        assert_eq!(devs_of(run(r#"drive:"Laptop/System"|drive:"desk/backup" report"#)), [0].into());
     }
 
 }

@@ -19,7 +19,7 @@ import { useApi } from "../api/context";
 import type { Device, HubStatus, PcSummary, Peers } from "../api/types";
 import { formatRelative } from "../lib/format";
 import { errText, hasPeers, inHubMode, OTHER_DEVICES } from "../lib/pcs";
-import { driveToken, hasToken } from "../lib/query";
+import { driveToken, type Filter } from "../lib/query";
 import { ContextMenu, type MenuItem } from "./ContextMenu";
 import { Dialog } from "./Dialog";
 import { DeviceItem } from "./DeviceItem";
@@ -30,13 +30,13 @@ interface Props {
   peers: Peers | null;
   /** While a hub is set, PCs come from the hub: no direct links. */
   hub: HubStatus | null;
-  query: string;
+  isFilterOn: (token: string) => boolean;
   collapsed: boolean;
   onCollapse: () => void;
   /** Space view: the drive shown (clicking a drive selects it instead of filtering the search). */
   selectedDevice?: string | null;
   onSelectDevice: (d: Device) => void;
-  onToggleDevice: (token: string) => void;
+  onToggleDevice: (filter: Filter) => void;
   onAddShare: () => void;
   onLinkPc: () => void;
   onOpenSettings: () => void;
@@ -105,11 +105,10 @@ export function Sidebar(p: Props) {
     const k = d.displayName.toLowerCase();
     nameCount.set(k, (nameCount.get(k) ?? 0) + 1);
   }
-  const tokenFor = (d: Device) =>
-    driveToken(
-      d.displayName,
-      (nameCount.get(d.displayName.toLowerCase()) ?? 0) > 1 ? pcNames.get(d.indexedByHost) : undefined,
-    );
+  const filterFor = (d: Device): Filter => {
+    const pc = (nameCount.get(d.displayName.toLowerCase()) ?? 0) > 1 ? pcNames.get(d.indexedByHost) : undefined;
+    return { token: driveToken(d.displayName, pc), kind: "drive", label: pc ? `${pc} › ${d.displayName}` : d.displayName };
+  };
 
   const commitRename = async (d: Device, name: string) => {
     setRenaming(null);
@@ -145,10 +144,10 @@ export function Sidebar(p: Props) {
       device={d}
       scanned={p.progress[d.id]}
       collapsed={p.collapsed}
-      active={p.selectedDevice !== undefined ? p.selectedDevice === d.id : hasToken(p.query, tokenFor(d))}
+      active={p.selectedDevice !== undefined ? p.selectedDevice === d.id : p.isFilterOn(filterFor(d).token)}
       renaming={renaming === d.id}
       note={deviceNote(d)}
-      onToggle={() => (p.selectedDevice !== undefined ? p.onSelectDevice(d) : p.onToggleDevice(tokenFor(d)))}
+      onToggle={() => (p.selectedDevice !== undefined ? p.onSelectDevice(d) : p.onToggleDevice(filterFor(d)))}
       onContextMenu={(pt) => setMenu({ ...pt, device: d })}
       onRename={() => !isRemote(d) && setRenaming(d.id)}
       onRenameCommit={(n) => void commitRename(d, n)}

@@ -249,7 +249,7 @@ function parseQuery(query: string): Parsed {
     const val = m?.[2] ?? "";
     if (key === "ext") q.exts = new Set(val.toLowerCase().split(";").filter(Boolean));
     else if (key === "device") q.devices.push(val.toLowerCase());
-    else if (key === "drive") q.drives.push(val.toLowerCase());
+    else if (key === "drive") q.drives.push(...val.toLowerCase().split("|drive:"));
     else if (key === "pc") {
       if (!val) return { ok: false, message: "pc: needs a name", position: start };
       q.pcs.push(val.toLowerCase());

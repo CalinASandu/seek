@@ -149,6 +149,12 @@ kbd { font-size: var(--fs-2xs); font-weight: 500; color: var(--muted); border-ra
 .chip.is-on { background: var(--accent); color: var(--accent-fg); font-weight: 600; }
 .chip.is-on svg { color: inherit; }
 .chip.is-on:hover { background: color-mix(in srgb, var(--accent) 90%, #000); }
+.chips-sep { align-self: center; width: 0.5px; height: 14px; margin: 0 4px; background: var(--border-strong); }
+.filter-pill { max-width: 240px; padding-right: 7px; animation: pill-in var(--t-spring); }
+.filter-pill span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.filter-pill svg { opacity: 0.75; transition: opacity var(--t); }
+.filter-pill:hover svg { opacity: 1; }
+@keyframes pill-in { from { opacity: 0; transform: scale(0.9); } }
 
 /* ---- results grid ------------------------------------------------------- */
 .grid-scroller { flex: 1; min-height: 0; overflow: auto; position: relative; outline: none; }
