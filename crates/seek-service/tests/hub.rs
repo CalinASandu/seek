@@ -155,6 +155,7 @@ fn cursor_of(pc: &Pc, device: DeviceId) -> Option<Cursor> {
 
 /// The in-memory copy of a device; a new one means a full copy was applied.
 fn index_of(pc: &Pc, device: DeviceId) -> Option<SharedIndex> {
+    pc.state.ensure_loaded(&[device], "test");
     pc.state.indexes.read().unwrap().get(&device).cloned()
 }
 

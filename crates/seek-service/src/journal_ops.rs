@@ -1,8 +1,8 @@
 //! Index changes that linked PCs must hear about: every batch applied to an own device's index is recorded
 //! in that device's change journal, and replacing an index starts a new journal generation.
 //!
-//! Lock order: `indexes` map → a device's index `RwLock` → `journals`. Holding the map lock across an
-//! apply/replace keeps a journal cursor and the index contents it describes consistent.
+//! Lock order: `parked` → `indexes` map → a device's index `RwLock` → `journals`. Holding the map lock across
+//! an apply/replace keeps a journal cursor and the index contents it describes consistent.
 
 use std::path::PathBuf;
 
@@ -35,8 +35,9 @@ impl State {
             .is_some_and(|d| d.indexed_by_host == reg.host_id)
     }
 
-    /// Applies `changes` to a device's index (and, for an own device, journals them). Returns the live
-    /// entry count, or `None` when the device has no index.
+    /// Applies `changes` to a device's index (and, for an own device, journals them). A parked own device
+    /// only journals them; its count then stays as it was until the next load. Returns the live entry
+    /// count, or `None` when the device has no index.
     pub fn apply_changes(
         &self,
         id: DeviceId,
@@ -44,6 +45,22 @@ impl State {
         checkpoint: Option<Checkpoint>,
     ) -> Option<u64> {
         let own = self.is_own_device(id);
+        let mut parked = self.parked.lock().unwrap();
+        if let Some(p) = parked.get_mut(&id) {
+            if own {
+                if checkpoint.is_some() {
+                    p.checkpoint = checkpoint;
+                }
+                self.with_journal(id, |j| j.record(changes));
+                self.own_index_changed();
+                return self.device(id).map(|d| d.entry_count);
+            }
+            // another PC's device has no journal here
+            drop(parked);
+            self.ensure_loaded(&[id], "change from a linked PC");
+            parked = self.parked.lock().unwrap();
+        }
+        let _in_memory_until_applied = parked;
         let map = self.indexes.read().unwrap();
         let ix = map.get(&id)?;
         let mut ix = ix.write().unwrap();
@@ -62,8 +79,7 @@ impl State {
     /// starts a new generation, so linked PCs fetch a full copy.
     pub fn replace_index(&self, id: DeviceId, ix: DeviceIndex) {
         let own = self.is_own_device(id);
-        let mut map = self.indexes.write().unwrap();
-        map.insert(id, std::sync::Arc::new(std::sync::RwLock::new(ix)));
+        self.install_index(id, ix);
         if own {
             self.with_journal(id, |j| j.reset());
             self.own_index_changed();
@@ -79,6 +95,7 @@ impl State {
 
     /// A consistent `(cursor, compacted copy)` of an own device, for a full copy to a linked PC.
     pub fn own_snapshot(&self, id: DeviceId) -> Option<(Cursor, DeviceIndex)> {
+        self.ensure_loaded(&[id], "full copy for a linked PC or the hub");
         let (cursor, mut copy) = {
             let map = self.indexes.read().unwrap();
             let ix = map.get(&id)?.read().unwrap();
@@ -116,6 +133,7 @@ mod tests {
             data_dir: dir.path().to_path_buf(),
             pipe_name: String::new(),
             sync: None,
+            idle_unload: None,
         };
         let state = State::load(cfg, Arc::new(NoVolumes)).unwrap();
         let id = crate::monitor::register_volume(&state, &volume());
@@ -148,6 +166,7 @@ mod tests {
             data_dir: dir.path().to_path_buf(),
             pipe_name: String::new(),
             sync: None,
+            idle_unload: None,
         };
         let state = State::load(cfg, Arc::new(NoVolumes)).unwrap();
         let id = crate::monitor::register_volume(&state, &volume());
@@ -170,6 +189,7 @@ mod tests {
             data_dir: dir.path().to_path_buf(),
             pipe_name: String::new(),
             sync: None,
+            idle_unload: None,
         };
         let state = State::load(cfg(), Arc::new(NoVolumes)).unwrap();
         let id = crate::monitor::register_volume(&state, &volume());
@@ -177,12 +197,21 @@ mod tests {
         state.apply_changes(id, &[Change::Delete { id: 105 }], None);
         state.save_index(id);
         let saved = state.journal_cursor(id);
-        // a change after the last save is lost from the index in a crash…
+        // a change after the last save is missing from the file, but the journal still has it…
         state.apply_changes(id, &[Change::Delete { id: 106 }], None);
+        let newest = state.journal_cursor(id);
         drop(state);
         let state = State::load(cfg(), Arc::new(NoVolumes)).unwrap();
-        // …so the journal (seq 2) no longer describes the index (seq 1): new generation.
-        assert_ne!(state.journal_cursor(id).generation, saved.generation);
+        // …so the next load replays it and linked PCs keep their deltas
+        assert_eq!(state.journal_cursor(id), newest);
+        assert_ne!(saved, newest);
+
+        // a journal that does not reach the file means a new generation
+        state.with_journal(id, |j| j.reset());
+        let reset = state.journal_cursor(id);
+        drop(state);
+        let state = State::load(cfg(), Arc::new(NoVolumes)).unwrap();
+        assert_ne!(state.journal_cursor(id).generation, reset.generation);
 
         state.save_index(id);
         let saved = state.journal_cursor(id);

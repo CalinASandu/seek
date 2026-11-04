@@ -172,6 +172,7 @@ fn service_body() -> anyhow::Result<()> {
         data_dir,
         pipe_name: seek_ipc::PIPE_NAME.into(),
         sync: Some(default_sync_config()),
+        idle_unload: Some(seek_service::parking::IDLE_UNLOAD),
     };
     let rt = tokio::runtime::Runtime::new()?;
     let result = rt.block_on(seek_service::run(cfg, Arc::new(RealVolumes), rx));

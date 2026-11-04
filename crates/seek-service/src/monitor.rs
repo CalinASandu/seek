@@ -178,14 +178,20 @@ fn start_pending_rescans(state: &Arc<State>) {
 /// Rescans only the folders a watcher reported, on a background thread. The device stays online and
 /// searchable throughout; on failure the device falls back to a full (rate-limited) rescan.
 fn start_update(state: &Arc<State>, id: DeviceId, v: VolumeInfo, dirs: Vec<PathBuf>) {
-    let Some(ix) = state.indexes.read().unwrap().get(&id).cloned() else {
+    if !state.has_index(id) {
         start_scan(state, id, v);
         return;
-    };
+    }
     state.updating.lock().unwrap().insert(id);
     let state = state.clone();
     std::thread::spawn(move || {
         let started = Instant::now();
+        state.ensure_loaded(&[id], "changed-folder rescan");
+        let Some(ix) = state.indexes.read().unwrap().get(&id).cloned() else {
+            // unreadable: the load queued a rescan
+            state.updating.lock().unwrap().remove(&id);
+            return;
+        };
         // Changes are computed and applied against the same index, and they refer to entries by id, so
         // a compaction in between is harmless; a full rescan that lands meanwhile replaces this index
         // entirely and already contains the changes.
@@ -263,7 +269,7 @@ pub(crate) fn register_volume(state: &Arc<State>, v: &VolumeInfo) -> DeviceId {
 }
 
 fn bring_online(state: &Arc<State>, id: DeviceId, v: &VolumeInfo) {
-    let has_index = state.indexes.read().unwrap().contains_key(&id);
+    let has_index = state.has_index(id);
     let forced = state.needs_rescan.lock().unwrap().remove(&id);
     if !has_index || forced {
         start_scan(state, id, v.clone());
@@ -271,13 +277,7 @@ fn bring_online(state: &Arc<State>, id: DeviceId, v: &VolumeInfo) {
     }
     // The stored index stays searchable while we catch up.
     if is_ntfs(v) {
-        let cp = state
-            .indexes
-            .read()
-            .unwrap()
-            .get(&id)
-            .and_then(|ix| ix.read().unwrap().checkpoint);
-        if let Some(cp) = cp {
+        if let Some(cp) = state.checkpoint_of(id) {
             match state.source.follow(v, cp) {
                 Ok(f) => {
                     tracing::info!("{}: resuming USN journal", v.mount_point);

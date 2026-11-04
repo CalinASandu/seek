@@ -73,6 +73,22 @@ impl std::fmt::Debug for DeviceIndex {
     }
 }
 
+/// A column that runs out of room while changes are applied grows by this fraction of its length (1/32), not the
+/// `Vec` default of doubling: one new file must not reserve hundreds of MB.
+const GROWTH_DIVISOR: usize = 32;
+
+fn room_in<T>(column: &mut Vec<T>, extra: usize) {
+    if column.capacity() - column.len() < extra {
+        column.reserve_exact(extra.max(column.len() / GROWTH_DIVISOR));
+    }
+}
+
+fn room_in_arena(arena: &mut String, extra: usize) {
+    if arena.capacity() - arena.len() < extra {
+        arena.reserve_exact(extra.max(arena.len() / GROWTH_DIVISOR));
+    }
+}
+
 fn clamp_len(s: &str) -> usize {
     let mut n = s.len().min(u16::MAX as usize);
     while !s.is_char_boundary(n) {
@@ -121,6 +137,52 @@ impl DeviceIndex {
         ix.alive.reserve(rows);
         ix.id_to_row.reserve(rows);
         ix
+    }
+
+    /// Gives back the spare room left by building an index row by row.
+    pub fn trim(&mut self) {
+        self.ids.shrink_to_fit();
+        self.parents.shrink_to_fit();
+        self.name_off.shrink_to_fit();
+        self.name_len.shrink_to_fit();
+        self.lower_off.shrink_to_fit();
+        self.lower_len.shrink_to_fit();
+        self.sizes.shrink_to_fit();
+        self.modified.shrink_to_fit();
+        self.created.shrink_to_fit();
+        self.attrs.shrink_to_fit();
+        self.alive.shrink_to_fit();
+        self.names.shrink_to_fit();
+        self.lower.shrink_to_fit();
+        self.id_to_row.shrink_to_fit();
+    }
+
+    /// Room for changes about to be applied, before the first push can double a column.
+    fn make_room(&mut self, changes: &[Change]) {
+        let (mut rows, mut bytes) = (0, 0);
+        for c in changes {
+            if let Change::Upsert(e) = c {
+                rows += usize::from(!self.id_to_row.contains_key(&e.id));
+                bytes += clamp_len(&e.name);
+            }
+        }
+        if rows == 0 && bytes == 0 {
+            return;
+        }
+        room_in(&mut self.ids, rows);
+        room_in(&mut self.parents, rows);
+        room_in(&mut self.name_off, rows);
+        room_in(&mut self.name_len, rows);
+        room_in(&mut self.lower_off, rows);
+        room_in(&mut self.lower_len, rows);
+        room_in(&mut self.sizes, rows);
+        room_in(&mut self.modified, rows);
+        room_in(&mut self.created, rows);
+        room_in(&mut self.attrs, rows);
+        room_in(&mut self.alive, rows);
+        room_in_arena(&mut self.names, bytes);
+        // lowercasing grows a name by at most half (`İ`, 2 bytes, becomes `i̇`, 3 bytes)
+        room_in_arena(&mut self.lower, bytes + bytes / 2);
     }
 
     /// Assemble from already validated columns (used by `persist::decode_index`).
@@ -230,22 +292,28 @@ impl DeviceIndex {
 
     /// Approximate heap bytes held by this index (columns, arenas, id map).
     pub fn heap_bytes(&self) -> usize {
+        self.heap_columns().iter().map(|(_, b)| b).sum()
+    }
+
+    /// [`Self::heap_bytes`], part by part.
+    pub fn heap_columns(&self) -> Vec<(&'static str, usize)> {
         use std::mem::size_of;
-        let map = self.id_to_row.capacity() * (size_of::<(u64, u32)>() + 1);
-        self.ids.capacity() * size_of::<u64>()
-            + self.parents.capacity() * size_of::<u32>()
-            + self.name_off.capacity() * size_of::<u32>()
-            + self.name_len.capacity() * size_of::<u16>()
-            + self.lower_off.capacity() * size_of::<u32>()
-            + self.lower_len.capacity() * size_of::<u16>()
-            + self.sizes.capacity() * size_of::<u64>()
-            + self.modified.capacity() * size_of::<i64>()
-            + self.created.capacity() * size_of::<i64>()
-            + self.attrs.capacity() * size_of::<u32>()
-            + self.alive.capacity()
-            + self.names.capacity()
-            + self.lower.capacity()
-            + map
+        // a hash table keeps at most 7/8 of its slots filled, plus one control byte per slot
+        let slots = self.id_to_row.capacity() * 8 / 7;
+        vec![
+            ("id map", slots * (size_of::<(u64, u32)>() + 1)),
+            ("names", self.names.capacity()),
+            ("lowercase names", self.lower.capacity()),
+            ("ids", self.ids.capacity() * size_of::<u64>()),
+            ("sizes", self.sizes.capacity() * size_of::<u64>()),
+            ("modified", self.modified.capacity() * size_of::<i64>()),
+            ("created", self.created.capacity() * size_of::<i64>()),
+            ("parents", self.parents.capacity() * size_of::<u32>()),
+            ("attributes", self.attrs.capacity() * size_of::<u32>()),
+            ("name offsets", self.name_off.capacity() * size_of::<u32>() + self.name_len.capacity() * size_of::<u16>()),
+            ("lowercase offsets", self.lower_off.capacity() * size_of::<u32>() + self.lower_len.capacity() * size_of::<u16>()),
+            ("alive flags", self.alive.capacity()),
+        ]
     }
 
     pub fn from_raw(root_id: u64, entries: Vec<RawEntry>) -> Self {
@@ -315,6 +383,7 @@ impl DeviceIndex {
                 e.id, parent, &e.name, e.size, e.modified, e.created, e.attrs,
             );
         }
+        ix.trim();
         ix
     }
 
@@ -642,6 +711,7 @@ impl DeviceIndex {
     /// is in, and only dropped (or, for known entries, removed) when their parent never shows up.
     pub fn apply(&mut self, changes: &[Change]) {
         self.version += 1;
+        self.make_room(changes);
         let mut sweep = false;
         let mut pending: Vec<&RawEntry> = Vec::new();
         for c in changes {
@@ -733,6 +803,7 @@ impl DeviceIndex {
                 self.attrs[r],
             );
         }
+        out.trim();
         *self = out;
     }
 }
@@ -796,6 +867,49 @@ mod tests {
         let r = ix.row_of(13).unwrap();
         assert_eq!(ix.name(r), "Ünïcödé İ.txt");
         assert_eq!(ix.name_lower(r), "Ünïcödé İ.txt".to_lowercase());
+    }
+
+    /// A loaded index has no spare room, and a `Vec` that runs out doubles: one new file would then reserve
+    /// twice the memory of every column.
+    #[test]
+    fn a_small_change_does_not_double_the_memory() {
+        let raw: Vec<RawEntry> = (10..20_010).map(|i| e(i, 5, "some-file-name.txt", false)).collect();
+        let mut built = DeviceIndex::from_raw(5, raw);
+        let header = crate::persist::IndexHeader {
+            format_version: 0,
+            device_id: uuid::Uuid::nil(),
+            host_id: uuid::Uuid::nil(),
+            checkpoint: None,
+            saved_at: 0,
+            rows: 0,
+            sync_cursor: None,
+        };
+        let bytes = crate::persist::encode_index(&header, &mut built).unwrap();
+        let (_, mut ix) = crate::persist::decode_index(&bytes).unwrap();
+        let before = ix.heap_bytes();
+
+        ix.apply(&[Change::Upsert(e(50_000, 5, "one-new-file.txt", false))]);
+        ix.apply(&[Change::Upsert(e(50_001, 5, "another-file.txt", false))]);
+        ix.apply(&[Change::Upsert(e(10, 5, "a-renamed-file.txt", false))]);
+
+        assert_eq!(ix.live_count(), 20_002);
+        assert!(ix.heap_bytes() < before + before / 8, "{before} -> {}", ix.heap_bytes());
+        assert_eq!(ix.name(ix.row_of(50_001).unwrap()), "another-file.txt");
+    }
+
+    /// Scanning and compacting grow the name arenas as they go; what remains should not keep the spare room.
+    #[test]
+    fn built_and_compacted_indexes_hold_no_spare_room() {
+        let raw: Vec<RawEntry> = (10..20_010).map(|i| e(i, 5, "some-file-name.txt", false)).collect();
+        let mut ix = DeviceIndex::from_raw(5, raw);
+        let bytes: usize = (10..20_010).map(|_| "some-file-name.txt".len()).sum();
+        assert_eq!(ix.names.capacity(), bytes);
+        assert_eq!(ix.lower.capacity(), bytes);
+
+        ix.apply(&[Change::Delete { id: 10 }]);
+        ix.compact();
+        assert_eq!(ix.names.capacity(), ix.names.len());
+        assert_eq!(ix.lower.capacity(), ix.lower.len());
     }
 
     #[test]
