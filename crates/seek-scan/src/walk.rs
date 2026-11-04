@@ -128,6 +128,7 @@ pub fn scan_walk(root: &Path, progress: &(dyn Fn(u64) + Sync)) -> Result<ScanRes
         }
     }
     progress(index.len() as u64);
+    index.trim();
     Ok(ScanResult {
         index,
         checkpoint: None,

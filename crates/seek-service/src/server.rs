@@ -35,6 +35,19 @@ struct StoredSearch {
     hits: Arc<Vec<Hit>>,
 }
 
+/// Hits kept for clients, on all connections.
+static STORED_HITS: AtomicU64 = AtomicU64::new(0);
+
+impl Drop for StoredSearch {
+    fn drop(&mut self) {
+        STORED_HITS.fetch_sub(self.hits.len() as u64, Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn stored_result_bytes() -> u64 {
+    STORED_HITS.load(Ordering::Relaxed) * std::mem::size_of::<Hit>() as u64
+}
+
 #[derive(Default)]
 struct Conn {
     generation: AtomicU64,
@@ -97,6 +110,14 @@ async fn handle_connection(pipe: NamedPipeServer, state: Arc<State>) {
         }
     });
     let mut tasks = Vec::new();
+    // stored results are row numbers: they mean nothing once their indexes have left memory
+    let mut parked = state.parked_gen.subscribe();
+    let stored = conn.clone();
+    tasks.push(tokio::spawn(async move {
+        while parked.changed().await.is_ok() {
+            stored.searches.lock().unwrap().clear();
+        }
+    }));
     while let Ok(Some(env)) = read_frame::<_, Envelope<Request>>(&mut rd).await {
         if env.body == Request::Subscribe {
             let mut events = state.events.subscribe();
@@ -166,6 +187,13 @@ async fn handle(state: Arc<State>, conn: Arc<Conn>, req: Request) -> Response {
             offset,
             limit,
         } => fetch_rows(state, conn, search_id, offset, limit).await,
+        Request::Wake => {
+            tokio::task::spawn_blocking(move || state.wake());
+            Response::Ok
+        }
+        Request::Memory => tokio::task::spawn_blocking(move || Response::Memory { report: state.memory_report() })
+            .await
+            .unwrap_or_else(|e| err(format!("memory report failed: {e}"))),
         Request::ListDevices => Response::Devices {
             devices: state.visible_devices(),
         },
@@ -395,7 +423,7 @@ async fn run_search(
     let c2 = conn.clone();
     let result = tokio::task::spawn_blocking(move || {
         let started = Instant::now();
-        let snap = state.snapshot();
+        let snap = state.snapshot("search");
         let guards: Vec<_> = snap.iter().map(|s| s.index.read().unwrap()).collect();
         let devs: Vec<SearchDevice> = snap
             .iter()
@@ -437,6 +465,7 @@ async fn run_search(
         Ok(Some((hits, devices, elapsed_ms))) => {
             let id = next_search_id();
             let total = hits.len() as u64;
+            STORED_HITS.fetch_add(total, Ordering::Relaxed);
             let mut searches = conn.searches.lock().unwrap();
             searches.push_back(StoredSearch {
                 id,
@@ -467,7 +496,7 @@ async fn space(
     f: impl FnOnce(&SearchDevice, &FolderTotals, Option<u32>) -> Response + Send + 'static,
 ) -> Response {
     tokio::task::spawn_blocking(move || {
-        let snap = state.snapshot();
+        let snap = state.snapshot("space view");
         let Some(s) = snap.iter().find(|s| s.device.id == device_id) else {
             return err("Unknown drive");
         };
@@ -521,13 +550,14 @@ async fn fetch_rows(
             .map(|s| (s.devices.clone(), s.hits.clone()))
     };
     let Some((devices, hits)) = found else {
-        return err("unknown or expired search");
+        // also what a client sees when idle unloading dropped its results: it searches again
+        return err("results changed; search again");
     };
     let limit = limit.min(MAX_ROWS_PER_FETCH) as usize;
     let start = (offset as usize).min(hits.len());
     let end = (start + limit).min(hits.len());
     let rows = tokio::task::spawn_blocking(move || {
-        let snap: Vec<Snapshot> = state.snapshot();
+        let snap: Vec<Snapshot> = state.snapshot("result rows");
         let guards: Vec<_> = snap.iter().map(|s| s.index.read().unwrap()).collect();
         // Map the device order captured at search time onto the current snapshot; a device that is
         // gone or whose rows were renumbered (compaction, rescan) cannot serve its old hits.
@@ -585,7 +615,7 @@ fn forget(state: &Arc<State>, id: DeviceId) -> Response {
         return err("only offline drives can be forgotten");
     }
     state.registry.write().unwrap().remove(id);
-    state.indexes.write().unwrap().remove(&id);
+    state.drop_index(id);
     state.dirty.lock().unwrap().remove(&id);
     let _ = std::fs::remove_file(state.index_path(id));
     state.remove_journal(id);

@@ -8,7 +8,9 @@ mod shares;
 mod shell;
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+use seek_ipc::Request;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager, WindowEvent};
@@ -29,6 +31,26 @@ fn toggle_main(app: &AppHandle) {
             let _ = w.hide();
         } else {
             show_main(app);
+        }
+    }
+}
+
+/// Tells the service while the window is showing, so its indexes are in memory before the first search.
+/// Once the window is hidden the service unloads them.
+async fn keep_service_awake(app: AppHandle, link: Arc<ServiceLink>) {
+    const LOOK_EVERY: Duration = Duration::from_millis(500);
+    const REPEAT_EVERY: Duration = Duration::from_secs(20);
+    let mut told: Option<Instant> = None;
+    loop {
+        tokio::time::sleep(LOOK_EVERY).await;
+        let showing = app
+            .get_webview_window("main")
+            .is_some_and(|w| w.is_visible().unwrap_or(false) && !w.is_minimized().unwrap_or(false));
+        if !showing {
+            told = None;
+        } else if told.is_none_or(|t| t.elapsed() >= REPEAT_EVERY) {
+            told = Some(Instant::now());
+            let _ = link.request(Request::Wake).await;
         }
     }
 }
@@ -71,6 +93,8 @@ pub fn run() {
             let handle = app.handle().clone();
             let events_link = link.clone();
             tauri::async_runtime::spawn(async move { events_link.run_events(handle).await });
+            let (handle, wake_link) = (app.handle().clone(), link.clone());
+            tauri::async_runtime::spawn(keep_service_awake(handle, wake_link));
             // Shares get their own connection: a multi-megabyte index upload must not sit in front of
             // the window's searches on the shared one.
             app.manage(shares::start(Arc::new(ServiceLink::default())));

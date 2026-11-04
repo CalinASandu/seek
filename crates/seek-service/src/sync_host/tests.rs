@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use seek_core::{synth_index, Change, DeviceIndex};
@@ -17,6 +17,7 @@ fn load(dir: &std::path::Path) -> Arc<State> {
         data_dir: dir.to_path_buf(),
         pipe_name: String::new(),
         sync: None,
+        idle_unload: None,
     };
     State::load(cfg, Arc::new(NoVolumes)).unwrap()
 }
@@ -38,6 +39,7 @@ fn live_ids(ix: &DeviceIndex) -> Vec<u64> {
 }
 
 fn copy_ids(st: &State, id: DeviceId) -> Option<Vec<u64>> {
+    st.ensure_loaded(&[id], "test");
     let ix = st.indexes.read().unwrap().get(&id)?.clone();
     let ix = ix.read().unwrap();
     Some(live_ids(&ix))
@@ -485,4 +487,79 @@ fn identical_catalogs_announce_nothing() {
     host.catalog(hub, pcs, renamed);
     assert!(events.try_recv().is_ok());
     assert!(st.invalidated.load(Ordering::Relaxed));
+}
+
+/// A drive that stays plugged in has a `last_seen` from when it came online, days ago. It was really last seen when
+/// its PC last talked to the hub, as long as that PC reported it online.
+#[test]
+fn a_drive_online_on_its_pc_was_seen_when_that_pc_last_synced() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = load(dir.path());
+    let (hub, b) = (HostId::from_u128(1), HostId::from_u128(2));
+    let (plugged, unplugged) = (DeviceId::from_u128(20), DeviceId::from_u128(30));
+    st.peers.lock().unwrap().upsert(hub_peer(hub));
+    let host = ServiceSync(st.clone());
+
+    let pc = CatalogPc { last_seen_ms: 5_000, ..catalog_pc(b, "B", "S-b") };
+    let mut on = record(plugged, b);
+    on.last_seen = 1_000;
+    let mut off = record(unplugged, b);
+    off.state = DeviceState::Offline;
+    off.last_seen = 2_000;
+    host.catalog(hub, vec![pc], vec![on, off]);
+
+    assert_eq!(st.device(plugged).unwrap().last_seen, 5_000);
+    assert_eq!(st.device(unplugged).unwrap().last_seen, 2_000, "unplugged there: its PC knows when");
+}
+
+/// The other PC's last contact moves every minute. That alone must not make the app reload or searches restart.
+#[test]
+fn the_seen_date_moving_announces_nothing() {
+    use std::sync::atomic::Ordering;
+
+    let dir = tempfile::tempdir().unwrap();
+    let st = load(dir.path());
+    let (hub, b) = (HostId::from_u128(1), HostId::from_u128(2));
+    let id = DeviceId::from_u128(20);
+    st.peers.lock().unwrap().upsert(hub_peer(hub));
+    let host = ServiceSync(st.clone());
+    let at = |ms| CatalogPc { last_seen_ms: ms, ..catalog_pc(b, "B", "S-b") };
+
+    let mut events = st.events.subscribe();
+    host.catalog(hub, vec![at(5_000)], vec![record(id, b)]);
+    while events.try_recv().is_ok() {}
+    st.invalidated.store(false, Ordering::Relaxed);
+
+    host.catalog(hub, vec![at(6_000)], vec![record(id, b)]);
+    assert_eq!(st.device(id).unwrap().last_seen, 6_000);
+    assert!(!st.invalidated.load(Ordering::Relaxed), "results are not invalidated");
+    while let Ok(e) = events.try_recv() {
+        assert!(!matches!(e, seek_ipc::Event::DevicesChanged), "the device list did not change");
+    }
+}
+
+/// Linked directly, a PC's drives were last seen when the session with it ended.
+#[test]
+fn a_direct_session_ending_stamps_the_drives_it_had_online() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = load(dir.path());
+    let b = HostId::from_u128(2);
+    let (on, off) = (DeviceId::from_u128(20), DeviceId::from_u128(30));
+    {
+        let mut reg = st.registry.write().unwrap();
+        let mut a = record(on, b);
+        a.last_seen = 1_000;
+        reg.add(a);
+        let mut c = record(off, b);
+        c.state = DeviceState::Offline;
+        c.last_seen = 2_000;
+        reg.add(c);
+    }
+    let before = crate::state::now_ms();
+    st.set_peer_devices_online(b, false);
+
+    let seen = st.device(on).unwrap();
+    assert_eq!(seen.state, DeviceState::Offline);
+    assert!(seen.last_seen >= before, "{}", seen.last_seen);
+    assert_eq!(st.device(off).unwrap().last_seen, 2_000);
 }

@@ -287,6 +287,98 @@ optional `init`, `compose up -d`, `compose logs`, `openssl s_client` (the certif
   and the Link dialog keep the older `.segmented` control.
 - Maybe later (user): a shortcuts page in Settings.
 
+## Next task: Cleanup and uninstaller (asked for 2026-11-04, nothing built yet)
+
+The user wants the Cleanup area and uninstaller built next, with a panel as polished as the rest of the app: Apple-style, clean,
+smooth animations (read the `emil-design-eng` skill first). Suggested setup: Opus orchestrates and owns design and final UI review,
+Sonnet agents code. Write a design spec first, since this is the first time Seek deletes anything.
+
+Before starting: the RAM and "seen" fixes below may not be running yet (needs `Rebuild Seek.bat`; check with `seek memory`), and
+that work is uncommitted. Ask the user about committing it first; agents should not build on a large uncommitted tree.
+
+**Proposed, not yet confirmed by the user:**
+
+- A cleanup area beside Search and Space. Files only go to the Recycle Bin, after review of a list, never permanently deleted.
+- Deletes run from the window with the user's permissions, never from the SYSTEM service.
+- A duplicate means identical contents, checked by comparing the files; a name and size match is never enough.
+- Only this PC's files can be deleted.
+- Every selector uses `Segmented.tsx` (Link a device, Settings theme, Search/Space, Space tabs). This also fixes Hub wrapping onto
+  its own row in the Link dialog. The gray beam applies to dark mode (now `#f5f5f7`).
+
+**Ask together, numbered, before designing (suggested defaults):**
+
+1. "Professional uninstaller": (a) Seek uninstalls other apps and removes what they leave behind, like Revo, or (b) a more polished
+   uninstaller for Seek itself? Default: a, plus the small version of b.
+2. What counts as a leftover? Default: Program Files and AppData folders no installed app owns, plus Seek's own data. No registry
+   cleaning in the first version.
+3. Duplicates across PCs? Default: this PC's drives first; a linked PC's duplicates can be listed but not deleted.
+4. What is protected? Default: Windows, Program Files and other users' folders can't be selected. Seek suggests which copy to keep
+   and never picks for the user.
+5. Beam gray? Default: `#c7c7cc`, dark label text kept, glow softened.
+6. More than the new selector on the Link panels? Default: steadier spacing, a dialog that keeps its height when switching tabs,
+   tabs ordered Show a code, Enter a code, Hub.
+
+## RAM investigation (2026-11-02 to 11-04, idle RAM fixed; see "Not explained" below)
+
+The user wants `seek-service` near zero while idle in the tray, using more only while loading. Task Manager showed
+593 MB; the process had 611 MB working set, 1,181 MB private, 1,259 MB peak. Measured by loading a copy of the real data:
+
+- 5 indexes, 4.84M rows: **600 MB** (130 B/row), held in RAM permanently. This is what Task Manager's number mostly is.
+- 2 journals, 112 MB on disk: **269 MB** as heap objects. **Fixed, uncommitted, not yet running on this PC**:
+  `seek_sync::DeviceJournal` keeps only file offsets, 13 MB on the same data. Needs the elevated rebuild + service restart.
+- About 310 MB of the 1,181 MB is **still unattributed**, and so is the 1,259 MB peak. Not measured yet; don't assume a cause.
+- Stored searches are small (8 B per hit, about 39 MB for an all-files search, 2 kept per connection).
+- Dropping everything returned the process to **3 MB**; reloading all 5 indexes takes **449 ms** in parallel, 864 ms in series.
+
+**Idle unloading is built (uncommitted, not yet running on this PC)**, `crates/seek-service/src/parking.rs`. A device is in
+`State::indexes` or `State::parked` (its saved file plus newer journal entries). The service starts with everything
+parked; `snapshot()` (searches, Space, fetching rows) and `Request::Wake` load what is visible, in parallel; `idle_tick`
+(every 5 s) parks anything unused for 60 s (`IDLE_UNLOAD`). Own devices park without saving: USN changes keep going to
+the journal and the next load replays them. Other PCs' copies have no journal here: they are saved before parking, and a
+delta for one loads it. `fold_parked` writes a backlog over 25 MB to its file so the journal never trims what a parked
+device needs. The app's `keep_service_awake` (`app/src-tauri/src/lib.rs`) sends `Wake` when the window shows and every
+20 s while it does. Parking clears stored searches, so a late `FetchRows` answers "results changed; search again" and the UI
+re-searches. `PROTOCOL_VERSION` is now 2: the app and service must be rebuilt together.
+
+Measured with the real service code on a copy of the real data (no volumes attached, so no live USN following):
+
+| Moment | Working set | Private |
+|---|---|---|
+| Started, nothing searched | 29 MB | 24 MB |
+| After a search (window open) | 634 MB | 949 MB |
+| 75 s idle | 31 MB | 27 MB |
+
+First search from idle 517–543 ms, later ones 18.5 ms. The ~310 MB gap between private and working set reappears on load
+and goes away on unload; what holds it is still not attributed.
+
+Limits: a linked PC that keeps sending changes keeps its drive loaded; a parked drive's entry count updates at its next
+load.
+
+**Measuring it: `seek memory`** asks the running service. It prints working set, committed memory, the heap (a counting
+`#[global_allocator]` in `seek-service/src/memory.rs`), every drive (in memory or on disk, rows, RAM, idle time, loads, unloads,
+last user, why it was refused unloading), the heap by owner and by column, and which code asked for indexes how often. Loads,
+unloads and refusals are in `service.log` at INFO with their reason. `seek hub` shows the hub link and each drive's dates.
+
+**Found with it (2026-11-04, live service, 4.96M rows):**
+
+- Idle in the tray or minimized: **21 MB working set, 12 MB committed**, 8 MB heap, of which 7.5 MB is journal offsets. Opening the
+  window loads everything in about 0.6 s; 60 s after it is hidden it is back at 21 MB.
+- **Every column held exactly twice what it needed** (`ids` 16 B/row for an 8 B value): a loaded column has no spare room, so the
+  first change after loading made each `Vec` double. That was the ~310 MB "unattributed" gap: committed, mostly never touched, so
+  it did not show in Task Manager. `DeviceIndex::apply` now reserves what a batch needs and grows by 1/32; building and compacting
+  end with `trim()`.
+- **Not explained:** the run before this diagnostic stayed at 700 MB for 20+ minutes with the window hidden, on the same unloading
+  logic. It did not recur on the next build. If it does, `seek memory` names the cause (last user, or `stays in memory: ...`).
+
+In-use RAM by column, if it ever needs to go lower (window open, after the doubling fix): names and lowercase names about 110 MB
+each, `id_to_row` 136 MB (a `hashbrown::HashTable<u32>` would need about 45 MB), sizes/ids/modified/created 38 MB each. The load
+peak (950 MB) is the decompressed file plus the columns; decoding columns as a stream would about halve it.
+
+**"Seen 2 days ago" on another PC's drives (fixed 2026-11-04):** the owner stamps `last_seen` only when a drive comes or goes, so a
+drive that stays plugged in showed the time its service started, while the data was up to date. A drive reported online by its PC
+now counts as seen when that PC last synced (`apply_remote_devices`), and when a direct session ends. The date moving alone is not
+saved or announced.
+
 ## Next step
 
 0. **Space view in the real window (user)** — the release binaries were locked while the session ran:

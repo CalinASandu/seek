@@ -53,6 +53,10 @@ enum Cmd {
     },
     /// Show the service's devices.
     Devices,
+    /// Show what the service's memory is made of, and which code last used each index.
+    Memory,
+    /// Show the hub link: when this PC and the others last synced, and each drive's dates.
+    Hub,
     /// Measure every performance metric: synthetic index, searches × sorts, persistence, live
     /// changes, optional real scans and service round trips. `--json` saves, `--compare` diffs.
     Perf {
@@ -108,6 +112,8 @@ fn main() -> anyhow::Result<()> {
         Cmd::Query { file, query, limit } => query_file(&file, &query, limit),
         Cmd::Remote { query, limit, sort, desc } => remote(&query, limit, sort.into(), desc),
         Cmd::Devices => devices(),
+        Cmd::Memory => memory(),
+        Cmd::Hub => hub(),
         Cmd::HubCompact { dir, device } => perf::hub_compact(&dir, device),
         Cmd::Perf { entries, runs, scans, remote, json, compare } => {
             perf::run(perf::Opts { entries, runs, scans, remote, json, compare })
@@ -270,6 +276,130 @@ fn remote(q: &str, limit: u32, sort: SortKey, descending: bool) -> anyhow::Resul
         };
         print_rows(&rows);
         println!("{total} results in {ms:.1} ms");
+        Ok(())
+    })
+}
+
+/// `90 s ago`, `12 min ago`, `3 h ago`, `2 days ago`; `never` for 0.
+fn ago(ms: i64) -> String {
+    if ms <= 0 {
+        return "never".into();
+    }
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64);
+    match (now - ms) / 1000 {
+        s if s < 120 => format!("{s} s ago"),
+        s if s < 7200 => format!("{} min ago", s / 60),
+        s if s < 172_800 => format!("{} h ago", s / 3600),
+        s => format!("{} days ago", s / 86_400),
+    }
+}
+
+fn hub() -> anyhow::Result<()> {
+    rt()?.block_on(async {
+        let mut c = connect().await?;
+        let Response::Hub { hub } = c.request(Request::HubStatus).await? else { bail!("unexpected reply") };
+        match hub {
+            None => println!("Not linked to a hub."),
+            Some(h) => {
+                println!("Hub {} at {}: {}, synced {}", h.name, h.addr, if h.online { "connected" } else { "not connected" }, ago(h.last_sync_ms));
+                if let Some(e) = h.last_error {
+                    println!("  last error: {e}");
+                }
+                for pc in h.pcs {
+                    println!("  PC {}: {}, hub last saw it {}", pc.name, if pc.online { "online" } else { "offline" }, ago(pc.last_sync_ms));
+                }
+            }
+        }
+        let Response::Devices { devices } = c.request(Request::ListDevices).await? else { bail!("unexpected reply") };
+        println!();
+        println!("{:<24} {:<9} {:>10}  {:<14}  LAST SEEN", "DRIVE", "STATE", "FILES", "INDEX UPDATED");
+        for d in devices {
+            println!(
+                "{:<24} {:<9} {:>10}  {:<14}  {}",
+                d.display_name.chars().take(24).collect::<String>(),
+                format!("{:?}", d.state),
+                d.entry_count,
+                ago(d.index_updated_at),
+                ago(d.last_seen)
+            );
+        }
+        Ok(())
+    })
+}
+
+fn mb(bytes: u64) -> String {
+    format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+}
+
+fn memory() -> anyhow::Result<()> {
+    rt()?.block_on(async {
+        let mut c = connect().await?;
+        let Response::Memory { report: r } = c.request(Request::Memory).await? else {
+            bail!("unexpected reply (is the service older than this command?)")
+        };
+        println!("Task Manager (working set)  {:>10}    peak {}", mb(r.working_set), mb(r.peak_working_set));
+        println!("Committed (private)         {:>10}", mb(r.private_bytes));
+        println!("Heap in use                 {:>10}    peak {}", mb(r.heap_live), mb(r.heap_peak));
+        match r.idle_unload_secs {
+            Some(s) => println!("Idle unloading              after {s} s, checked {} times", r.idle_checks),
+            None => println!("Idle unloading              off"),
+        }
+        println!();
+        println!("{:<24} {:<10} {:>10} {:>10} {:>7} {:>5} {:>7}  LAST USED BY", "DRIVE", "WHERE", "ROWS", "RAM", "IDLE", "LOADS", "UNLOADS");
+        for d in &r.devices {
+            let place = if d.in_memory { "memory" } else if d.on_disk_only { "disk" } else { "no index" };
+            let idle = d.idle_secs.map_or("-".to_string(), |s| format!("{s} s"));
+            println!(
+                "{:<24} {:<10} {:>10} {:>10} {:>7} {:>5} {:>7}  {}",
+                d.name.chars().take(24).collect::<String>(),
+                place,
+                d.rows,
+                mb(d.bytes),
+                idle,
+                d.loads,
+                d.unloads,
+                d.last_used_by.as_deref().unwrap_or("-")
+            );
+            if let Some(why) = &d.refused {
+                println!("    stays in memory: {why}");
+            }
+        }
+        let indexes: u64 = r.devices.iter().map(|d| d.bytes).sum();
+        let known = indexes + r.journal_bytes + r.mask_bytes + r.totals_bytes + r.stored_result_bytes;
+        println!();
+        println!("Heap by owner");
+        for (name, bytes) in [
+            ("indexes", indexes),
+            ("change journals", r.journal_bytes),
+            ("hidden-folder masks", r.mask_bytes),
+            ("Space totals", r.totals_bytes),
+            ("stored search results", r.stored_result_bytes),
+            ("everything else", r.heap_live.saturating_sub(known)),
+        ] {
+            println!("  {name:<24} {:>10}", mb(bytes));
+        }
+        println!("  {:<24} {:>10}", "committed beyond the heap", mb(r.private_bytes.saturating_sub(r.heap_live)));
+        let mut columns: std::collections::BTreeMap<&str, u64> = Default::default();
+        for d in &r.devices {
+            for (name, bytes) in &d.columns {
+                *columns.entry(name).or_default() += bytes;
+            }
+        }
+        if indexes > 0 {
+            let mut columns: Vec<_> = columns.into_iter().collect();
+            columns.sort_by_key(|c| std::cmp::Reverse(c.1));
+            let rows: u64 = r.devices.iter().map(|d| d.rows).sum::<u64>().max(1);
+            println!();
+            println!("Indexes by column ({rows} rows)");
+            for (name, bytes) in columns {
+                println!("  {name:<24} {:>10}  {:>5.1} B/row", mb(bytes), bytes as f64 / rows as f64);
+            }
+        }
+        println!();
+        println!("Who asked for indexes since the service started");
+        for (who, n) in &r.touches {
+            println!("  {who:<40} {n:>8}");
+        }
         Ok(())
     })
 }

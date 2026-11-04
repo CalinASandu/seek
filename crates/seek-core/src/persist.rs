@@ -252,6 +252,22 @@ pub fn save_index(path: &Path, header: &IndexHeader, index: &mut DeviceIndex) ->
     write_atomic(path, &bytes)
 }
 
+/// The header of a stored index, without reading its body.
+pub fn read_index_head(path: &Path) -> Result<IndexHeader, Error> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut start = [0u8; 16];
+    file.read_exact(&mut start).map_err(|_| bad("unexpected end of data"))?;
+    let hdr_len = u32::get(&start[12..16]) as usize;
+    if hdr_len > 1 << 20 {
+        return Err(bad("header too large"));
+    }
+    let mut head = start.to_vec();
+    head.resize(16 + hdr_len, 0);
+    file.read_exact(&mut head[16..]).map_err(|_| bad("unexpected end of data"))?;
+    check_index_head(&head)
+}
+
 pub fn load_index(path: &Path) -> Result<(IndexHeader, DeviceIndex), Error> {
     decode_index(&std::fs::read(path)?)
 }

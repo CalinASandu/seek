@@ -9,7 +9,7 @@ use seek_core::{
     encode_index, Change, Checkpoint, DeviceIdentity, DeviceIndex, DeviceKind, DeviceState,
     IndexHeader, RawEntry, SortKey, ATTR_DIRECTORY,
 };
-use seek_ipc::{Client, MuxClient, Request, Response, UserVolume};
+use seek_ipc::{Client, MuxClient, Request, Response, UserVolume, PROTOCOL_VERSION};
 use seek_scan::{Changed, DirWatcher, FollowError, ScanError, ScanResult, UsnFollower, VolumeInfo};
 use seek_service::access::Caller;
 use seek_service::{Config, VolumeSource};
@@ -122,12 +122,17 @@ struct Running {
 }
 
 async fn start(dir: &Path, fake: Arc<Fake>) -> Running {
+    start_idle(dir, fake, None).await
+}
+
+async fn start_idle(dir: &Path, fake: Arc<Fake>, idle_unload: Option<Duration>) -> Running {
     let pipe = format!(r"\\.\pipe\seek-test-{}", uuid::Uuid::new_v4());
     let (stop, rx) = tokio::sync::watch::channel(false);
     let cfg = Config {
         data_dir: dir.to_path_buf(),
         pipe_name: pipe.clone(),
         sync: None,
+        idle_unload,
     };
     let task = tokio::spawn(seek_service::run(cfg, fake, rx));
     Running { pipe, stop, task }
@@ -188,14 +193,14 @@ async fn hello_search_and_paging() {
 
     let hello = c
         .request(Request::Hello {
-            protocol_version: 1,
+            protocol_version: PROTOCOL_VERSION,
         })
         .await
         .unwrap();
     assert!(matches!(
         hello,
         Response::Hello {
-            protocol_version: 1,
+            protocol_version: PROTOCOL_VERSION,
             ..
         }
     ));
@@ -296,6 +301,36 @@ async fn unplugged_device_stays_searchable_and_survives_restart() {
     let mut c = connect(&svc.pipe).await;
     assert_eq!(total(search(&mut c, "file").await).1, ENTRIES - 10);
     assert_eq!(*fake2.scans.lock().unwrap(), 0);
+    let _ = svc.stop.send(true);
+    svc.task.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn idle_indexes_unload_and_come_back_for_the_next_search() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = Arc::new(Fake::default());
+    fake.vols.lock().unwrap().push(volume());
+    let svc = start_idle(dir.path(), fake.clone(), Some(Duration::from_millis(1))).await;
+    let mut c = connect(&svc.pipe).await;
+    wait_for(&mut c, "device scanned", scanned_online).await;
+    let (id, found) = total(search(&mut c, "file").await);
+
+    // the stored results go with the index, and the client is told to search again
+    let mut gone = false;
+    for _ in 0..240 {
+        let r = c.request(Request::FetchRows { search_id: id, offset: 0, limit: 1 }).await.unwrap();
+        if let Response::Error { message } = r {
+            assert!(message.contains("results changed"), "{message}");
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(gone, "the index was never unloaded");
+
+    assert_eq!(total(search(&mut c, "file").await).1, found);
+    assert!(matches!(c.request(Request::Wake).await.unwrap(), Response::Ok));
+    assert_eq!(*fake.scans.lock().unwrap(), 1, "reloading is not rescanning");
     let _ = svc.stop.send(true);
     svc.task.await.unwrap().unwrap();
 }

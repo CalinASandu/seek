@@ -2,7 +2,7 @@
 //! linked PCs' devices as ordinary (remote) devices.
 
 use std::collections::HashSet;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use seek_core::{
     decode_index, encode_index_level, Change, Device, DeviceId, DeviceState, HostId, IndexHeader,
@@ -29,14 +29,14 @@ impl State {
         if !sharing {
             return Vec::new();
         }
-        let indexes = self.indexes.read().unwrap();
+        let indexed = self.indexed_ids();
         let reg = self.registry.read().unwrap();
         reg.devices
             .iter()
             .filter(|d| {
                 d.indexed_by_host == reg.host_id
                     && !unshared.contains(&d.id)
-                    && indexes.contains_key(&d.id)
+                    && indexed.contains(&d.id)
             })
             .cloned()
             .collect()
@@ -49,7 +49,7 @@ impl State {
     /// Drops a copy of another PC's device: record, index, cursor and file.
     pub fn remove_remote_device(&self, id: DeviceId) {
         self.registry.write().unwrap().remove(id);
-        self.indexes.write().unwrap().remove(&id);
+        self.drop_index(id);
         self.remote_cursors.lock().unwrap().remove(&id);
         self.dirty.lock().unwrap().remove(&id);
         let _ = std::fs::remove_file(self.index_path(id));
@@ -134,6 +134,8 @@ impl State {
                 if d.state != want {
                     d.state = want;
                     changed = true;
+                    // it was there until this session ended
+                    d.last_seen = now_ms();
                 }
             }
         }
@@ -157,13 +159,18 @@ impl ServiceSync {
         let st = &self.0;
         let mut changed = false;
         let connected = st.connected.lock().unwrap().contains(&owner);
-        let held: HashSet<DeviceId> = st.indexes.read().unwrap().keys().copied().collect();
+        let held: HashSet<DeviceId> = st.indexed_ids();
+        let owner_synced = st.peers.lock().unwrap().get(owner).map_or(0, |p| p.last_sync_ms);
         let gone: Vec<DeviceId> = {
             let mut reg = st.registry.write().unwrap();
             for mut d in devices.iter().cloned() {
                 d.indexed_by_host = owner;
-                let online =
-                    connected && matches!(d.state, DeviceState::Online | DeviceState::Scanning);
+                let there = matches!(d.state, DeviceState::Online | DeviceState::Scanning);
+                // Its PC dates a drive only when it comes or goes, days ago for one that stays plugged in.
+                if there {
+                    d.last_seen = d.last_seen.max(owner_synced);
+                }
+                let online = connected && there;
                 d.state = if online {
                     DeviceState::Online
                 } else {
@@ -177,10 +184,13 @@ impl ServiceSync {
                         if held.contains(&d.id) {
                             d.entry_count = existing.entry_count;
                         }
+                        // the date moves with every contact: not worth saving or announcing on its own
+                        let seen = std::mem::replace(&mut d.last_seen, existing.last_seen);
                         if *existing != d {
-                            *existing = d;
                             changed = true;
                         }
+                        *existing = d;
+                        existing.last_seen = seen;
                     }
                     Some(_) => tracing::warn!(
                         "{owner} sent device {} that belongs to another PC; ignored",
@@ -275,12 +285,12 @@ impl SyncHost for ServiceSync {
 
     fn held(&self, owner: uuid::Uuid) -> Vec<(uuid::Uuid, Cursor)> {
         let st = &self.0;
+        let indexed = st.indexed_ids();
         let reg = st.registry.read().unwrap();
-        let indexes = st.indexes.read().unwrap();
         let cursors = st.remote_cursors.lock().unwrap();
         reg.devices
             .iter()
-            .filter(|d| d.indexed_by_host == owner && indexes.contains_key(&d.id))
+            .filter(|d| d.indexed_by_host == owner && indexed.contains(&d.id))
             .filter_map(|d| cursors.get(&d.id).map(|c| (d.id, *c)))
             .collect()
     }
@@ -288,12 +298,12 @@ impl SyncHost for ServiceSync {
     fn held_remote(&self) -> Vec<(uuid::Uuid, Cursor)> {
         let st = &self.0;
         let me = st.host_id();
+        let indexed = st.indexed_ids();
         let reg = st.registry.read().unwrap();
-        let indexes = st.indexes.read().unwrap();
         let cursors = st.remote_cursors.lock().unwrap();
         reg.devices
             .iter()
-            .filter(|d| d.indexed_by_host != me && indexes.contains_key(&d.id))
+            .filter(|d| d.indexed_by_host != me && indexed.contains(&d.id))
             .filter_map(|d| cursors.get(&d.id).map(|c| (d.id, *c)))
             .collect()
     }
@@ -435,10 +445,7 @@ impl SyncHost for ServiceSync {
             return Err("index belongs to another device".into());
         }
         let count = ix.live_count() as u64;
-        st.indexes
-            .write()
-            .unwrap()
-            .insert(device, Arc::new(RwLock::new(ix)));
+        st.install_index(device, ix);
         st.remote_cursors.lock().unwrap().insert(device, cursor);
         if let Some(d) = st.registry.write().unwrap().get_mut(device) {
             d.entry_count = count;

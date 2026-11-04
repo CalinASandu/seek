@@ -31,6 +31,16 @@ pub struct FolderTotals {
 }
 
 impl FolderTotals {
+    /// Approximate heap bytes held.
+    pub fn heap_bytes(&self) -> usize {
+        self.bytes.capacity() * 8
+            + self.files.capacity() * 4
+            + self.cloud.capacity()
+            + self.offsets.capacity() * 4
+            + self.kids.capacity() * 4
+            + self.visible.capacity() * 8
+    }
+
     /// `hidden[row]` rows (another user's folders) are left out of every listing; their bytes still count
     /// in their ancestors' totals and show as one "Other users" item where the hidden part starts.
     pub fn compute(ix: &DeviceIndex, hidden: Option<&[bool]>) -> FolderTotals {

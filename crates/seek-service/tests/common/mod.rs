@@ -209,6 +209,7 @@ pub async fn start_with(
             interval,
             hub_tls,
         }),
+        idle_unload: None,
     };
     let (tx, ready) = tokio::sync::oneshot::channel();
     let task = tokio::spawn(seek_service::run_with(cfg, fake, rx, Some(tx)));

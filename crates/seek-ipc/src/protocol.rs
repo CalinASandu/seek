@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 pub use seek_core::{Device, DeviceId, ResultRow, SortKey, SpaceNode, TypeTotal};
 
 pub const PIPE_NAME: &str = r"\\.\pipe\seek-v1";
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 /// Largest accepted frame (share index uploads can be big).
 pub const MAX_FRAME_BYTES: usize = 256 * 1024 * 1024;
 
@@ -24,6 +24,10 @@ pub enum Request {
     Hello { protocol_version: u32 },
     Search { query: String, sort: SortKey, descending: bool },
     FetchRows { search_id: u64, offset: u32, limit: u32 },
+    /// The window is showing: load the indexes (if they are not in memory) and keep them there a while.
+    Wake,
+    /// What the service's memory is made of (`seek memory`).
+    Memory,
     ListDevices,
     RenameDevice { id: DeviceId, name: String },
     ForgetDevice { id: DeviceId },
@@ -93,6 +97,49 @@ pub enum Response {
     SpaceTree { node: SpaceNode },
     SpaceFiles { files: Vec<ResultRow> },
     SpaceTypes { types: Vec<TypeTotal> },
+    Memory { report: MemoryReport },
+}
+
+/// What the service's memory is made of. Sizes are in bytes.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryReport {
+    /// What Task Manager's Memory column shows.
+    pub working_set: u64,
+    pub private_bytes: u64,
+    pub peak_working_set: u64,
+    /// Bytes handed out by the allocator right now, and the most ever.
+    pub heap_live: u64,
+    pub heap_peak: u64,
+    /// `None` = loaded indexes are never unloaded.
+    pub idle_unload_secs: Option<u64>,
+    /// How many times idle unloading has run.
+    pub idle_checks: u64,
+    pub devices: Vec<DeviceMemory>,
+    /// Which code asked for indexes, and how often, since the service started.
+    pub touches: Vec<(String, u64)>,
+    pub journal_bytes: u64,
+    pub mask_bytes: u64,
+    pub totals_bytes: u64,
+    pub stored_result_bytes: u64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceMemory {
+    pub name: String,
+    pub in_memory: bool,
+    pub on_disk_only: bool,
+    pub rows: u64,
+    pub bytes: u64,
+    pub columns: Vec<(String, u64)>,
+    /// Seconds since something last used this index; `None` = not since the service started.
+    pub idle_secs: Option<u64>,
+    pub last_used_by: Option<String>,
+    pub loads: u32,
+    pub unloads: u32,
+    /// Why idle unloading could not take it out of memory.
+    pub refused: Option<String>,
 }
 
 /// Prefixes of the `Response::Error` message of `LinkHub` when the cause is one the app explains in its own words.
