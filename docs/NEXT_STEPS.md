@@ -1,6 +1,6 @@
 # Seek — Status & Next Steps
 
-_Last updated: 2026-10-16 (Space view implemented, plan tasks 1–8). Read this first when starting a new session in this repo._
+_Last updated: 2026-11-04 (RAM work committed, pairing race fixed, Cleanup decisions made). Read this first when starting a new session in this repo._
 
 ## Where we are
 
@@ -293,30 +293,40 @@ The user wants the Cleanup area and uninstaller built next, with a panel as poli
 smooth animations (read the `emil-design-eng` skill first). Suggested setup: Opus orchestrates and owns design and final UI review,
 Sonnet agents code. Write a design spec first, since this is the first time Seek deletes anything.
 
-Before starting: the RAM and "seen" fixes below may not be running yet (needs `Rebuild Seek.bat`; check with `seek memory`), and
-that work is uncommitted. Ask the user about committing it first; agents should not build on a large uncommitted tree.
+The RAM and "seen" work is committed (`24cbddc`). The pairing fix below needs `Rebuild Seek.bat` to run on this PC.
 
-**Proposed, not yet confirmed by the user:**
+**Decided by the user (2026-11-04), defaults plus their changes:**
 
-- A cleanup area beside Search and Space. Files only go to the Recycle Bin, after review of a list, never permanently deleted.
-- Deletes run from the window with the user's permissions, never from the SYSTEM service.
-- A duplicate means identical contents, checked by comparing the files; a name and size match is never enough.
-- Only this PC's files can be deleted.
-- Every selector uses `Segmented.tsx` (Link a device, Settings theme, Search/Space, Space tabs). This also fixes Hub wrapping onto
-  its own row in the Link dialog. The gray beam applies to dark mode (now `#f5f5f7`).
+- A Cleanup area beside Search and Space. Files only go to the Recycle Bin, never permanently deleted. Deletes run from the window
+  with the user's permissions, never from the SYSTEM service.
+- **The user sees exactly what gets removed, every time, and can protect any item.** Program Files can be cleaned, with an admin prompt
+  for that removal, but only after that list.
+- A duplicate means identical contents, checked by comparing the files; a name and size match is never enough. Only this PC's files can
+  be deleted; a linked PC's duplicates can be listed. Duplicates never touch Windows, Program Files or other users' folders. Seek
+  suggests which copy to keep and never picks for the user.
+- Uninstaller: Seek uninstalls other apps and removes what they leave behind, like Revo, plus a small polish of Seek's own uninstaller
+  (an opt-in "delete my index" step). Desktop apps first, Store apps later.
+- Leftovers: Program Files and AppData folders no installed app owns, plus Seek's own data. No registry cleaning in the first version.
+- Drives without a Recycle Bin: their files can't be removed from Seek, and the list says why. An app's own uninstaller can't be undone:
+  Seek warns first, then offers the leftover scan. No automatic restore point.
+- Every selector uses `Segmented.tsx` (Link a device, Settings theme, Search/Space, Space tabs), which also fixes Hub wrapping onto its
+  own row in the Link dialog. The beam in dark mode (now `#f5f5f7`) gets clearly darker: the user asked for darker than the `#c7c7cc`
+  first suggested. Dark label text kept, glow softened. Light mode keeps its dark beam.
+- Link panels: steadier spacing, a dialog that keeps its height when switching tabs, tabs ordered Show a code, Enter a code, Hub.
 
-**Ask together, numbered, before designing (suggested defaults):**
+## Pairing race (fixed 2026-11-04)
 
-1. "Professional uninstaller": (a) Seek uninstalls other apps and removes what they leave behind, like Revo, or (b) a more polished
-   uninstaller for Seek itself? Default: a, plus the small version of b.
-2. What counts as a leftover? Default: Program Files and AppData folders no installed app owns, plus Seek's own data. No registry
-   cleaning in the first version.
-3. Duplicates across PCs? Default: this PC's drives first; a linked PC's duplicates can be listed but not deleted.
-4. What is protected? Default: Windows, Program Files and other users' folders can't be selected. Seek suggests which copy to keep
-   and never picks for the user.
-5. Beam gray? Default: `#c7c7cc`, dark label text kept, glow softened.
-6. More than the new selector on the Link panels? Default: steadier spacing, a dialog that keeps its height when switching tabs,
-   tabs ordered Show a code, Enter a code, Hub.
+The sync tests failed in 4 of 22 runs before this fix. After linking, a PC could dial before the other had saved the link. The other side
+then took it for a PC that had missed an unlink and told it so, and each forgot the other. Forcing a 100 ms delay on the last commit failed
+every run in either direction. Whether the uncommitted RAM work made it more likely was not established (0 of 12 failures on the
+commit before it is a small sample).
+
+- The host now saves the guest before replying (`pair_host_then`), and takes it back out if the reply fails.
+- `PeerFile.unlinked` records the PCs this PC actually removed, cleared when they link again. Only those are told "unlinked"; any other
+  unknown PC is closed on quietly and dials again. A link removed before this version is not told later: that PC stays offline until
+  it is unlinked there too.
+- A PC that links while its Hello is on the way no longer gets marked as reinstalled.
+- Verified: the forced delays (guest slow to save, group told late) now pass 6 of 6, and the sync tests 30 of 30 runs.
 
 ## RAM investigation (2026-11-02 to 11-04, idle RAM fixed; see "Not explained" below)
 

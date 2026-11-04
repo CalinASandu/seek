@@ -41,6 +41,62 @@ async fn pairing_with_the_right_code_links_both_pcs() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn the_host_has_saved_the_link_before_the_guest_hears_back() {
+    use seek_sync::noise::Keys;
+    use seek_sync::pairing::{pair_guest, PairInfo};
+    use seek_sync::peers::key_to_b64;
+    use seek_sync::Role;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let da = tempfile::tempdir().unwrap();
+    let a = start(da.path(), "A", Fake::new("a", vec![])).await;
+    let code = a.rt().start_pairing(ME);
+    let guest = PairInfo {
+        host_id: uuid::Uuid::new_v4(),
+        name: "Guest".into(),
+        public_key: key_to_b64(&Keys::generate().public),
+        user_sid: ME.into(),
+        members: vec![],
+        port: 1,
+        role: Role::Pc,
+        addrs: vec![],
+        user_name: String::new(),
+    };
+    let mut io = tokio::net::TcpStream::connect(a.addr()).await.unwrap();
+    io.write_all(b"P").await.unwrap();
+    assert_eq!(io.read_u8().await.unwrap(), 1, "the host is showing a code");
+    pair_guest(&mut io, &code.code, &guest).await.unwrap();
+    assert!(
+        a.state.peers.lock().unwrap().get(guest.host_id).is_some(),
+        "a guest that dials the moment it hears back must find itself linked"
+    );
+    a.stop().await;
+}
+
+/// A PC can dial one that does not know it yet: the other side of a pairing still saving it, or a group member not
+/// yet told about a PC that joined through another. Being told "unlinked" then would break a link nobody removed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pc_nobody_unlinked_is_not_told_it_was() {
+    let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let a = start(da.path(), "A", Fake::new("a", vec![])).await;
+    let b = start(db.path(), "B", Fake::new("b", vec![])).await;
+    link(&a, &b).await;
+    wait("a session", || a.connected_to(&b)).await;
+    let b_id = b.id();
+    b.stop().await;
+    wait("session gone", || !a.state.connected.lock().unwrap().contains(&b_id)).await;
+
+    // A does not know B, and never removed it
+    a.state.peers.lock().unwrap().remove(b_id);
+    let b = start(db.path(), "B", Fake::new("b", vec![])).await;
+    // long enough for B to dial as either the lower or the higher host id (2 × the 1 s interval)
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert_eq!(b.peer_state(&a), Some(PeerState::Linked), "B keeps the link and tries again later");
+    a.stop().await;
+    b.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn wrong_code_three_times_expires_the_code() {
     let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     let a = start(da.path(), "A", Fake::new("a", vec![])).await;
