@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use seek_core::{DeviceId, HostId};
 use seek_sync::noise::{self, Keys};
-use seek_sync::pairing::{pair_guest, pair_host, MemberInfo, PairInfo, PairingCode};
+use seek_sync::pairing::{pair_guest, pair_host_then, MemberInfo, PairInfo, PairingCode};
 use seek_sync::peers::{key_from_b64, key_to_b64, load_or_create_keys, Peer, PeerState, MAX_PCS};
 use seek_sync::{run_session, Msg, Role, SessionCtl};
 use serde::{Deserialize, Serialize};
@@ -278,6 +278,8 @@ impl PeersRuntime {
             Some(p) if p.via_hub || p.role == Role::Hub => return Err("that PC is managed by the hub".into()),
             Some(_) => {}
         }
+        // kept until they link again: if that PC is off now, it is told when it comes back
+        self.state.peers.lock().unwrap().remember_unlinked(host);
         let ctl = self.sessions.lock().unwrap().get(&host).cloned();
         if let Some(ctl) = ctl {
             // the session sends it and ends
@@ -436,31 +438,52 @@ impl PeersRuntime {
         }
         let Some((code, creator)) = code else { return };
         let mine = self.my_info(&creator);
-        let guest = match tokio::time::timeout(PAIRING_TIMEOUT, pair_host(&mut io, &code, &mine)).await {
+        // Saved before the reply goes out: the guest dials the moment it hears back. It is told it reached itself
+        // by the reply, so that case is not stored.
+        let mut added = None;
+        let paired = tokio::time::timeout(
+            PAIRING_TIMEOUT,
+            pair_host_then(&mut io, &code, &mine, |guest| {
+                if guest.host_id != self.host_id() {
+                    let new = self.state.peers.lock().unwrap().get(guest.host_id).is_none();
+                    added = new.then_some(guest.host_id);
+                    self.store_peer(Peer {
+                        host_id: guest.host_id,
+                        name: guest.name,
+                        public_key: guest.public_key,
+                        addr: Some(SocketAddr::new(from.ip(), guest.port).to_string()),
+                        linked_users: vec![(creator, guest.user_sid)],
+                        profiles: Vec::new(),
+                        last_sync_ms: 0,
+                        state: PeerState::Linked,
+                        role: Role::Pc,
+                        addrs: Vec::new(),
+                        via_hub: false,
+                    });
+                }
+                async { Ok(()) }
+            }),
+        )
+        .await;
+        let guest = match paired {
             Ok(Ok(g)) => g,
-            Ok(Err(e)) => {
-                tracing::info!("pairing attempt from {from} failed: {e}");
+            failed => {
+                if let Ok(Err(e)) = &failed {
+                    tracing::info!("pairing attempt from {from} failed: {e}");
+                }
+                // the guest never heard back, so it is not linked
+                if let Some(host) = added {
+                    let mut peers = self.state.peers.lock().unwrap();
+                    peers.remove(host);
+                    let _ = peers.save();
+                }
                 return;
             }
-            Err(_) => return,
         };
         if guest.host_id == self.host_id() {
             return;
         }
         let addr = SocketAddr::new(from.ip(), guest.port).to_string();
-        self.store_peer(Peer {
-            host_id: guest.host_id,
-            name: guest.name.clone(),
-            public_key: guest.public_key.clone(),
-            addr: Some(addr.clone()),
-            linked_users: vec![(creator, guest.user_sid.clone())],
-            profiles: Vec::new(),
-            last_sync_ms: 0,
-            state: PeerState::Linked,
-            role: Role::Pc,
-            addrs: Vec::new(),
-            via_hub: false,
-        });
         *self.pairing.lock().unwrap() = None;
         tracing::info!("linked with {}", guest.name);
         let member = MemberInfo {
@@ -496,9 +519,14 @@ impl PeersRuntime {
                 // Unknown key. If it claims to be a linked PC, that PC was reinstalled: it must link again.
                 let Ok(Ok(frame)) = tokio::time::timeout(Duration::from_secs(5), rd.recv()).await else { return };
                 let Ok(Msg::Hello { host_id, .. }) = frame.msg::<Msg>() else { return };
-                let relink = {
+                let (relink, removed_by_us) = {
                     let mut peers = self.state.peers.lock().unwrap();
-                    match peers.get_mut(host_id) {
+                    // linked while its Hello was on the way; that Hello is used up, so the dialer tries again
+                    if peers.by_key(&theirs).is_some_and(|p| p.state == PeerState::Linked) {
+                        return;
+                    }
+                    let removed_by_us = peers.was_unlinked(host_id);
+                    let relink = match peers.get_mut(host_id) {
                         Some(p) if p.state != PeerState::NeedsRelink => {
                             tracing::warn!("{} came back with a different key; it must be linked again", p.name);
                             p.state = PeerState::NeedsRelink;
@@ -507,13 +535,17 @@ impl PeersRuntime {
                         }
                         Some(_) => Some(false),
                         None => None,
-                    }
+                    };
+                    (relink, removed_by_us)
                 };
                 match relink {
                     Some(true) => self.state.peers_changed(),
                     Some(false) => {}
-                    // Not linked at all: it missed our unlink (it was offline). The dialer authenticated our
-                    // key, so it can trust this; a PC only claiming that host id is told nothing it can use.
+                    // We do not know it yet: still saving this pairing, or it joined through another PC and we
+                    // have not been told. It tries again.
+                    None if !removed_by_us => {}
+                    // It missed our unlink (it was offline). The dialer authenticated our key, so it can trust
+                    // this; a PC only claiming that host id is told nothing it can use.
                     None => {
                         let hello = Msg::Hello {
                             protocol: seek_sync::SYNC_PROTOCOL,
