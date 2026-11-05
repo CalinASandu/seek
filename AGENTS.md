@@ -17,4 +17,7 @@ Design: `docs/superpowers/specs/2026-10-04-seek-local-design.md`. Plan: `docs/su
 - Dev service: `.\target\release\seek-service.exe --console --data-dir "$env:LOCALAPPDATA\Seek-dev"`
 - Query it: `.\target\release\seek.exe remote "<query>"`
 - Run everything: double-click `Seek.bat` (service + window); `Stop Seek.bat` to stop
+- Rebuild and run the latest source on this PC: double-click `Rebuild Seek.bat`
 - UI: `cd app; pnpm test; pnpm build; pnpm tauri build --no-bundle` (`pnpm dev` = browser preview with mock data)
+- Perf (every metric, compares with last run): `.\scripts\perf.ps1` or `.\target\release\seek.exe perf --scan D:\ --remote`
+- Installer: `.\scripts\build-installer.ps1` → `target\release\bundle\nsis\Seek_<ver>_x64-setup.exe`
