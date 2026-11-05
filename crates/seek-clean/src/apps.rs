@@ -74,20 +74,48 @@ pub struct Ctx<'a> {
 /// Runs `f` with this PC's answers. A folder or file on a drive that is not a fixed local one is
 /// never asked for: a folder is taken as there, a file as not there.
 pub fn with_real_ctx<R>(f: impl FnOnce(&Ctx) -> R) -> R {
-    f(&Ctx {
-        env: &process_env,
-        expand: &claims::expand_short_spelling,
-        dir_exists: &|p| !claims::is_fixed_local(p) || Path::new(p).is_dir(),
-        file_exists: &|p| claims::is_fixed_local(p) && Path::new(p).is_file(),
-    })
+    // Each path is asked of the disk once per call, however many rows look at it.
+    let dir = memoised(|p: &str| !claims::is_fixed_local(p) || Path::new(p).is_dir());
+    let file = memoised(|p: &str| claims::is_fixed_local(p) && Path::new(p).is_file());
+    f(&Ctx { env: &process_env, expand: &claims::expand_short_spelling, dir_exists: &dir, file_exists: &file })
+}
+
+/// `ask`, remembering its answer for each path (compared ignoring case).
+pub(crate) fn memoised<'a>(ask: impl Fn(&str) -> bool + 'a) -> impl Fn(&str) -> bool + 'a {
+    let seen = std::cell::RefCell::new(HashMap::<String, bool>::new());
+    move |p| {
+        let key = p.to_lowercase();
+        if let Some(&answer) = seen.borrow().get(&key) {
+            return answer;
+        }
+        let answer = ask(p);
+        seen.borrow_mut().insert(key, answer);
+        answer
+    }
 }
 
 const BARE_SYSTEM_PROGRAMS: [&str; 2] = ["rundll32", "msiexec"];
+
+/// Programs that run whatever they are told (shells, script hosts, downloaders, system tools).
+/// A registry string that names one is never run by Seek, by bare name or full path.
+pub const NEVER_RUN: &[&str] = &[
+    "cmd", "powershell", "pwsh", "wscript", "cscript", "mshta", "bash", "wsl", "conhost", "regsvr32", "explorer", "schtasks", "reg", "sc",
+    "certutil", "bitsadmin", "curl", "wget", "forfiles", "msbuild",
+];
+
+fn is_never_run(path: &str) -> bool {
+    let file = path.rsplit(['\\', '/']).next().unwrap_or(path).to_ascii_lowercase();
+    let stem = file.strip_suffix(".exe").unwrap_or(&file);
+    NEVER_RUN.contains(&stem)
+}
 
 /// An absolute path to an `.exe`: as given, or for a bare `rundll32` / `msiexec` the one in the
 /// Windows directory. Any other relative or bare name is something Seek can't pin down.
 fn resolve_program(path: &str, ctx: &Ctx) -> Option<String> {
     let path = path.trim();
+    if is_never_run(path) {
+        return None;
+    }
     if is_abs(path) {
         return path.to_ascii_lowercase().ends_with(".exe").then(|| path.to_string());
     }
@@ -165,10 +193,23 @@ pub fn parse_app_id(id: &str) -> Option<(&str, &str, &str)> {
 
 /// The registry entry behind an id, read now. `None` if the id is malformed, the key is gone, or
 /// the entry is one the list does not show (Seek, a system component, a child entry, an app with
-/// no normal uninstaller): an id can't reach what the list hides.
-pub fn entry_by_id(id: &str) -> Option<RawEntry> {
+/// no normal uninstaller, or the 32-bit twin of an app listed from the 64-bit view): an id can't
+/// reach what the list hides. `read` is the registry reader (hive, view, key).
+pub fn entry_by_id_with(id: &str, read: &dyn Fn(&str, &str, &str) -> Option<RawEntry>) -> Option<RawEntry> {
     let (hive, view, key) = parse_app_id(id)?;
-    claims::read_uninstall_entry(hive, view, key).filter(is_listed)
+    let entry = read(hive, view, key).filter(is_listed)?;
+    if view == "32" {
+        let twin = read(hive, "64", key).filter(is_listed);
+        if twin.is_some_and(|t| t.display_name.trim().eq_ignore_ascii_case(entry.display_name.trim())) {
+            return None;
+        }
+    }
+    Some(entry)
+}
+
+/// [`entry_by_id_with`] on this PC's registry.
+pub fn entry_by_id(id: &str) -> Option<RawEntry> {
+    entry_by_id_with(id, &claims::read_uninstall_entry)
 }
 
 // ---- which entries are listed -----------------------------------------------------------------
@@ -249,10 +290,12 @@ fn is_root(canon: &str) -> bool {
 
 /// A folder an app may be said to live in, in its expanded spelling (so `C:\PROGRA~1\x` is judged
 /// as `C:\Program Files\x`). Rejected: one that is not there, Windows (with `Installer`), temp
-/// folders, the package cache, a drive or share root, a Program Files root, the user profile or a
-/// folder directly in it, any other place Seek knows and, for a guess, one that is or holds the
-/// folder of another listed app (`others`, in lowercase lexical form). That last rule holds for an
-/// `InstallLocation` too: a vendor folder that holds other apps is not one app's folder.
+/// folders, the package cache, a drive or share root, a Program Files root, the user profile or
+/// one of its well-known folders, any other place Seek knows and, for a guess, one under
+/// `Common Files`. `others` are the registered `InstallLocation` folders of the other listed apps
+/// (lowercase lexical form, never guesses): a guess that is or holds one is rejected, and so is a
+/// registered folder strictly above one (a vendor folder is not one app's folder). Two apps with
+/// the same registered folder both keep it.
 fn acceptable_folder(places: &Places, ctx: &Ctx, raw: &str, guessed: bool, others: &[String]) -> Option<PathBuf> {
     let expanded = (ctx.expand)(raw.trim()).replace('/', "\\");
     let spelled = if expanded.len() > 3 { expanded.trim_end_matches('\\') } else { expanded.as_str() };
@@ -262,10 +305,10 @@ fn acceptable_folder(places: &Places, ctx: &Ctx, raw: &str, guessed: bool, other
         || places.is_or_contains_place(&c)
         || places.in_package_cache(&c)
         || places.is_program_files_root(&c)
-        || places.is_profile_or_child(&c)
+        || places.is_profile_or_known_folder(&c)
         || in_temp(&c)
         || (guessed && places.in_common_files(&c))
-        || others.iter().any(|o| is_inside(o, &c))
+        || others.iter().any(|o| is_inside(o, &c) && (guessed || *o != c))
         || !(ctx.dir_exists)(spelled);
     (!bad).then(|| PathBuf::from(spelled))
 }
@@ -285,7 +328,7 @@ pub struct Found {
 /// The folder an app is installed in: `InstallLocation`, else the folder of its `DisplayIcon`,
 /// else the folder of its uninstaller. A candidate that fails [`acceptable_folder`] (including a
 /// stale `InstallLocation` that no longer exists) falls through to the next. `others` are the
-/// canonical folders of the other listed apps. The path is returned in expanded spelling: 8.3 names
+/// registered folders of the other listed apps ([`registered_folder`]). The path is returned in expanded spelling: 8.3 names
 /// written out in the disk's case on fixed drives, otherwise as registered, with `\` separators
 /// and no trailing `\`. `None` when nothing is left; the app is still listed.
 pub fn find_folder(e: &RawEntry, places: &Places, ctx: &Ctx, others: &[String]) -> Option<Found> {
@@ -307,7 +350,17 @@ pub fn find_folder(e: &RawEntry, places: &Places, ctx: &Ctx, others: &[String]) 
     }
 }
 
-/// [`find_folder`] on this PC, knowing nothing of other apps.
+/// The folder an app's own `InstallLocation` gives, judged without regard to other apps. This is
+/// what the other apps are compared against.
+fn registered_folder(e: &RawEntry, places: &Places, ctx: &Ctx) -> Option<String> {
+    location_paths(&e.install_location, ctx.env)
+        .iter()
+        .find_map(|p| acceptable_folder(places, ctx, p, false, &[]))
+        .map(|p| canon_lexical(&p))
+}
+
+/// [`find_folder`] on this PC, knowing nothing of other apps: it can give a folder that holds
+/// another app's. Task 13 must use [`found_by_id`], which knows the others.
 pub fn install_folder(e: &RawEntry, places: &Places) -> Option<PathBuf> {
     with_real_ctx(|ctx| find_folder(e, places, ctx, &[])).map(|f| f.path)
 }
@@ -405,36 +458,45 @@ fn size_bytes(kb: Option<u64>) -> u64 {
 
 // ---- the rows -------------------------------------------------------------------------------------------
 
-/// The rows for these entries: hidden ones dropped, the same app in both views once (the 64-bit
-/// view wins), sorted by name. `icon` stays empty. Folders are found twice: once alone, then
-/// again knowing every other app's folder, so a guess that is or holds another app's folder
-/// (`C:\Program Files\Adobe`) is dropped. A row whose uninstall command can't be understood stays,
-/// with a note saying so. Pure but for `ctx`.
-pub fn rows(
+/// One listed app, as the list builds it: the row, the registry entry it came from (for Task 13
+/// to run its uninstaller) and the parsed uninstall command.
+#[derive(Clone, Debug)]
+pub struct FoundApp {
+    pub row: AppRow,
+    pub entry: RawEntry,
+    pub command: Option<UninstallCommand>,
+}
+
+/// Every listed app: hidden entries dropped, the same app in both views once (the 64-bit view
+/// wins), sorted by name. `row.icon` stays empty. Each folder is found knowing the registered
+/// folders of all the other apps, so `C:\Program Files\Adobe` (above Photoshop's registered
+/// folder) is dropped for Premiere. A row whose uninstall command can't be understood stays, with
+/// `can_uninstall` false and a note. Pure but for `ctx`.
+pub fn found_apps(
     entries: Vec<RawEntry>,
     places: &Places,
     running_exes: &[String],
     ctx: &Ctx,
     local_to_utc: &dyn Fn(i64) -> Option<i64>,
-) -> Vec<AppRow> {
+) -> Vec<FoundApp> {
     let mut entries: Vec<RawEntry> = entries.into_iter().filter(is_listed).collect();
     // "64" sorts after "32", so reversing puts the 64-bit view first; the sort is stable.
     entries.sort_by(|a, b| b.view.cmp(&a.view));
     let mut seen = HashSet::new();
     entries.retain(|e| seen.insert((e.hive.clone(), e.key.to_lowercase(), e.display_name.trim().to_lowercase())));
 
-    let alone: Vec<Option<String>> =
-        entries.iter().map(|e| find_folder(e, places, ctx, &[]).map(|f| canon_lexical(&f.path))).collect();
-    let mut out: Vec<AppRow> = Vec::new();
+    let registered: Vec<Option<String>> = entries.iter().map(|e| registered_folder(e, places, ctx)).collect();
+    let mut out: Vec<FoundApp> = Vec::new();
     for (i, e) in entries.iter().enumerate() {
-        let others: Vec<String> = alone.iter().enumerate().filter(|(j, _)| *j != i).filter_map(|(_, f)| f.clone()).collect();
+        let others: Vec<String> = registered.iter().enumerate().filter(|(j, _)| *j != i).filter_map(|(_, f)| f.clone()).collect();
         let found = find_folder(e, places, ctx, &others);
+        let command = parse_uninstall_with(&e.uninstall_string, ctx);
         let name = e.display_name.trim().to_string();
         let mut notes: Vec<&str> = note_for(&name).into_iter().collect();
-        if parse_uninstall_with(&e.uninstall_string, ctx).is_none() {
+        if command.is_none() {
             notes.push(CANT_START_NOTE);
         }
-        out.push(AppRow {
+        let row = AppRow {
             id: app_id(e),
             note: (!notes.is_empty()).then(|| notes.join(" ")),
             name,
@@ -446,11 +508,38 @@ pub fn rows(
             running: is_running(found.as_ref().map(|f| f.path.as_path()), running_exes),
             folder_guessed: found.as_ref().is_some_and(|f| f.source != FolderSource::InstallLocation),
             folder_source: found.as_ref().map(|f| f.source),
+            can_uninstall: command.is_some(),
             folder: found.map(|f| f.path.to_string_lossy().into_owned()),
-        });
+        };
+        out.push(FoundApp { row, entry: e.clone(), command });
     }
-    out.sort_by_key(|r| r.name.to_lowercase());
+    out.sort_by_key(|f| f.row.name.to_lowercase());
     out
+}
+
+/// The rows of [`found_apps`].
+pub fn rows(
+    entries: Vec<RawEntry>,
+    places: &Places,
+    running_exes: &[String],
+    ctx: &Ctx,
+    local_to_utc: &dyn Fn(i64) -> Option<i64>,
+) -> Vec<AppRow> {
+    found_apps(entries, places, running_exes, ctx, local_to_utc).into_iter().map(|f| f.row).collect()
+}
+
+/// What `list()` gives for `id`, with the entry and command: `None` if the id is malformed or the
+/// list does not show it. This is what Task 13 starts from: folder, source and command are those
+/// of the list, computed knowing every other app. Reads the registry once.
+pub fn found_by_id(id: &str) -> Option<FoundApp> {
+    parse_app_id(id)?;
+    let places = Places::from_system().ok()?;
+    let (entries, failed) = claims::read_uninstall_entries();
+    if failed.iter().any(|(hive, view)| hive == "HKLM" && view == "64") {
+        return None;
+    }
+    let running = claims::running_exes();
+    with_real_ctx(|ctx| found_apps(entries, &places, &running, ctx, &local_to_utc_ms)).into_iter().find(|f| f.row.id == id)
 }
 
 /// The rows for these entries on this PC: no icons, and nothing counted as running (the caller

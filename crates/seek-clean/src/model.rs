@@ -205,6 +205,8 @@ pub struct AppRow {
     pub folder_source: Option<FolderSource>,
     /// True when the folder did not come from `InstallLocation`: Seek's best guess.
     pub folder_guessed: bool,
+    /// False when Seek can't tell what to run to uninstall this app.
+    pub can_uninstall: bool,
     pub note: Option<String>,
     pub running: bool,
 }

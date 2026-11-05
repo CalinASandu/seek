@@ -391,7 +391,7 @@ function buildApps(scenario: CleanScenario, now: number): AppRow[] {
     folder: string | null, extra: Partial<AppRow> = {},
   ): AppRow => ({
     id, name, publisher, version, size: Math.round(mb * MB), installDate: ageDays === null ? null : now - ageDays * DAY,
-    icon: null, folder, folderGuessed: false, note: null, running: false, ...extra,
+    icon: null, folder, folderGuessed: false, canUninstall: true, note: null, running: false, ...extra,
   });
   const runtime = "Other apps may need this.";
   return [
@@ -412,6 +412,7 @@ function buildApps(scenario: CleanScenario, now: number): AppRow[] {
     a("app-obs", "OBS Studio", "OBS Project", "30.2.3", 330, 150, `${PF}\\obs-studio`),
     a("app-gimp", "GIMP 2.10.38", "The GIMP Team", "2.10.38", 1_040, 260, `${PF}\\GIMP 2`),
     a("app-blender", "Blender", "Blender Foundation", "4.2.3", 1_900, 40, `${PF}\\Blender Foundation\\Blender 4.2`),
+    a("app-odd", "Odd Portable Tool", "Unknown", "1.0", 8, 100, null, { canUninstall: false, note: "Seek can't start this app's uninstaller." }),
     a("app-notepadpp", "Notepad++ (64-bit x64)", "Notepad++ Team", "8.7.1", 12, 300, `${PF}\\Notepad++`),
     a("app-qbit", "qBittorrent", "The qBittorrent project", "5.0.1", 66, 500, `${PF}\\qBittorrent`),
     a("app-winrar", "WinRAR 7.01 (64-bit)", "win.rar GmbH", "7.01", 11, 610, `${PF}\\WinRAR`),

@@ -456,6 +456,16 @@ describe("Apps, Recently removed and Settings", () => {
     expect(uninstallStart).not.toHaveBeenCalled();
   });
 
+  it("disables Uninstall and says why when Seek can't start the uninstaller", async () => {
+    const user = await openClean();
+    await user.click(tab("Apps"));
+    await user.click(await screen.findByRole("button", { name: /^Odd Portable Tool/ }));
+    expect(screen.getByRole("button", { name: /^Uninstall…/ })).toBeDisabled();
+    expect(screen.getAllByText(/can't start this app's uninstaller/).length).toBeGreaterThan(0);
+    await user.click(await screen.findByRole("button", { name: /^Google Chrome/ }));
+    expect(screen.getByRole("button", { name: /^Uninstall…/ })).toBeEnabled();
+  });
+
   it("marks a folder Seek only guessed, and not one the app registered", async () => {
     const user = await openClean();
     await user.click(tab("Apps"));

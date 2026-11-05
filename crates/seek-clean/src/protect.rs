@@ -118,12 +118,18 @@ impl Places {
         self.program_files.iter().any(|p| is_inside(canon_path, &format!("{}\\common files", p.trim_end_matches('\\'))))
     }
 
-    /// True if `canon_path` (in `canon` form) is the user profile or directly inside it
-    /// (Downloads, Desktop, Documents and the like).
-    pub fn is_profile_or_child(&self, canon_path: &str) -> bool {
+    /// True if `canon_path` (in `canon` form) is the user profile itself or one of its well-known
+    /// folders (Desktop, Downloads and the like). Other folders in the profile, where tools such
+    /// as miniconda or scoop live, are not.
+    pub fn is_profile_or_known_folder(&self, canon_path: &str) -> bool {
+        const KNOWN: [&str; 13] = [
+            "desktop", "documents", "downloads", "pictures", "music", "videos", "favorites", "links", "saved games", "contacts",
+            "searches", "onedrive", "appdata",
+        ];
         let profile = self.profile.trim_end_matches('\\');
         !profile.is_empty()
-            && (canon_path == profile || canon_path.rsplit_once('\\').is_some_and(|(parent, _)| parent == profile))
+            && (canon_path == profile
+                || canon_path.rsplit_once('\\').is_some_and(|(parent, name)| parent == profile && KNOWN.contains(&name)))
     }
 
     /// True if `canon_path` (in `canon` form) is inside `<ProgramData>\Package Cache`.
