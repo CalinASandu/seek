@@ -1,6 +1,6 @@
 # Seek — Status & Next Steps
 
-_Last updated: 2026-11-04 (RAM work committed, pairing race fixed, Cleanup decisions made). Read this first when starting a new session in this repo._
+_Last updated: 2026-11-05 (Decimator spec approved, plan written). Read this first when starting a new session in this repo._
 
 ## Where we are
 
@@ -295,12 +295,16 @@ Sonnet agents code. Write a design spec first, since this is the first time Seek
 
 The RAM and "seen" work is committed (`24cbddc`). The pairing fix below needs `Rebuild Seek.bat` to run on this PC.
 
+**Where this stands (2026-11-05):** the user approved the spec `docs/superpowers/specs/2026-11-04-seek-cleanup-design.md`, including the name
+Decimator and leaving registry cleaning out. The plan is `docs/superpowers/plans/2026-11-05-seek-decimator.md`, waiting for the user's review.
+No code is written yet, and the spec and plan are uncommitted.
+
 **Decided by the user (2026-11-04), defaults plus their changes:**
 
 - A Cleanup area beside Search and Space. Files only go to the Recycle Bin, never permanently deleted. Deletes run from the window
   with the user's permissions, never from the SYSTEM service.
-- **The user sees exactly what gets removed, every time, and can protect any item.** Program Files can be cleaned, with an admin prompt
-  for that removal, but only after that list.
+- **The user sees exactly which leftovers and files Seek removes, every time, and can protect any item.** This doesn't cover what an app's own
+  uninstaller removes. Program Files can be cleaned, with an admin prompt for that removal, but only after that list.
 - A duplicate means identical contents, checked by comparing the files; a name and size match is never enough. Only this PC's files can
   be deleted; a linked PC's duplicates can be listed. Duplicates never touch Windows, Program Files or other users' folders. Seek
   suggests which copy to keep and never picks for the user.
