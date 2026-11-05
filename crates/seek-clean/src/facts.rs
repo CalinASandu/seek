@@ -156,7 +156,7 @@ fn walk(root: &Path, s: &mut Stat) -> Option<()> {
                 stack.push(entry.path());
             } else {
                 s.files = s.files.saturating_add(1);
-                s.size += md.len();
+                s.size = s.size.saturating_add(md.len());
             }
         }
     }
@@ -196,19 +196,18 @@ mod tests {
         std::fs::write(f.join("sub").join("b.txt"), b"123").unwrap();
         let s = RealFacts.stat(&f).unwrap();
         assert_eq!((s.size, s.files, s.is_dir, s.reparse), (8, 2, true, false));
-        if crate::paths::make_junction(&f.join("link"), &outside) {
-            let s2 = RealFacts.stat(&f).unwrap();
-            assert_eq!(
-                (s2.size, s2.files),
-                (8, 2),
-                "junction neither counted nor followed"
-            );
-            let l = RealFacts.stat(&f.join("link")).unwrap();
-            assert!(l.reparse);
-            assert!(RealFacts
-                .same_bytes(&f.join("link"), &f.join("a.txt"))
-                .is_err());
-        }
+        assert!(crate::paths::make_junction(&f.join("link"), &outside));
+        let s2 = RealFacts.stat(&f).unwrap();
+        assert_eq!(
+            (s2.size, s2.files),
+            (8, 2),
+            "junction neither counted nor followed"
+        );
+        let l = RealFacts.stat(&f.join("link")).unwrap();
+        assert!(l.reparse);
+        assert!(RealFacts
+            .same_bytes(&f.join("link"), &f.join("a.txt"))
+            .is_err());
     }
 
     #[test]

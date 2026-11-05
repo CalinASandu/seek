@@ -10,7 +10,7 @@ use windows::core::PCWSTR;
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, GetFinalPathNameByHandleW, GetLongPathNameW, FILE_FLAG_BACKUP_SEMANTICS,
-    FILE_FLAG_OPEN_REPARSE_POINT, FILE_NAME_NORMALIZED, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_FLAGS_AND_ATTRIBUTES, FILE_FLAG_OPEN_REPARSE_POINT, FILE_NAME_NORMALIZED, FILE_SHARE_DELETE, FILE_SHARE_READ,
     FILE_SHARE_WRITE, OPEN_EXISTING,
 };
 
@@ -150,6 +150,10 @@ impl Drop for QueryHandle {
 /// Opens a file or folder without reading its contents and without following a link in the
 /// last segment. Parent links are still followed by Windows, which `real_location` relies on.
 pub(crate) fn open_query(path: &Path) -> Option<QueryHandle> {
+    open_flags(path, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+}
+
+fn open_flags(path: &Path, flags: FILE_FLAGS_AND_ATTRIBUTES) -> Option<QueryHandle> {
     let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
     // SAFETY: `wide` is NUL-terminated and outlives the call.
     let h = unsafe {
@@ -159,7 +163,7 @@ pub(crate) fn open_query(path: &Path) -> Option<QueryHandle> {
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             None,
             OPEN_EXISTING,
-            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            flags,
             None,
         )
     };
@@ -167,9 +171,18 @@ pub(crate) fn open_query(path: &Path) -> Option<QueryHandle> {
 }
 
 /// Where an existing path really is, in `canon` form, with every link in its parents resolved
-/// (a junction into `C:\Windows` shows up as `c:\windows\...`). `None` if it can't be opened.
+/// (a junction into `C:\Windows` shows up as `c:\windows\...`). A link in the last segment is
+/// reported as itself. `None` if it can't be opened.
 pub fn real_location(path: &Path) -> Option<String> {
-    let h = open_query(path)?;
+    final_path(&open_query(path)?)
+}
+
+/// Like `real_location`, but a link in the last segment is followed to its target too.
+pub fn target_location(path: &Path) -> Option<String> {
+    final_path(&open_flags(path, FILE_FLAG_BACKUP_SEMANTICS)?)
+}
+
+fn final_path(h: &QueryHandle) -> Option<String> {
     let mut buf = vec![0u16; 1024];
     loop {
         // SAFETY: `h` is a valid handle and `buf` a valid buffer.
@@ -185,20 +198,24 @@ pub fn real_location(path: &Path) -> Option<String> {
     }
 }
 
-/// Test helper: makes a junction `link` -> `target` with `mklink /J`. False if that failed.
+/// Test helper: makes a junction `link` -> `target` with `mklink /J`. Tests must `assert!` the
+/// result: a junction test that quietly skips proves nothing.
 #[cfg(test)]
 pub(crate) fn make_junction(link: &Path, target: &Path) -> bool {
-    let ok = std::process::Command::new("cmd")
+    // `mklink` reads a `/` as a switch, so only backslashes.
+    let fix = |p: &Path| p.to_string_lossy().replace('/', "\\");
+    let out = std::process::Command::new("cmd")
         .args(["/C", "mklink", "/J"])
-        .arg(link)
-        .arg(target)
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    if !ok {
-        eprintln!("mklink /J failed here; junction test skipped");
+        .arg(fix(link))
+        .arg(fix(target))
+        .output();
+    match out {
+        Ok(o) if o.status.success() => true,
+        other => {
+            eprintln!("mklink /J failed: {other:?}");
+            false
+        }
     }
-    ok
 }
 
 #[cfg(test)]
@@ -213,9 +230,7 @@ mod tests {
         std::fs::create_dir(&real).unwrap();
         std::fs::write(real.join("f.txt"), b"x").unwrap();
         let junc = dir.path().join("junc");
-        if !make_junction(&junc, &real) {
-            return;
-        }
+        assert!(make_junction(&junc, &real));
         let via = real_location(&junc.join("f.txt")).unwrap();
         let direct = real_location(&real.join("f.txt")).unwrap();
         assert_eq!(via, direct);

@@ -83,6 +83,17 @@ impl Places {
         self.program_files.iter().any(|p| is_inside(canon_path, p))
     }
 
+    /// True if `canon_path` (in `canon` form) is, or contains, any known place: Windows, a
+    /// Program Files root, the users folder, your profile, ProgramData or an AppData folder.
+    /// A folder like that is never a leftover.
+    pub fn is_or_contains_place(&self, canon_path: &str) -> bool {
+        [&self.windows, &self.users_root, &self.profile, &self.program_data]
+            .into_iter()
+            .chain(&self.program_files)
+            .chain(&self.app_data)
+            .any(|p| !p.is_empty() && is_inside(p, canon_path))
+    }
+
     /// Fixed places for tests. Paths are put through `canon`.
     pub fn for_tests(
         windows: &str,
