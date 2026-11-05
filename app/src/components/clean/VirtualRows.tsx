@@ -13,6 +13,8 @@ interface Props<R> extends Omit<HTMLAttributes<HTMLDivElement>, "children" | "on
   rowClass?: (row: R, index: number) => string;
   onKeyDown?: (e: KeyboardEvent<HTMLDivElement>) => void;
   autoFocus?: boolean;
+  /** The scrolling element, for the caller that returns DOM focus to it. */
+  listRef?: { current: HTMLDivElement | null };
 }
 
 /** A scrolling list that renders only the rows in view, the same way as the results table. */
@@ -27,9 +29,10 @@ export function VirtualRows<R>({
   className = "",
   onKeyDown,
   autoFocus,
+  listRef,
   ...rest
 }: Props<R>) {
-  const scroller = useRef<HTMLDivElement>(null);
+  const scroller = useRef<HTMLDivElement | null>(null);
   const virt = useVirtualizer({
     count: rows.length,
     getScrollElement: () => scroller.current,
@@ -47,7 +50,10 @@ export function VirtualRows<R>({
 
   return (
     <div
-      ref={scroller}
+      ref={(el) => {
+        scroller.current = el;
+        if (listRef) listRef.current = el;
+      }}
       className={`vrows ${className}`}
       tabIndex={0}
       data-autofocus={autoFocus ? "" : undefined}

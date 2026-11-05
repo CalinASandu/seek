@@ -36,7 +36,9 @@ export function lockText(lock: Lock): string {
   }
 }
 
-const norm = (p: string) => p.replace(/\//g, "\\").replace(/\\+$/, "").toLowerCase();
+/** One spelling for comparing paths from the UI and from the engine: lower case, backslashes, no trailing separator. */
+export const normPath = (p: string): string => p.replace(/\//g, "\\").replace(/\\+$/, "").toLowerCase();
+const norm = normPath;
 
 /** Is `path` one of the protected entries, or inside one? Case-insensitive, like Windows. */
 export function isProtectedPath(path: string, list: readonly string[]): boolean {

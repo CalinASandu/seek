@@ -116,13 +116,16 @@ const AppItem = memo(function AppItem({
               </span>
             </span>
           </button>
-          <span className="app-date tnum">{app.installDate ? dateOf(app.installDate) : ""}</span>
+          <span className="app-slot">
+            {selected ? (
+              <button className="btn app-uninstall" onClick={() => onUninstall(app)}>
+                Uninstall…
+              </button>
+            ) : (
+              <span className="app-date tnum">{app.installDate ? dateOf(app.installDate) : ""}</span>
+            )}
+          </span>
           <span className="app-size tnum">{formatSize(app.size)}</span>
-          {selected && (
-            <button className="btn app-uninstall" onClick={() => onUninstall(app)}>
-              Uninstall…
-            </button>
-          )}
         </div>
       </div>
     </li>

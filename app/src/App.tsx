@@ -160,8 +160,8 @@ function Shell() {
         setTimeout(focusSearch);
       },
       f5: search.refresh,
-      "ctrl+shift+s": () => setView(view === "space" ? "search" : "space"),
-      "ctrl+shift+d": () => setView(view === "clean" ? "search" : "clean"),
+      "ctrl+shift+s": () => (document.querySelector('[role="dialog"]') ? false : setView(view === "space" ? "search" : "space")),
+      "ctrl+shift+d": () => (document.querySelector('[role="dialog"]') ? false : setView(view === "clean" ? "search" : "clean")),
       "alt+arrowleft": goBack,
       "alt+arrowright": goForward,
     };

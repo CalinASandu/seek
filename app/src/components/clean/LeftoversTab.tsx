@@ -6,7 +6,7 @@ import { isProtectedPath, LEVEL_ORDER, lockText } from "../../lib/clean";
 import { formatInt, formatModified, formatSize, pluralize } from "../../lib/format";
 import { useStore } from "../../lib/store";
 import { ConfidenceMeter, ReasonList } from "./ConfidenceMeter";
-import { Collapse, LockNote, MidPath, Placeholder, Shielded, SkeletonRows, Tick } from "./parts";
+import { Collapse, LockNote, MidPath, Placeholder, SelBar, Shielded, SkeletonRows, Tick } from "./parts";
 import type { SheetSpec } from "./CleanView";
 
 interface Props {
@@ -132,7 +132,7 @@ export function LeftLine({ row, ticked, locked, leave, onToggle }: LineProps) {
               <MidPath path={row.parent} className="cl-sub" />
             </span>
           </button>
-          {locked ? <span className="lf-protected">Protected</span> : <ConfidenceMeter level={row.level} reasons={row.reasons} />}
+          {locked ? <span className="lf-protected">Protected</span> : <ConfidenceMeter level={row.level} reasons={row.reasons} quiet={open} />}
           {row.needsAdmin ? <Shielded /> : <span className="shield-gap" />}
           <span className="lf-size tnum">{formatSize(row.size)}</span>
           <span className="lf-changed tnum">{formatModified(row.modified)}</span>
@@ -174,7 +174,7 @@ function LeftBar({ ctl, rows, onReview }: { ctl: CleanController; rows: Leftover
   if (picked.length === 0) return null;
   const bytes = picked.reduce((s, r) => s + r.size, 0);
   return (
-    <div className="sel-bar" role="region" aria-label="Selection">
+    <SelBar>
       <span className="sel-text tnum">
         {formatInt(picked.length)} {picked.length === 1 ? "item" : "items"}, {formatSize(bytes)}
       </span>
@@ -183,10 +183,10 @@ function LeftBar({ ctl, rows, onReview }: { ctl: CleanController; rows: Leftover
       </button>
       <button
         className="btn btn-primary"
-        onClick={() => onReview({ request: folderRequest(picked, "leftover"), picked: null, contents: contentsOf(picked) })}
+        onClick={() => onReview({ request: folderRequest(picked, "leftover"), picked: null, contents: contentsOf(picked), clear: () => ctl.clearLeftovers() })}
       >
         Review…
       </button>
-    </div>
+    </SelBar>
   );
 }
