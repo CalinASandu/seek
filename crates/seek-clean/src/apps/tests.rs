@@ -238,7 +238,7 @@ fn derived_folder_rejected_under_windows_installer_temp_package_cache_and_pf_roo
 }
 
 #[test]
-fn roots_the_profile_and_its_direct_children_are_not_app_folders() {
+fn roots_and_the_profile_with_its_well_known_folders_are_not_app_folders() {
     let bad = [
         r"C:\setup.exe",
         r"D:\unins.exe",
@@ -246,16 +246,29 @@ fn roots_the_profile_and_its_direct_children_are_not_app_folders() {
         r"C:\Users\me\unins.exe",
         r"C:\Users\me\Downloads\setup.exe",
         r"C:\Users\me\Desktop\setup.exe",
+        r"C:\Users\me\Documents\setup.exe",
+        r"C:\Users\me\OneDrive\setup.exe",
+        r"C:\Users\me\Saved Games\setup.exe",
     ];
     for exe in bad {
         let mut e = entry("App");
         e.uninstall_string = format!(r#""{exe}""#);
         assert_eq!(folder(&e), None, "{exe}");
+        // Registered folders follow the same rule.
+        let mut r = entry("Reg");
+        r.install_location = exe.rsplit_once('\\').unwrap().0.to_string();
+        r.uninstall_string = format!("MsiExec.exe /X{GUID}");
+        assert_eq!(folder(&r), None, "{exe}");
     }
-    // Deeper in the profile is fine, and so is a UNC folder below the share.
+    // Other folders in the profile, and deeper ones, are fine, guessed or registered.
+    for tool in [r"C:\Users\me\miniconda3", r"C:\Users\me\anaconda3", r"C:\Users\me\scoop", r"C:\Users\me\Tools\App"] {
+        let mut e = entry("App");
+        e.uninstall_string = format!(r#""{tool}\unins.exe""#);
+        assert_eq!(folder(&e), Some(PathBuf::from(tool)), "{tool}");
+        e.install_location = tool.to_string();
+        assert_eq!(find(&e).map(|f| f.source), Some(FolderSource::InstallLocation), "{tool}");
+    }
     let mut e = entry("App");
-    e.uninstall_string = r#""C:\Users\me\Tools\App\unins.exe""#.into();
-    assert_eq!(folder(&e), Some(PathBuf::from(r"C:\Users\me\Tools\App")));
     e.uninstall_string = r#""\\nas\share\App\unins.exe""#.into();
     assert_eq!(folder(&e), Some(PathBuf::from(r"\\nas\share\App")));
 }
@@ -328,13 +341,13 @@ fn a_guess_that_is_or_holds_another_apps_folder_is_dropped() {
     assert_eq!(photoshop_row.folder.as_deref(), Some(r"C:\Program Files\Adobe\Adobe Photoshop 2026"));
     assert!(!photoshop_row.folder_guessed);
 
-    // Two apps guessing the same folder reject each other: it is shared.
+    // Two apps guessing the same folder: a guess never counts against another guess.
     let mut a = entry("A");
     a.key = "a".into();
     let mut b = entry("B");
     b.key = "b".into();
     let shown = build(vec![a, b]);
-    assert!(shown.iter().all(|r| r.folder.is_none()));
+    assert!(shown.iter().all(|r| r.folder.as_deref() == Some(r"C:\Program Files\Acme")));
 
     // The rule holds for an InstallLocation too: a folder that holds another app's folder is a
     // vendor folder, not this app's. It falls through to a guess; the inner app keeps its own.
@@ -347,6 +360,75 @@ fn a_guess_that_is_or_holds_another_apps_folder_is_dropped() {
     assert_eq!(holder_row.folder_source, Some(FolderSource::Uninstaller));
     let inner_row = shown.iter().find(|r| r.name == "Inner").unwrap();
     assert_eq!((inner_row.folder.as_deref(), inner_row.folder_guessed), (Some(r"D:\Games\Inner"), false));
+}
+
+#[test]
+fn another_apps_guess_never_removes_a_registered_folder() {
+    let mut foo = entry("Foo");
+    foo.install_location = r"C:\Program Files\Foo".into();
+    // B's only clue is an updater inside Foo's folder.
+    let mut b = entry("Updater");
+    b.uninstall_string = r#""C:\Program Files\Foo\updater\unins.exe""#.into();
+    let shown = build(vec![foo, b]);
+    let foo_row = shown.iter().find(|r| r.name == "Foo").unwrap();
+    assert_eq!(foo_row.folder.as_deref(), Some(r"C:\Program Files\Foo"));
+    assert!(!foo_row.folder_guessed);
+    let b_row = shown.iter().find(|r| r.name == "Updater").unwrap();
+    assert_eq!(b_row.folder.as_deref(), Some(r"C:\Program Files\Foo\updater"));
+}
+
+#[test]
+fn two_apps_with_the_same_install_location_both_keep_it() {
+    let mut product = entry("Product");
+    product.install_location = r"D:\Apps\Product".into();
+    let mut pack = entry("Product Language Pack");
+    pack.install_location = r"D:\Apps\Product\".into();
+    let mut twin = product.clone();
+    twin.hive = "HKCU".into();
+    let shown = build(vec![product, pack, twin]);
+    assert_eq!(shown.len(), 3);
+    assert!(shown.iter().all(|r| r.folder.as_deref() == Some(r"D:\Apps\Product") && !r.folder_guessed));
+    // A guess equal to someone's registered folder is rejected.
+    let mut guesser = entry("Guesser");
+    guesser.uninstall_string = r#""D:\Apps\Product\unins.exe""#.into();
+    let mut owner = entry("Owner");
+    owner.install_location = r"D:\Apps\Product".into();
+    let shown = build(vec![guesser, owner]);
+    assert_eq!(shown.iter().find(|r| r.name == "Guesser").unwrap().folder, None);
+}
+
+#[test]
+fn a_suite_above_its_plugins_registered_folder_loses_it() {
+    // Accepted behaviour, pinned: a registered folder strictly above another app's registered
+    // folder is a vendor folder. The suite falls through to its other clues.
+    let mut suite = entry("Suite");
+    suite.install_location = r"D:\Suite".into();
+    let mut plugin = entry("Suite Plugin");
+    plugin.install_location = r"D:\Suite\Plugins\One".into();
+    let shown = build(vec![suite, plugin]);
+    let suite_row = shown.iter().find(|r| r.name == "Suite").unwrap();
+    assert_eq!(suite_row.folder_source, Some(FolderSource::Uninstaller));
+    assert_eq!(shown.iter().find(|r| r.name == "Suite Plugin").unwrap().folder.as_deref(), Some(r"D:\Suite\Plugins\One"));
+}
+
+#[test]
+fn found_by_id_gives_the_list_row_entry_and_command_with_the_others_known() {
+    let mut premiere = entry("Premiere");
+    premiere.install_location = r"C:\Program Files\Adobe".into();
+    premiere.uninstall_string = r#""C:\Program Files\Adobe\u.exe" /uninstall"#.into();
+    premiere.display_icon = r"C:\Program Files\Adobe\p.ico".into();
+    let mut photoshop = entry("Photoshop");
+    photoshop.install_location = r"C:\Program Files\Adobe\Adobe Photoshop 2026".into();
+    let entries = vec![premiere, photoshop];
+    let all = all_there(|ctx| found_apps(entries.clone(), &places(), &[], ctx, &plus_two));
+    let found = all.iter().find(|f| f.row.id == r"HKLM64\{Premiere}").unwrap();
+    assert_eq!(found.row.folder, None, "the Adobe folder holds Photoshop's");
+    assert_eq!(found.entry.key, "{Premiere}");
+    assert_eq!(found.command, exe(r"C:\Program Files\Adobe\u.exe", "/uninstall"));
+    // `found_by_id` is this on the real registry; `install_folder` alone would not know Photoshop.
+    let alone = all_there(|ctx| find_folder(&entries[0], &places(), ctx, &[])).map(|f| f.path);
+    assert_eq!(alone, Some(PathBuf::from(r"C:\Program Files\Adobe")));
+    assert!(found_by_id("nonsense").is_none());
 }
 
 #[test]
@@ -420,6 +502,14 @@ fn only_an_absolute_exe_or_a_system_program_can_be_run() {
     assert_eq!(parse("RUNDLL32 shell32.dll,Foo"), exe(&format!(r"{system}\rundll32.exe"), "shell32.dll,Foo"));
     assert_eq!(parse("msiexec.exe /?"), exe(&format!(r"{system}\msiexec.exe"), "/?"));
     for bad in [
+        r"C:\Windows\System32\cmd.exe /c del C:\x",
+        r#""C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe" -File C:\x.ps1"#,
+        r"powershell.exe -File C:\x.ps1",
+        r"cmd /c del x",
+        r"C:\Tools\PWSH.EXE -c x",
+        r"C:\Windows\System32\reg.exe delete HKLM\x",
+        r"C:\Windows\System32\sc.exe delete x",
+        r#""C:\Windows\explorer.exe" C:\x"#,
         "uninstall.exe",
         r"..\u.exe",
         r"sub\u.exe",
@@ -436,6 +526,19 @@ fn only_an_absolute_exe_or_a_system_program_can_be_run() {
     ] {
         assert_eq!(parse(bad), None, "{bad:?}");
     }
+}
+
+#[test]
+fn shells_script_hosts_and_system_tools_are_never_run() {
+    for name in NEVER_RUN {
+        let upper = name.to_uppercase();
+        for line in [format!(r"C:\Windows\System32\{name}.exe /x"), format!(r#""C:\Any Where\{upper}.EXE" /x"#), format!("{name} /x")] {
+            assert_eq!(parse(&line), None, "{line}");
+        }
+    }
+    // Ordinary uninstallers with similar names are fine.
+    assert!(parse(r"C:\a\recovery.exe /x").is_some());
+    assert!(parse(r"C:\a\scan.exe").is_some());
 }
 
 #[test]
@@ -494,6 +597,33 @@ fn id_round_trips_and_rejects_anything_else() {
     ] {
         assert_eq!(parse_app_id(bad), None, "{bad:?}");
     }
+}
+
+#[test]
+fn entry_by_id_goes_through_the_reader_and_the_list_rules() {
+    let mut seek = entry("Seek");
+    seek.publisher = "Seek".into();
+    seek.key = "Seek".into();
+    let mut sys = entry("Sys");
+    sys.system_component = true;
+    let mut child = entry("Child");
+    child.parent_key_name = "P".into();
+    let mut quiet = entry("Quiet");
+    quiet.uninstall_string.clear();
+    quiet.quiet_uninstall_string = "x.exe /S".into();
+    let fine64 = entry("Fine");
+    let mut fine32 = fine64.clone();
+    fine32.view = "32".into();
+    let mut only32 = entry("Only32");
+    only32.view = "32".into();
+    let all = [seek, sys, child, quiet, fine64, fine32, only32];
+    let read = |h: &str, v: &str, k: &str| all.iter().find(|e| e.hive == h && e.view == v && e.key == k).cloned();
+    for hidden in [r"HKLM64\Seek", r"HKLM64\{Sys}", r"HKLM64\{Child}", r"HKLM64\{Quiet}", r"HKLM32\{Fine}", r"HKLM64\{Missing}", "HKLM64\\a\u{0}"] {
+        assert!(entry_by_id_with(hidden, &read).is_none(), "{hidden}");
+    }
+    assert_eq!(entry_by_id_with(r"HKLM64\{Fine}", &read).map(|e| e.view), Some("64".to_string()));
+    // Listed only from the 32-bit view: reachable there, as the list shows it.
+    assert_eq!(entry_by_id_with(r"HKLM32\{Only32}", &read).map(|e| e.key), Some("{Only32}".to_string()));
 }
 
 #[test]
@@ -679,6 +809,32 @@ fn clearing_the_cache_lets_go_of_every_icon() {
 }
 
 #[test]
+fn a_path_is_asked_of_the_disk_once() {
+    use std::cell::Cell;
+    let calls = Cell::new(0);
+    let ask = memoised(|p: &str| {
+        calls.set(calls.get() + 1);
+        p.ends_with('1')
+    });
+    assert!(ask(r"C:\a1"));
+    assert!(ask(r"c:\A1"));
+    assert!(!ask(r"C:\b"));
+    assert!(!ask(r"C:\b"));
+    assert_eq!(calls.get(), 2);
+}
+
+#[test]
+fn a_row_says_whether_its_uninstaller_can_be_started() {
+    let mut odd = entry("Odd");
+    odd.uninstall_string = "uninstall.exe".into();
+    let mut msi = entry("Msi");
+    msi.uninstall_string = format!("MsiExec.exe /X{GUID}");
+    let shown = build(vec![odd, entry("Fine"), msi]);
+    let flags: Vec<(&str, bool)> = shown.iter().map(|r| (r.name.as_str(), r.can_uninstall)).collect();
+    assert_eq!(flags, [("Fine", true), ("Msi", true), ("Odd", false)]);
+}
+
+#[test]
 fn a_failed_icon_is_remembered_as_none() {
     let cache = IconCache::default();
     let mut calls = 0;
@@ -723,7 +879,7 @@ fn real_app_list() {
     let guessed: Vec<&AppRow> = warm_rows.iter().filter(|r| r.folder_guessed).collect();
     let no_icon = warm_rows.iter().filter(|r| r.icon.is_none()).count();
     let running = warm_rows.iter().filter(|r| r.running).count();
-    let cant_start: Vec<&AppRow> = warm_rows.iter().filter(|r| r.note.as_deref().is_some_and(|n| n.contains(CANT_START_NOTE))).collect();
+    let cant_start: Vec<&AppRow> = warm_rows.iter().filter(|r| !r.can_uninstall).collect();
     let seek = warm_rows.iter().any(|r| r.name.trim().eq_ignore_ascii_case("seek"));
     let mut out = String::new();
     let _ = writeln!(out, "apps listed: {}", warm_rows.len());

@@ -118,9 +118,12 @@ const AppItem = memo(function AppItem({
           </button>
           <span className="app-slot">
             {selected ? (
-              <button className="btn app-uninstall" onClick={() => onUninstall(app)}>
-                Uninstall…
-              </button>
+              <>
+                {!app.canUninstall && <span className="app-note app-cant">Seek can't start this app's uninstaller.</span>}
+                <button className="btn app-uninstall" disabled={!app.canUninstall} onClick={() => onUninstall(app)}>
+                  Uninstall…
+                </button>
+              </>
             ) : (
               <span className="app-date tnum">{app.installDate ? dateOf(app.installDate) : ""}</span>
             )}

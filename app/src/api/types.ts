@@ -229,6 +229,8 @@ export interface AppRow {
   folder: string | null;
   /** True when the folder did not come from the app's InstallLocation: Seek's best guess. */
   folderGuessed: boolean;
+  /** False when Seek can't tell what to run to uninstall this app. */
+  canUninstall: boolean;
   note: string | null;
   running: boolean;
 }
