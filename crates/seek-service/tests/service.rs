@@ -74,6 +74,8 @@ struct Fake {
     profiles: Mutex<Vec<(String, String)>>,
     /// See `entries_sized`.
     size_mod: Mutex<u64>,
+    /// (file id, size) pairs applied on top of `size_mod`.
+    size_of: Mutex<Vec<(u64, u64)>>,
 }
 
 const ME: &str = "S-1-5-21-me";
@@ -90,7 +92,13 @@ impl VolumeSource for Fake {
         *self.scans.lock().unwrap() += 1;
         progress(ENTRIES);
         Ok(ScanResult {
-            index: DeviceIndex::from_raw(0, entries_sized(*self.size_mod.lock().unwrap())),
+            index: DeviceIndex::from_raw(0, {
+                let mut e = entries_sized(*self.size_mod.lock().unwrap());
+                for &(id, size) in self.size_of.lock().unwrap().iter() {
+                    e[id as usize - 1].size = size;
+                }
+                e
+            }),
             checkpoint: None,
             skipped: 0,
         })
@@ -1103,6 +1111,10 @@ async fn same_size_files_pages_through_every_group() {
     }
     assert_eq!(all[0].files[0].full_path, r"T:\folder10\file99.txt");
 
+    // an enormous limit is capped by the server (far above this data, so everything fits one page)
+    let (page, next) = same_size(&mut c, &[id], 1, None, u32::MAX).await;
+    assert_eq!((page.len(), next), (99, None));
+
     // a group alone can be bigger than the limit: one group per page then
     let one = same_size_all(&mut c, &[id], 1, 1).await;
     assert_eq!(one, all);
@@ -1179,6 +1191,34 @@ async fn same_size_files_hides_other_users_rows() {
     let all = same_size_all(&mut admin, &[id], 1, 1000).await;
     assert_eq!(all.len(), 99);
     assert_eq!(all.iter().map(|g| g.files.len()).sum::<usize>(), SAME_SIZE_FILES);
+
+    let _ = svc.stop.send(true);
+    svc.task.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn same_size_with_one_visible_and_one_hidden_file_is_not_a_group() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = Arc::new(Fake::default());
+    // file11 is in folder2 (hidden from me), file12 in folder3: size 7777 has one visible file only
+    *fake.size_of.lock().unwrap() = vec![(11, 7777), (12, 7777), (13, 7000), (14, 7000), (15, 8000), (16, 8000)];
+    fake.vols.lock().unwrap().push(volume());
+    *fake.profiles.lock().unwrap() = vec![(ME.into(), r"T:\folder1".into()), ("S-1-5-21-bob".into(), r"T:\FOLDER2\".into())];
+    let svc = start(dir.path(), fake.clone()).await;
+    let mut c = connect(&svc.pipe).await;
+    wait_for(&mut c, "device scanned", scanned_online).await;
+    let id = device_id(&mut c).await;
+
+    let sizes = |g: &[seek_ipc::SizeGroup]| g.iter().map(|g| g.size).collect::<Vec<_>>();
+    // one group per page: the 7777 gap in the middle must not end the walk early
+    assert_eq!(sizes(&same_size_all(&mut c, &[id], 1, 2).await), [8000, 7000]);
+    assert_eq!(sizes(&same_size_all(&mut c, &[id], 1, 1000).await), [8000, 7000]);
+    let (page, next) = same_size(&mut c, &[id], 1, None, 2).await;
+    assert_eq!((sizes(&page), next), (vec![8000], Some(7000)));
+
+    *fake.elevated.lock().unwrap() = true;
+    let mut admin = connect(&svc.pipe).await;
+    assert_eq!(sizes(&same_size_all(&mut admin, &[id], 1, 2).await), [8000, 7777, 7000]);
 
     let _ = svc.stop.send(true);
     svc.task.await.unwrap().unwrap();

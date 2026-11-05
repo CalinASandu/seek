@@ -26,6 +26,8 @@ const MAX_ROWS_PER_FETCH: u32 = 500;
 const KEPT_SEARCHES: usize = 2;
 const MAX_SPACE_DEPTH: u8 = 8;
 const MAX_SPACE_FILES: u32 = 1000;
+/// Most files in one same-size page (every page scans the whole index, so pages must be big).
+const MAX_SAME_SIZE_FILES_PER_PAGE: u32 = 20_000;
 const FOLDER_GONE: &str = "That folder no longer exists";
 
 struct StoredSearch {
@@ -529,6 +531,26 @@ async fn space(
     .unwrap_or_else(|e| err(format!("space view failed: {e}")))
 }
 
+/// The first requested drive that exists (is in `visible`) but has no loaded index.
+fn first_unloaded(requested: &[DeviceId], visible: &[DeviceId], loaded: &[DeviceId]) -> Option<DeviceId> {
+    requested.iter().copied().find(|id| visible.contains(id) && !loaded.contains(id))
+}
+
+/// How many of the leading `(size, files)` groups make one page: whole groups only, up to
+/// `MAX_SAME_SIZE_FILES_PER_PAGE` or `limit` files (the smaller), and always at least one group.
+fn groups_in_page(sizes: &[(u64, u64)], limit: u32) -> usize {
+    let max_files = u64::from(limit.min(MAX_SAME_SIZE_FILES_PER_PAGE));
+    let (mut taken, mut files) = (0, 0u64);
+    for &(_, n) in sizes {
+        if taken > 0 && files + n > max_files {
+            break;
+        }
+        taken += 1;
+        files += n;
+    }
+    taken
+}
+
 /// One page of files that share a size across `device_ids` (first stage of the duplicate finder). Reads the
 /// index only and keeps nothing between pages: each call recomputes from the cursor, so an index change
 /// between pages can shift results, but every page's sizes are strictly below the previous page's.
@@ -545,7 +567,15 @@ async fn same_size_files(
     }
     tokio::task::spawn_blocking(move || {
         let mut snap = state.snapshot("same size");
-        // unknown ids simply match nothing; the order is stable whatever the snapshot's order
+        // ids that are no drive at all are skipped, but a drive whose index did not load is an error:
+        // an empty answer would read as "no duplicates"
+        let visible: Vec<DeviceId> = state.visible_devices().iter().map(|d| d.id).collect();
+        let loaded: Vec<DeviceId> = snap.iter().map(|s| s.device.id).collect();
+        if let Some(id) = first_unloaded(&device_ids, &visible, &loaded) {
+            let name = state.device(id).map_or_else(|| "A drive".to_string(), |d| d.display_name);
+            return err(format!("{name} could not be read right now, so its files can't be compared"));
+        }
+        // the order is stable whatever the snapshot's order
         snap.retain(|s| device_ids.contains(&s.device.id));
         snap.sort_by_key(|s| s.device.id);
         let guards: Vec<_> = snap.iter().map(|s| s.index.read().unwrap()).collect();
@@ -572,15 +602,7 @@ async fn same_size_files(
             .collect();
         sizes.sort_unstable_by_key(|&(size, _)| std::cmp::Reverse(size));
 
-        // whole groups, up to about `limit` files, and always at least one
-        let (mut taken, mut files) = (0, 0u64);
-        for &(_, n) in &sizes {
-            if taken > 0 && files + n > u64::from(limit) {
-                break;
-            }
-            taken += 1;
-            files += n;
-        }
+        let taken = groups_in_page(&sizes, limit);
         let next = sizes.get(taken).map(|&(size, _)| size);
         let page: Vec<u64> = sizes[..taken].iter().map(|&(size, _)| size).collect();
         let wanted: HashSet<u64> = page.iter().copied().collect();
@@ -855,5 +877,29 @@ fn status(state: &Arc<State>) -> StatusInfo {
                 done: false,
             })
             .collect(),
+    }
+}
+
+#[cfg(test)]
+mod same_size_tests {
+    use super::*;
+
+    #[test]
+    fn a_page_is_capped_but_never_splits_a_group() {
+        let sizes = [(9, 9_000), (8, 9_000), (7, 9_000)];
+        assert_eq!(groups_in_page(&sizes, u32::MAX), 2, "18000 fits the cap, 27000 does not");
+        assert_eq!(groups_in_page(&sizes, 9_000), 1);
+        assert_eq!(groups_in_page(&sizes, 0), 1, "always one group");
+        assert_eq!(groups_in_page(&[(5, 30_000), (4, 2)], u32::MAX), 1, "one group may exceed the cap");
+        assert_eq!(groups_in_page(&[], 10), 0);
+    }
+
+    #[test]
+    fn a_known_drive_without_an_index_is_reported_not_skipped() {
+        let (a, b, c) = (uuid::Uuid::from_u128(1), uuid::Uuid::from_u128(2), uuid::Uuid::from_u128(3));
+        // c is not a drive at all: skipped; b is a drive whose index did not load
+        assert_eq!(first_unloaded(&[a, b, c], &[a, b], &[a]), Some(b));
+        assert_eq!(first_unloaded(&[a, c], &[a, b], &[a]), None);
+        assert_eq!(first_unloaded(&[], &[a], &[]), None);
     }
 }
