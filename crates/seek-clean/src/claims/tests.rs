@@ -95,7 +95,7 @@ fn version_and_architecture_words_are_ignored() {
     assert!(whole_words_match("Foo", "Foo (x64 en-US)"));
     assert!(whole_words_match("Foo Bar", "Foo Bar x86"));
     assert!(whole_words_match("Foo", "Foo 64-bit"));
-    assert!(!whole_words_match("Foo 2", "Foo 2"), "a folder name is not trimmed, so only the app name loses its version");
+    assert!(whole_words_match("Foo 2", "Foo 2"), "an exact name matches even if it ends in a number");
 }
 
 #[test]
@@ -310,6 +310,169 @@ fn a_claim_above_a_leftover_subfolder_claims_it() {
     e.install_location = r"C:\Program Files\Foo".into();
     add_uninstall_entry(&mut p, &e, &env);
     assert!(claimed(p, r"C:\Program Files\Foo\Cache").is_some());
+}
+
+#[test]
+fn exact_names_with_a_version_word_match() {
+    assert!(whole_words_match("Cubase 13", "Cubase 13"));
+    assert!(whole_words_match("Visual Studio 2019", "Visual Studio 2019"));
+    assert!(whole_words_match("Visual Studio", "Visual Studio 2019"));
+    assert!(!whole_words_match("Cubase 12", "Cubase 13"));
+}
+
+#[test]
+fn windows_own_folders_are_in_the_table() {
+    let c = SystemClaims::from_parts(parts());
+    for n in [
+        ".IdentityService", "VirtualStore", "PlaceholderTileLogoFolder", "PeerDistRepub", "ToastNotificationManagerCompat",
+        "Windows Kits", "Windows Sidebar", "Windows Multimedia Platform", "Windows Mail", "Windows Media Player",
+        "Windows Photo Viewer", "Windows Security", "Uninstall Information", "wsl", "ASP.NET",
+    ] {
+        assert!(c.is_claimed(Path::new(&format!(r"C:\Users\me\AppData\Local\{n}"))).is_some(), "{n}");
+    }
+    for vendor in ["AMD", "NVIDIA", "Google", "Adobe"] {
+        assert!(c.is_claimed(Path::new(&format!(r"C:\Users\me\AppData\Local\{vendor}"))).is_none(), "{vendor}");
+    }
+}
+
+#[test]
+fn short_names_are_expanded_only_on_fixed_drives() {
+    let kind = |l: char| match l {
+        'C' | 'c' => 3,
+        'Z' | 'z' => 4, // a network drive
+        _ => 0,
+    };
+    assert!(should_expand_short_names(r"C:\PROGRA~1\App\u.exe", &mut |l| kind(l)));
+    assert!(should_expand_short_names(r"c:\progra~1", &mut |l| kind(l)));
+    assert!(!should_expand_short_names(r"Z:\PROGRA~1\App\u.exe", &mut |l| kind(l)));
+    assert!(!should_expand_short_names(r"\\server\share\PROGRA~1", &mut |l| kind(l)));
+    assert!(!should_expand_short_names(r"C:\Program Files\App", &mut |_| panic!("no short name, no disk question")));
+    // And a claim is compared as written without touching the disk.
+    let mut p = parts();
+    add_process(&mut p, r"Z:\PROGRA~1\App\u.exe");
+    let c = SystemClaims::from_parts(p);
+    assert!(c.is_claimed(Path::new(r"Z:\PROGRA~1\App")).is_some());
+}
+
+#[test]
+fn a_program_extension_inside_a_folder_name_still_claims_the_real_folder() {
+    let got = command_paths(r"C:\Program Files\Booking.com Helper\h.exe /s", &env);
+    assert_eq!(got, vec![r"C:\Program Files\Booking.com", r"C:\Program Files\Booking.com Helper\h.exe"]);
+    let mut p = parts();
+    add_service(&mut p, "Booking", r"C:\Program Files\Booking.com Helper\h.exe /s", &env);
+    assert!(claimed(p, r"C:\Program Files\Booking.com Helper").is_some());
+}
+
+#[test]
+fn a_later_program_after_an_argument_is_not_glued_on() {
+    assert_eq!(
+        command_paths(r"C:\a\u.exe /x C:\b c\v.exe", &env),
+        vec![r"C:\a\u.exe", r"C:\b c\v.exe"]
+    );
+}
+
+#[test]
+fn no_link_opening_counts_as_a_failed_source() {
+    assert!(every_link_failed(&[false, false]));
+    assert!(!every_link_failed(&[false, true]));
+    assert!(!every_link_failed(&[]), "no shortcuts at all is not a failure");
+}
+
+#[test]
+fn a_running_program_claims_its_folder_but_not_a_broad_place() {
+    let mut p = parts();
+    add_process(&mut p, r"C:\Program Files\Foo\foo.exe");
+    add_process(&mut p, r"C:\Windows\explorer.exe");
+    let c = SystemClaims::from_parts(p);
+    assert!(c.is_claimed(Path::new(r"C:\Program Files\Foo\Cache")).is_some());
+    assert!(c.is_claimed(Path::new(r"C:\Program Files\Foo")).is_some());
+    assert!(c.is_claimed(Path::new(r"C:\Windows\Anything")).is_none());
+    assert!(c.is_claimed(Path::new(r"C:\Program Files\Other")).is_none());
+}
+
+#[test]
+fn awkward_command_lines_give_exact_claims() {
+    assert_eq!(
+        command_paths(r"C:\Program Files\App Name\u.exe /x C:\Other\", &env),
+        vec![r"C:\Program Files\App Name\u.exe", r"C:\Other"]
+    );
+    assert_eq!(
+        command_paths(r#""C:\Setup\setup.exe" /D=C:\Program Files"#, &env),
+        vec![r"C:\Setup\setup.exe", r"C:\Program Files"]
+    );
+    assert_eq!(command_paths(r#""C:\Program Files\App\" /x"#, &env), vec![r"C:\Program Files\App"]);
+    assert_eq!(command_paths(r"rundll32.exe C:\a\b.dll,Uninstall", &env), vec![r"C:\a\b.dll"]);
+    assert_eq!(command_paths(r"%NOPE%\App\u.exe", &env), Vec::<String>::new());
+    assert_eq!(command_paths(r"C:\%NOPE%\u.exe", &env), vec![r"C:\%NOPE%\u.exe"]);
+}
+
+#[test]
+fn live_claims_says_it_could_not_check_when_a_source_fails() {
+    let live = LiveClaims::with_readers(
+        Box::new(|| {
+            let mut p = parts();
+            p.failed.push("the HKLM 64-bit uninstall list".into());
+            SystemClaims::from_parts(p)
+        }),
+        Duration::from_secs(30),
+        Box::new(|| SystemClaims::from_parts(parts())),
+        Duration::from_secs(2),
+        Box::new(|| Duration::ZERO),
+    );
+    let who = live.is_claimed(Path::new(r"C:\Users\me\AppData\Local\Anything")).expect("fails closed");
+    assert!(who.starts_with("Couldn't check") && who.contains("uninstall list"), "{who}");
+}
+
+#[test]
+fn the_read_time_is_when_the_read_finished() {
+    let now_ms = Arc::new(AtomicU64::new(0));
+    let reads = Arc::new(AtomicUsize::new(0));
+    let (n, r) = (now_ms.clone(), reads.clone());
+    let live = LiveClaims::with_readers(
+        Box::new(|| SystemClaims::from_parts(parts())),
+        Duration::from_secs(30),
+        Box::new(move || {
+            r.fetch_add(1, Ordering::SeqCst);
+            n.fetch_add(5000, Ordering::SeqCst); // a slow read
+            SystemClaims::from_parts(parts())
+        }),
+        Duration::from_secs(2),
+        Box::new({
+            let n = now_ms.clone();
+            move || Duration::from_millis(n.load(Ordering::SeqCst))
+        }),
+    );
+    let f = Path::new(r"C:\Users\me\AppData\Local\X");
+    live.is_claimed(f);
+    now_ms.fetch_add(1000, Ordering::SeqCst);
+    live.is_claimed(f);
+    assert_eq!(reads.load(Ordering::SeqCst), 1, "the snapshot was one second old, not six");
+}
+
+#[test]
+fn an_installed_programs_exe_name_claims_its_data_folder() {
+    let mut p = parts();
+    add_shortcut(&mut p, "Visual Studio Code", r"C:\Users\me\AppData\Local\Programs\Microsoft VS Code\Code.exe", &env);
+    add_app_path(&mut p, "ollama app.exe", r"C:\Users\me\AppData\Local\Programs\Ollama\ollama app.exe", "", &env);
+    add_process(&mut p, r"C:\Program Files\AnyDesk\AnyDesk.exe");
+    let c = SystemClaims::from_parts(p);
+    let who = c.is_claimed(Path::new(r"C:\Users\me\AppData\Roaming\Code")).expect("claimed");
+    assert!(who.contains("Code.exe"), "{who}");
+    assert!(c.is_claimed(Path::new(r"C:\Users\me\AppData\Local\ollama app")).is_some());
+    assert!(c.is_claimed(Path::new(r"C:\Users\me\AppData\Roaming\ANYDESK")).is_some());
+    assert!(c.is_claimed(Path::new(r"C:\Users\me\AppData\Roaming\Cod")).is_none());
+}
+
+#[test]
+fn a_generic_exe_name_claims_nothing() {
+    let mut p = parts();
+    for exe in ["Setup", "unins000", "Updater", "Launcher", "Helper", "Uninstall", "app", "run", "start", "main", "service", "install", "update", "uninst"] {
+        add_shortcut(&mut p, "X", &format!(r"C:\Program Files\X\{exe}.exe"), &env);
+    }
+    let c = SystemClaims::from_parts(p);
+    for n in ["Setup", "unins000", "Updater", "Launcher", "Helper", "Uninstall", "app", "run", "start", "main", "service", "install", "update", "uninst"] {
+        assert!(c.is_claimed(Path::new(&format!(r"C:\Users\me\AppData\Roaming\{n}"))).is_none(), "{n}");
+    }
 }
 
 struct Harness {
