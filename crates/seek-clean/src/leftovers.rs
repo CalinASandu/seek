@@ -34,9 +34,24 @@ const GENERIC_NAMES: &[&str] = &[
     "data", "common", "shared", "bin", "config", "cache", "logs", "tools", "plugins", "settings", "resources", "updates",
 ];
 
-/// What one walk of a folder found. Totals and a few names, nothing per file.
+/// Where the facts of many folders can come from without walking the disk (Seek's own index).
+/// One call for all the candidates; `None` for a folder it doesn't know, which is then walked.
+pub trait IndexFacts: Sync {
+    fn summaries(&self, folders: &[PathBuf]) -> Vec<Option<Summary>>;
+}
+
+/// No index to ask: every folder is walked.
+pub struct NoIndex;
+
+impl IndexFacts for NoIndex {
+    fn summaries(&self, folders: &[PathBuf]) -> Vec<Option<Summary>> {
+        vec![None; folders.len()]
+    }
+}
+
+/// What is known of a folder: from the index or from one walk. Totals and a few names, nothing per file.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct Summary {
+pub struct Summary {
     pub size: u64,
     pub files: u64,
     /// Newest modification of anything inside, folders and links included. 0 if nothing is inside.
@@ -49,6 +64,8 @@ pub(crate) struct Summary {
     pub programs: bool,
     /// The first names directly inside, in alphabetical order.
     pub top: Vec<String>,
+    /// Something online-only is inside: the folder is left out, never judged.
+    pub cloud: bool,
 }
 
 /// What an entry is, from its attributes alone.
@@ -90,7 +107,7 @@ fn keep_name(top: &mut Vec<String>, name: String) {
 
 /// Walks `root` on this thread, reading metadata only. `None` if anything in it can't be read,
 /// vanishes, or is a cloud placeholder: that folder is then left out of the list.
-pub(crate) fn walk(root: &Path) -> Option<Summary> {
+pub fn walk(root: &Path) -> Option<Summary> {
     let mut s = Summary::default();
     let mut stack = vec![(root.to_path_buf(), true)];
     while let Some((dir, top)) = stack.pop() {
@@ -210,12 +227,21 @@ pub(crate) fn scan_with(
     claims: &dyn ClaimCheck,
     installed: &InstalledNames,
     now_ms: i64,
+    index: &dyn IndexFacts,
     walker: &dyn Fn(&Path) -> Option<Summary>,
 ) -> Counted {
     let mut scored: Vec<(i32, LeftoverRow)> = Vec::new();
     let mut left_out = 0;
-    for c in candidates(places, claims) {
-        let Some(s) = walker(&c.path) else {
+    let cands = candidates(places, claims);
+    let paths: Vec<PathBuf> = cands.iter().map(|c| c.path.clone()).collect();
+    let mut known = index.summaries(&paths);
+    known.resize(cands.len(), None);
+    for (c, from_index) in cands.into_iter().zip(known) {
+        let found = match from_index {
+            Some(s) => Some(s).filter(|s| !s.cloud),
+            None => walker(&c.path),
+        };
+        let Some(s) = found else {
             left_out += 1;
             continue;
         };
@@ -240,11 +266,18 @@ pub(crate) fn scan_with(
     Counted { rows: scored.into_iter().map(|(_, r)| r).collect(), left_out }
 }
 
-/// Lists the leftover candidates of this PC. Reads the disk's metadata and nothing else; the
-/// caller decides what to do with the rows. `facts` is not asked anything: it has no way to list
-/// a folder, and the walk needs more than a `Stat` holds (programs, subfolders, names).
-pub fn scan(places: &Places, claims: &dyn ClaimCheck, installed: &InstalledNames, _facts: &dyn FileFacts) -> Vec<LeftoverRow> {
-    scan_with(places, claims, installed, unix_now_ms(), &walk).rows
+/// Lists the leftover candidates of this PC. Folder facts come from `index` where it knows the
+/// folder (Seek's own index, one question for all of them) and from one metadata walk where it
+/// doesn't. Reads only; the caller decides what to do with the rows. `facts` is not asked
+/// anything: it has no way to list a folder.
+pub fn scan(
+    places: &Places,
+    claims: &dyn ClaimCheck,
+    installed: &InstalledNames,
+    _facts: &dyn FileFacts,
+    index: &dyn IndexFacts,
+) -> Vec<LeftoverRow> {
+    scan_with(places, claims, installed, unix_now_ms(), index, &walk).rows
 }
 
 #[cfg(test)]

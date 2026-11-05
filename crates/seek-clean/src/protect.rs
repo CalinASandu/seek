@@ -114,6 +114,12 @@ impl Places {
             .any(|p| !p.is_empty() && is_inside(p, canon_path))
     }
 
+    /// Tests only: one more folder whose top-level folders count as leftover candidates.
+    pub fn with_scan_root_for_tests(mut self, root: &str) -> Places {
+        self.scan_roots.push(PathBuf::from(root));
+        self
+    }
+
     /// Fixed places for tests. Paths are put through `canon`.
     pub fn for_tests(
         windows: &str,
@@ -174,6 +180,39 @@ pub fn lock_for(
         return Some(Lock::Protected);
     }
     None
+}
+
+/// The extra rules for what may be a leftover folder or a stale file of Seek's: a leftover is a
+/// direct child of a scan root that the scan would list; stale data is one of Seek's own index or
+/// journal files. Anything else is `UnsupportedPath`. Judged on the path as written.
+pub fn candidate_lock(places: &Places, canon_path: &str, why: Why) -> Option<Lock> {
+    let ok = match why {
+        Why::Leftover => is_scan_root_child(places, canon_path) && !never_listed(places, canon_path),
+        Why::StaleData => is_seek_data_file(places, canon_path),
+        Why::Duplicate | Why::Uninstall => true,
+    };
+    (!ok).then_some(Lock::UnsupportedPath)
+}
+
+/// True if `p` (in `canon` form) is a direct child of one of the leftover scan roots.
+fn is_scan_root_child(places: &Places, p: &str) -> bool {
+    places.scan_roots.iter().any(|r| {
+        let r = canon(r);
+        let r = r.trim_end_matches('\\');
+        p.len() > r.len() + 1 && p.starts_with(r) && p.as_bytes()[r.len()] == b'\\' && !p[r.len() + 1..].contains('\\')
+    })
+}
+
+/// True if `p` (in `canon` form) is one of Seek's own index or journal files: directly in
+/// `<ProgramData>\Seek\indexes` as `.seekidx`, or in `<ProgramData>\Seek\journal` as `.log`.
+fn is_seek_data_file(places: &Places, p: &str) -> bool {
+    if places.program_data.is_empty() {
+        return false;
+    }
+    [("indexes", ".seekidx"), ("journal", ".log")].iter().any(|(dir, ext)| {
+        let prefix = format!("{}\\seek\\{dir}\\", places.program_data.trim_end_matches('\\'));
+        p.strip_prefix(&prefix).is_some_and(|name| name.len() > ext.len() && name.ends_with(ext) && !name.contains('\\'))
+    })
 }
 
 /// Leftover scans never list these at all.

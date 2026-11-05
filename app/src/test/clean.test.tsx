@@ -421,6 +421,15 @@ describe("Leftovers and the meter", () => {
     expect(within(tip).getByText("−4")).toBeInTheDocument();
   });
 
+  it("describes a stale Seek file by what it is, never as empty", async () => {
+    const user = await openClean();
+    await toLeftovers(user);
+    const row = screen.getByText(/5e1f0a52.*.seekidx/).closest("li")!;
+    await user.click(within(row).getByRole("button", { name: /5e1f0a52/ }));
+    expect(within(row).getByText("Seek's index for a drive it no longer knows")).toBeInTheDocument();
+    expect(within(row).queryByText("Empty.")).toBeNull();
+  });
+
   it("starts 'Probably still in use' collapsed under its own heading", async () => {
     const user = await openClean();
     await toLeftovers(user);

@@ -347,9 +347,25 @@ const LEFTOVER_DEFS: LeftDef[] = [
   },
 ];
 
+/** Seek's own index for a drive it no longer knows, as the service reports it. */
+const STALE_INDEX_LINE = "Seek's index for a drive it no longer knows";
+
+function staleRow(now: number): LeftoverRow {
+  return {
+    path: "C:\\ProgramData\\Seek\\indexes\\5e1f0a52-7c3b-4d0e-9a41-0d3a2f7b9c66.seekidx",
+    parent: "C:\\ProgramData\\Seek\\indexes",
+    size: 48 * MB,
+    modified: now - 200 * DAY,
+    needsAdmin: true,
+    level: "veryLikely",
+    reasons: [{ text: "No drive Seek knows about uses this file", points: 5 }],
+    contents: [STALE_INDEX_LINE],
+  };
+}
+
 function buildLeftovers(scenario: CleanScenario, now: number): LeftoverRow[] {
   if (scenario === "empty") return [];
-  return LEFTOVER_DEFS.map((d) => leftoverRow(d, now));
+  return [...LEFTOVER_DEFS.map((d) => leftoverRow(d, now)), staleRow(now)];
 }
 
 /** What an app might leave behind once its own uninstaller is done. Nothing in here is what the uninstaller removes. */

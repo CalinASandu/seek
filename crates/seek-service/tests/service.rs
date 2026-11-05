@@ -1315,3 +1315,68 @@ async fn same_size_counts_across_two_drives() {
     let _ = svc.stop.send(true);
     svc.task.await.unwrap().unwrap();
 }
+
+async fn folder_facts(c: &mut Client, paths: &[&str]) -> Vec<Option<seek_core::FolderFact>> {
+    let paths = paths.iter().map(|p| p.to_string()).collect();
+    match c.request(Request::FolderFacts { paths }).await.unwrap() {
+        Response::FolderFacts { facts } => facts,
+        other => panic!("expected FolderFacts, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn folder_facts_reports_totals_and_hides_other_users_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = Arc::new(Fake::default());
+    fake.vols.lock().unwrap().push(volume());
+    *fake.profiles.lock().unwrap() = vec![(ME.into(), r"T:\folder1".into()), ("S-1-5-21-bob".into(), r"T:\FOLDER2\".into())];
+    let svc = start(dir.path(), fake.clone()).await;
+    let mut c = connect(&svc.pipe).await;
+    wait_for(&mut c, "device scanned", scanned_online).await;
+
+    // folder1 holds files 20, 30, ... 1000 (ids ending in 0); folder2 holds the ids ending in 1.
+    let paths = [r"T:\folder1", r"t:\FOLDER1\", r"T:\folder2", r"T:\nothing", r"D:\folder1"];
+    let f = folder_facts(&mut c, &paths).await;
+    assert_eq!(f.len(), paths.len(), "one answer per path, in order");
+    let one = f[0].as_ref().expect("folder1");
+    assert_eq!((one.files, one.size), (99, (20..=1000).step_by(10).sum::<u64>()));
+    assert!(one.has_files && !one.has_subfolders && !one.has_programs && !one.has_link && !one.has_cloud);
+    assert_eq!(one.newest_modified, 1_700_000_000_000);
+    assert_eq!(one.top_names.len(), 6);
+    assert!(one.top_names.windows(2).all(|w| w[0].to_lowercase() <= w[1].to_lowercase()), "{:?}", one.top_names);
+    assert_eq!(f[1], f[0], "case and a trailing backslash do not matter");
+    assert_eq!(f[2], None, "another user's folder is not found");
+    assert_eq!(f[3], None, "not in the index");
+    assert_eq!(f[4], None, "not on a drive of this PC");
+
+    *fake.elevated.lock().unwrap() = true;
+    let mut admin = connect(&svc.pipe).await;
+    let f = folder_facts(&mut admin, &[r"T:\folder2"]).await;
+    let two = f[0].as_ref().expect("folder2 for an admin");
+    assert_eq!((two.files, two.size), (99, (11..=991).step_by(10).sum::<u64>()));
+
+    let _ = svc.stop.send(true);
+    svc.task.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stale_data_knows_a_live_id_spelled_in_upper_case_or_braces() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = Arc::new(Fake::default());
+    fake.vols.lock().unwrap().push(volume());
+    let svc = start(dir.path(), fake.clone()).await;
+    let mut c = connect(&svc.pipe).await;
+    wait_for(&mut c, "device scanned", scanned_online).await;
+    let live = device_id(&mut c).await;
+    let (indexes, journal) = (dir.path().join("indexes"), dir.path().join("journal"));
+    std::fs::write(indexes.join(format!("{}.seekidx", live.to_string().to_uppercase())), b"live").unwrap();
+    std::fs::write(journal.join(format!("{{{live}}}.log")), b"live").unwrap();
+    let unknown = uuid::Uuid::new_v4();
+    std::fs::write(indexes.join(format!("{{{}}}.seekidx", unknown.to_string().to_uppercase())), b"stale").unwrap();
+    let files = stale_files(&mut c).await;
+    assert_eq!(files.len(), 1, "{files:?}");
+    assert!(files[0].path.to_uppercase().contains(&unknown.to_string().to_uppercase()));
+
+    let _ = svc.stop.send(true);
+    svc.task.await.unwrap().unwrap();
+}

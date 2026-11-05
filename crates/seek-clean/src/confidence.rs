@@ -53,7 +53,7 @@ pub const POINTS: &[(Evidence, i32, &str)] = &[
     (Evidence::Depth, -2, "Sits one level below the top"),
     (Evidence::SimilarInstalledApp, -2, "Another installed app has a similar name"),
     (Evidence::Empty, 4, "Empty, or nothing left but empty folders"),
-    (Evidence::NoSubfolders, 2, "Has no subfolders"),
+    (Evidence::NoSubfolders, 1, "Has no subfolders"),
     (Evidence::Stale, 2, "Nothing inside changed for a year"),
     (Evidence::GenericName, -3, "Generic folder name"),
     (Evidence::ContainsPrograms, -4, "Contains programs (.exe, .dll)"),
@@ -80,11 +80,17 @@ fn row(ev: Evidence) -> (i32, &'static str) {
         .expect("every Evidence variant has a row in POINTS")
 }
 
+/// Levels of depth that count (the spec: at most 2).
+pub const MAX_DEPTH: usize = 2;
+
 /// The total, its level, and one reason per piece of evidence (a repeated piece, such as
 /// `Depth`, is repeated), the strongest first. Equal strength keeps the order given.
 pub fn score(ev: &[Evidence]) -> (i32, Level, Vec<Reason>) {
+    let mut depth = 0;
     let mut reasons: Vec<Reason> = ev
         .iter()
+        // At most `MAX_DEPTH` levels of depth count, however many are given.
+        .filter(|e| **e != Evidence::Depth || { depth += 1; depth <= MAX_DEPTH })
         .map(|e| {
             let (points, text) = row(*e);
             Reason { text: text.to_string(), points }
@@ -164,7 +170,7 @@ mod tests {
             (Evidence::Depth, -2),
             (Evidence::SimilarInstalledApp, -2),
             (Evidence::Empty, 4),
-            (Evidence::NoSubfolders, 2),
+            (Evidence::NoSubfolders, 1),
             (Evidence::Stale, 2),
             (Evidence::GenericName, -3),
             (Evidence::ContainsPrograms, -4),
@@ -184,6 +190,19 @@ mod tests {
         assert_eq!(total, 2);
         assert_eq!(reasons.len(), 4);
         assert_eq!(score(&[]).0, 0);
+    }
+
+    #[test]
+    fn an_empty_folder_with_no_subfolders_alone_is_very_likely() {
+        assert_eq!(score(&[Evidence::Empty, Evidence::NoSubfolders]).1, Level::VeryLikely);
+        assert_eq!(score(&[Evidence::NoSubfolders]).1, Level::NotSure);
+    }
+
+    #[test]
+    fn depth_counts_at_most_two_levels() {
+        let (total, _, reasons) = score(&[Evidence::Depth, Evidence::Depth, Evidence::Depth]);
+        assert_eq!(total, -4);
+        assert_eq!(reasons.len(), 2);
     }
 
     #[test]
