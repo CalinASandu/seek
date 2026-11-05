@@ -205,6 +205,29 @@ export function SettingsPanel({ settings, version, peers, hub, onChange, onShari
               </button>
             </form>
           </section>
+
+          <section className="setting-group" aria-labelledby="set-prot">
+            <h3 id="set-prot">Protected from Cleanup</h3>
+            <p className="setting-desc">Cleanup never moves these files or folders, or anything inside them.</p>
+            {settings.protectedPaths.length > 0 ? (
+              <ul className="excl-list">
+                {settings.protectedPaths.map((f) => (
+                  <li key={f}>
+                    <span title={f}>{f}</span>
+                    <button
+                      className="icon-btn"
+                      aria-label={`Stop protecting ${f}`}
+                      onClick={() => onChange({ protectedPaths: settings.protectedPaths.filter((x) => x !== f) })}
+                    >
+                      <X size={14} />
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <p className="setting-desc">Nothing is protected yet. In a Cleanup review, choose Always protect on anything you want kept.</p>
+            )}
+          </section>
         </div>
 
         <div className="panel-foot">Seek {version ?? ""} · service connected</div>

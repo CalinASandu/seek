@@ -1,10 +1,11 @@
 import { Segmented } from "./Segmented";
 
-export type View = "search" | "space";
+export type View = "search" | "space" | "clean";
 
 const VIEWS: { id: View; label: string; hint: string }[] = [
   { id: "search", label: "Search", hint: "Find files by name (Ctrl+Shift+S)" },
   { id: "space", label: "Space", hint: "See what fills each drive (Ctrl+Shift+S)" },
+  { id: "clean", label: "Decimator", hint: "Cleans up files (Ctrl+Shift+D)" },
 ];
 
 /** The title bar's switch between the two views. */

@@ -16,6 +16,7 @@ import type {
 } from "./types";
 import { HUB_ERR_WRONG_CODE } from "../lib/pcs";
 import { createMockSpace } from "./mockSpace";
+import { createMockClean, type CleanScenario } from "./mockClean";
 
 export interface MockOptions {
   /** Number of synthetic rows (default 300k). */
@@ -28,6 +29,8 @@ export interface MockOptions {
   simulate?: boolean;
   /** Start linked to a hub (default: the `?hub` URL param). */
   hub?: boolean;
+  /** What the Decimator tab finds: `default`, `empty` or `big` (default: the `?clean=` URL param). */
+  clean?: CleanScenario;
 }
 
 const DAY = 86_400_000; // timestamps are unix epoch milliseconds, like the service
@@ -287,6 +290,7 @@ export function createMockApi(opts: MockOptions = {}): SeekApi {
     startWithWindows: true,
     theme: "system",
     excludeFolders: ["C:\\Windows\\WinSxS", "C:\\$Recycle.Bin"],
+    protectedPaths: [],
   };
   const listeners = new Set<(e: SeekEvent) => void>();
   const emit = (e: SeekEvent) => listeners.forEach((l) => l(e));
@@ -377,7 +381,17 @@ export function createMockApi(opts: MockOptions = {}): SeekApi {
     }
   };
 
+  const urlClean = typeof location !== "undefined" ? new URLSearchParams(location.search).get("clean") : null;
+  const cleanApi = createMockClean({
+    scenario: opts.clean ?? (urlClean === "empty" || urlClean === "big" ? urlClean : "default"),
+    simulate: !!opts.simulate,
+    delay,
+    protectedPaths: () => settings.protectedPaths,
+    now,
+  });
+
   return {
+    ...cleanApi,
     async search(query, sort, descending): Promise<SearchOutcome> {
       await delay();
       const t0 = performance.now();
@@ -499,11 +513,11 @@ export function createMockApi(opts: MockOptions = {}): SeekApi {
     },
     async getSettings() {
       await delay();
-      return { ...settings, excludeFolders: [...settings.excludeFolders] };
+      return { ...settings, excludeFolders: [...settings.excludeFolders], protectedPaths: [...settings.protectedPaths] };
     },
     async setSettings(s) {
       await delay();
-      settings = s;
+      settings = { ...s, protectedPaths: s.protectedPaths ?? [] };
     },
     async startPairing(): Promise<PairingCode> {
       await delay();

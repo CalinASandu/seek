@@ -1,8 +1,10 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import type { SeekApi, SeekEvent } from "./types";
+import type { CleanEvent, SeekApi, SeekEvent } from "./types";
 
 export const EVENT_CHANNEL = "seek://event";
+/** Duplicate-scan events of the Decimator (the Rust side arrives in a later task). */
+export const CLEAN_EVENT_CHANNEL = "seek://clean";
 
 export function createTauriApi(): SeekApi {
   return {
@@ -35,6 +37,33 @@ export function createTauriApi(): SeekApi {
     spaceTree: (deviceId, path, depth) => invoke("space_tree", { deviceId, path, depth }),
     spaceLargest: (deviceId, path, limit) => invoke("space_largest", { deviceId, path, limit }),
     spaceTypes: (deviceId, path) => invoke("space_types", { deviceId, path }),
+    // Decimator: the Rust commands arrive in later tasks. Until then each call rejects ("command not found"),
+    // which the view shows as a plain error; nothing here runs at load.
+    cleanScanStart: (deviceIds) => invoke("clean_scan_start", { deviceIds }),
+    cleanScanCancel: () => invoke("clean_scan_cancel"),
+    cleanScanState: () => invoke("clean_scan_state"),
+    cleanLeftovers: () => invoke("clean_leftovers"),
+    cleanApps: () => invoke("clean_apps"),
+    cleanPrepare: (req) => invoke("clean_prepare", { req }),
+    cleanCommit: (token, ids) => invoke("clean_commit", { token, ids }),
+    cleanHistory: () => invoke("clean_history"),
+    cleanPutBack: (entryIds) => invoke("clean_put_back", { entryIds }),
+    uninstallStart: (appId) => invoke("uninstall_start", { appId }),
+    uninstallState: (appId) => invoke("uninstall_state", { appId }),
+    uninstallLeftovers: (appId) => invoke("uninstall_leftovers", { appId }),
+    openRecycleBin: () => invoke("open_recycle_bin"),
+    onCleanEvent(cb) {
+      let disposed = false;
+      let unlisten: (() => void) | null = null;
+      void listen<CleanEvent>(CLEAN_EVENT_CHANNEL, (e) => cb(e.payload)).then((fn) => {
+        if (disposed) fn();
+        else unlisten = fn;
+      });
+      return () => {
+        disposed = true;
+        unlisten?.();
+      };
+    },
     onEvent(cb) {
       let disposed = false;
       let unlisten: (() => void) | null = null;

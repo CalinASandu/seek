@@ -10,6 +10,7 @@ import { ResultsTable } from "./components/ResultsTable";
 import { SearchBar } from "./components/SearchBar";
 import { ServiceSetup } from "./components/ServiceSetup";
 import { SettingsPanel } from "./components/SettingsPanel";
+import { CleanView } from "./components/clean/CleanView";
 import { SpaceView, type Tab } from "./components/space/SpaceView";
 import { Sidebar } from "./components/Sidebar";
 import { StatusBar } from "./components/StatusBar";
@@ -31,7 +32,8 @@ const NO_SEGS: string[] = [];
 
 function readView(): View {
   try {
-    return localStorage.getItem(VIEW_KEY) === "space" ? "space" : "search";
+    const v = localStorage.getItem(VIEW_KEY);
+    return v === "space" || v === "clean" ? v : "search";
   } catch {
     return "search";
   }
@@ -64,6 +66,8 @@ function Shell() {
   const [view, setViewState] = useState<View>(readView);
   const [spaceTab, setSpaceTab] = useState<Tab>("contents");
   const nav = useSpaceNav();
+  // Decimator: the drive picked in the sidebar narrows Duplicates to it
+  const [cleanDevice, setCleanDevice] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState(false);
   const [showShare, setShowShare] = useState(false);
   const [showLink, setShowLink] = useState(false);
@@ -77,6 +81,23 @@ function Shell() {
   const { devices, status, progress, peers, hub, refresh } = useDevices();
   const remotePc = useMemo(() => remotePcNames(devices, peers), [devices, peers]);
   const { settings, update } = useSettings();
+  const settingsRef = useRef(settings);
+  settingsRef.current = settings;
+  const protectPath = useCallback(
+    (path: string) => {
+      const cur = settingsRef.current.protectedPaths;
+      if (!cur.some((p) => p.toLowerCase() === path.toLowerCase())) update({ protectedPaths: [...cur, path] });
+    },
+    [update],
+  );
+  const scanDeviceIds = useMemo(
+    () => devices.filter((d) => !remotePc.has(d.id) && d.state !== "offline").map((d) => d.id),
+    [devices, remotePc],
+  );
+  const [cleanOpened, setCleanOpened] = useState(view === "clean");
+  useEffect(() => {
+    if (view === "clean") setCleanOpened(true);
+  }, [view]);
   const query = useMemo(() => composeQuery(input), [input]);
   const search = useSearch(query, sort, descending);
 
@@ -140,6 +161,7 @@ function Shell() {
       },
       f5: search.refresh,
       "ctrl+shift+s": () => setView(view === "space" ? "search" : "space"),
+      "ctrl+shift+d": () => setView(view === "clean" ? "search" : "clean"),
       "alt+arrowleft": goBack,
       "alt+arrowright": goForward,
     };
@@ -211,8 +233,10 @@ function Shell() {
         isFilterOn={isFilterOn}
         collapsed={collapsed}
         onCollapse={toggleCollapsed}
-        selectedDevice={view === "space" ? (spaceDrive?.id ?? null) : undefined}
-        onSelectDevice={(d) => d.id !== spaceDrive?.id && nav.openDrive(d.id)}
+        selectedDevice={view === "space" ? (spaceDrive?.id ?? null) : view === "clean" ? cleanDevice : undefined}
+        onSelectDevice={(d) =>
+          view === "clean" ? setCleanDevice((cur) => (cur === d.id ? null : d.id)) : d.id !== spaceDrive?.id && nav.openDrive(d.id)
+        }
         onToggleDevice={(f) => applyFilter(f)}
         onAddShare={() => setShowShare(true)}
         onLinkPc={() => setShowLink(true)}
@@ -220,7 +244,18 @@ function Shell() {
         onChanged={() => void refresh()}
         notify={notify}
       />
-      {view === "space" ? (
+      {cleanOpened && (
+        <CleanView
+          active={view === "clean"}
+          deviceId={cleanDevice}
+          deviceName={devices.find((d) => d.id === cleanDevice)?.displayName ?? null}
+          scanDeviceIds={scanDeviceIds}
+          protectedPaths={settings.protectedPaths}
+          onProtect={protectPath}
+          notify={notify}
+        />
+      )}
+      {view === "clean" ? null : view === "space" ? (
         <main className="main">
           {spaceDrive ? (
             <SpaceView
