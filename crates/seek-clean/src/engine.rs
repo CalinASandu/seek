@@ -3,7 +3,7 @@
 //! Safety rules 1, 3, 4, 5 and 7 live here (see the cleanup design spec). The only way out of
 //! this module is `Recycler::recycle`, which can only fill the Recycle Bin.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -12,37 +12,13 @@ use crate::model::{
     Candidate, CommitResult, ItemOutcome, JobItem, Level, Lock, Outcome, Prepared, Reason,
     ReviewItem, Why,
 };
-use crate::paths::{canon, real_location};
+use crate::paths::{canon, is_inside, real_location, target_location};
 use crate::protect::{lock_for, Places};
+use crate::reasons::*;
+use support::{in_system_store, inside_any, new_token, run_admin, spellings};
 
 /// Tokens that stay valid at once. Older ones are dropped.
 const MAX_TOKENS: usize = 8;
-
-const GONE: &str = "It is no longer there, so nothing was removed.";
-const CHANGED: &str = "This changed after you reviewed it, so it was left in place.";
-const LAST_COPY: &str = "This is the last copy, so it was left in place.";
-const NO_TWIN: &str =
-    "No other copy could be confirmed as identical and unchanged, so it was left in place.";
-const NEEDS_ADMIN: &str = "Windows admin rights are needed for this.";
-const STOPPED: &str = "Removal stopped after an item could not be confirmed in the Recycle Bin, so this was left in place.";
-const DESTROYED: &str = "This is gone, but Windows did not confirm it in the Recycle Bin, so it may have been deleted for good.";
-
-fn lock_reason(l: Lock) -> &'static str {
-    match l {
-        Lock::SystemFolder => "This is part of Windows, so it was left in place.",
-        Lock::ProgramFiles => "This is in Program Files, so it was left in place.",
-        Lock::OtherUser => "This belongs to another user, so it was left in place.",
-        Lock::AppData => "This is in an app data folder, so it was left in place.",
-        Lock::ToolFolder => "This is inside a tool folder (.git, node_modules and the like), so it was left in place.",
-        Lock::NoRecycleBin => "This drive has no Recycle Bin that can hold it, so it was left in place.",
-        Lock::CloudPlaceholder => "This is an online-only cloud file, so it was left in place.",
-        Lock::Protected => "You marked this as always protected, so it was left in place.",
-        Lock::LinkedPc => "This is on a linked PC. Seek only removes files on this PC, so it was left in place.",
-        Lock::UnsupportedPath => "Seek cannot remove this kind of path, so it was left in place.",
-        Lock::ReparsePoint => "This is a link to somewhere else, so it was left in place.",
-        Lock::Claimed => "An app or a running program is using this folder, so it was left in place.",
-    }
-}
 
 /// Everything `prepare` read about one item. `commit` compares the disk with this.
 struct Rec {
@@ -52,7 +28,6 @@ struct Rec {
     stat: Stat,
     file_id: Option<(u32, u64)>,
     group: Option<u32>,
-    needs_admin: bool,
     lock: Option<Lock>,
 }
 
@@ -62,12 +37,66 @@ struct Review {
     recs: BTreeMap<u32, Rec>,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum Shape {
+    File,
+    Dir,
+}
+
 struct Seed {
     path: PathBuf,
     why: Why,
+    shape: Shape,
     group: Option<u32>,
     level: Option<Level>,
     reasons: Vec<Reason>,
+}
+
+/// Per-call state for judging: the user's protected entries (as written and as they really are,
+/// in `canon` form) and the bytes already planned for the Recycle Bin of each drive.
+struct Ctx {
+    prot: Vec<String>,
+    planned: HashMap<String, u64>,
+}
+
+impl Ctx {
+    fn new(user_protected: &[String]) -> Ctx {
+        let mut prot = Vec::new();
+        for p in user_protected {
+            prot.push(canon(Path::new(p)));
+            // A protected link protects what it points at, and its own parents' real spelling.
+            prot.extend(real_location(Path::new(p)));
+            prot.extend(target_location(Path::new(p)));
+        }
+        Ctx {
+            prot,
+            planned: HashMap::new(),
+        }
+    }
+
+    fn plan(&mut self, drive: &str, size: u64) {
+        let t = self.planned.entry(drive.to_string()).or_insert(0);
+        *t = t.saturating_add(size);
+    }
+}
+
+/// What a commit works from.
+struct Plan<'a> {
+    review: &'a Review,
+    sel: &'a BTreeSet<u32>,
+    spell: &'a HashMap<u32, Vec<String>>,
+}
+
+struct Checked<'a> {
+    admin: bool,
+    twin: Option<&'a Rec>,
+    drive: String,
+}
+
+enum Step {
+    Moved(String),
+    Stayed(String),
+    Stop(String),
 }
 
 pub struct Engine {
@@ -77,6 +106,8 @@ pub struct Engine {
     facts: Arc<dyn FileFacts>,
     claims: Arc<dyn ClaimCheck>,
     tokens: Mutex<VecDeque<(String, Review)>>,
+    /// Held for the whole of every `commit`: two commits never judge each other's survivors.
+    serial: Mutex<()>,
 }
 
 impl Engine {
@@ -94,32 +125,32 @@ impl Engine {
             facts,
             claims,
             tokens: Mutex::new(VecDeque::new()),
+            serial: Mutex::new(()),
         }
     }
 
     /// Rule 1: looks at each candidate on disk and returns what the review sheet shows, with a
     /// single-use token. Items that no longer exist are left out. Nothing here is selected.
     pub fn prepare(&self, candidates: Vec<Candidate>, user_protected: &[String]) -> Prepared {
+        let ctx = Ctx::new(user_protected);
         let mut built: Vec<(ReviewItem, Rec)> = Vec::new();
         let mut next_group = 0u32;
+        let seed = |path, why, shape, group, level, reasons| Seed {
+            path,
+            why,
+            shape,
+            group,
+            level,
+            reasons,
+        };
         for cand in candidates {
-            let seed = |path, why, group, level, reasons| Seed {
-                path,
-                why,
-                group,
-                level,
-                reasons,
-            };
             match cand {
                 Candidate::Duplicates { copies } => {
                     let g = next_group;
                     next_group += 1;
                     for p in copies {
-                        self.add(
-                            &mut built,
-                            seed(p, Why::Duplicate, Some(g), None, vec![]),
-                            user_protected,
-                        );
+                        let s = seed(p, Why::Duplicate, Shape::File, Some(g), None, vec![]);
+                        self.add(&mut built, s, &ctx);
                     }
                 }
                 Candidate::Folder {
@@ -130,16 +161,13 @@ impl Engine {
                 } => {
                     self.add(
                         &mut built,
-                        seed(path, why, None, level, reasons),
-                        user_protected,
+                        seed(path, why, Shape::Dir, None, level, reasons),
+                        &ctx,
                     );
                 }
                 Candidate::StaleFile { path } => {
-                    self.add(
-                        &mut built,
-                        seed(path, Why::StaleData, None, None, vec![]),
-                        user_protected,
-                    );
+                    let s = seed(path, Why::StaleData, Shape::File, None, None, vec![]);
+                    self.add(&mut built, s, &ctx);
                 }
                 Candidate::LinkedPc { path } => {
                     built.push(Self::linked_pc(built.len() as u32, path))
@@ -191,20 +219,24 @@ impl Engine {
             stat,
             file_id: None,
             group: None,
-            needs_admin: false,
             lock: Some(Lock::LinkedPc),
         };
         (item, rec)
     }
 
-    fn add(&self, built: &mut Vec<(ReviewItem, Rec)>, seed: Seed, user_protected: &[String]) {
+    fn add(&self, built: &mut Vec<(ReviewItem, Rec)>, seed: Seed, ctx: &Ctx) {
         let Some(stat) = self.facts.stat(&seed.path) else {
             return;
         };
         let id = built.len() as u32;
         let c = canon(&seed.path);
-        let (lock, needs_admin) =
-            self.judge(&seed.path, &c, seed.why, &stat, user_protected, stat.size);
+        let (mut lock, needs_admin, _) = self.judge(&seed.path, &c, seed.why, &stat, ctx);
+        // A folder candidate is a folder with a folder's purpose; a file candidate is a file.
+        let right_kind = stat.is_dir == (seed.shape == Shape::Dir)
+            && (seed.shape == Shape::File || matches!(seed.why, Why::Leftover | Why::Uninstall));
+        if !right_kind {
+            lock = lock.or(Some(Lock::UnsupportedPath));
+        }
         built.push((
             ReviewItem {
                 id,
@@ -227,48 +259,69 @@ impl Engine {
                 why: seed.why,
                 stat,
                 group: seed.group,
-                needs_admin,
                 lock,
             },
         ));
     }
 
-    /// Why this path can't be removed now (if it can't) and whether removing it needs admin.
-    /// Used at `prepare` and again at `commit`. A path is judged under both spellings: as written
-    /// and as it really is on disk (a junction into `C:\Windows` is Windows), the stricter wins.
+    /// Why this path can't be removed now (if it can't), whether removing it needs admin, and its
+    /// drive. Used at `prepare` and again at `commit`. A path is judged under both spellings: as
+    /// written and as it really is on disk (a junction into `C:\Windows` is Windows). A protected
+    /// entry counts when it holds the path or sits inside it.
     fn judge(
         &self,
         path: &Path,
         c: &str,
         why: Why,
         st: &Stat,
-        user_protected: &[String],
-        batch_bytes: u64,
-    ) -> (Option<Lock>, bool) {
+        ctx: &Ctx,
+    ) -> (Option<Lock>, bool, String) {
         let real = real_location(path);
-        let mut lock = lock_for(&self.places, c, why, user_protected);
-        if lock.is_none() {
-            lock = match &real {
-                Some(r) => lock_for(&self.places, r, why, user_protected),
-                None => Some(Lock::UnsupportedPath), // exists but can't be located: fail closed
-            };
+        let spell: Vec<&str> = std::iter::once(c).chain(real.as_deref()).collect();
+        let mut lock = spell
+            .iter()
+            .find_map(|s| lock_for(&self.places, s, why, &ctx.prot));
+        if lock.is_none() && real.is_none() {
+            lock = Some(Lock::UnsupportedPath); // exists but can't be located: fail closed
         }
-        let in_pf = |s: &str| self.places.in_program_files(s);
-        let admin = why == Why::StaleData
-            || (why == Why::Leftover && (in_pf(c) || real.as_deref().is_some_and(in_pf)));
+        if lock.is_none() && st.is_dir && spell.iter().any(|s| self.places.is_or_contains_place(s))
+        {
+            lock = Some(Lock::SystemFolder);
+        }
+        if lock.is_none()
+            && ctx
+                .prot
+                .iter()
+                .any(|p| spell.iter().any(|s| is_inside(p, s)))
+        {
+            lock = Some(Lock::Protected);
+        }
+        let pf = |s: &&str| self.places.in_program_files(s);
+        let admin = why == Why::StaleData || (why == Why::Leftover && spell.iter().any(pf));
         if lock.is_none() && st.cloud {
             lock = Some(Lock::CloudPlaceholder);
         }
         if lock.is_none() && st.reparse {
             lock = Some(Lock::ReparsePoint);
         }
-        if lock.is_none() && st.is_dir && self.claims.is_claimed(path).is_some() {
+        let claimed = |p: &Path| self.claims.is_claimed(p).is_some();
+        if lock.is_none()
+            && st.is_dir
+            && (claimed(path) || real.as_deref().is_some_and(|r| claimed(Path::new(r))))
+        {
             lock = Some(Lock::Claimed);
         }
+        let drive: String = real.as_deref().unwrap_or(c).chars().take(2).collect();
         if lock.is_none() {
-            lock = self.facts.recycle_block(path, batch_bytes);
+            let batch = ctx
+                .planned
+                .get(&drive)
+                .copied()
+                .unwrap_or(0)
+                .saturating_add(st.size);
+            lock = self.facts.recycle_block(path, batch);
         }
-        (lock, admin)
+        (lock, admin, drive)
     }
 
     /// Takes the token out of the store (single use) and returns its review.
@@ -286,6 +339,7 @@ impl Engine {
         ids: &[u32],
         user_protected: &[String],
     ) -> Result<CommitResult, String> {
+        let _serial = self.serial.lock().unwrap_or_else(|e| e.into_inner());
         let review = self
             .take(token)
             .ok_or("This review is no longer valid. Review the items again.")?;
@@ -293,7 +347,30 @@ impl Engine {
         if sel.iter().any(|id| !review.recs.contains_key(id)) {
             return Err("Some of these items were not part of the review.".into());
         }
+        let spell: HashMap<u32, Vec<String>> = sel
+            .iter()
+            .map(|id| (*id, spellings(&review.recs[id].path)))
+            .collect();
+        let dirs: Vec<u32> = sel
+            .iter()
+            .copied()
+            .filter(|i| review.recs[i].stat.is_dir)
+            .collect();
+        let inner: HashSet<u32> = sel
+            .iter()
+            .copied()
+            .filter(|x| {
+                dirs.iter()
+                    .any(|d| d != x && inside_any(&spell[x], &spell[d]))
+            })
+            .collect();
+        let plan = Plan {
+            review: &review,
+            sel: &sel,
+            spell: &spell,
+        };
 
+        let mut ctx = Ctx::new(user_protected);
         let mut out: Vec<ItemOutcome> = Vec::new();
         let mut moved_bytes = 0u64;
         let mut stayed: HashSet<u32> = HashSet::new();
@@ -308,17 +385,20 @@ impl Engine {
                 size: rec.stat.size,
                 outcome,
             };
-            if stopped.is_some() {
-                out.push(mk(Outcome::Left {
-                    reason: STOPPED.into(),
-                }));
-                continue;
-            }
-            let verdict = self.check(&review, &sel, &stayed, id, rec, user_protected, moved_bytes);
-            let outcome = match verdict {
-                Err(reason) => Outcome::Left { reason },
-                Ok(()) if rec.needs_admin => {
-                    if self.elevator.is_some() {
+            let left = |reason: &str| Outcome::Left {
+                reason: reason.into(),
+            };
+            let outcome = if stopped.is_some() {
+                left(STOPPED)
+            } else if inner.contains(&id) {
+                left(NESTED)
+            } else {
+                match self.check(&plan, &stayed, id, &ctx) {
+                    Err(reason) => left(&reason),
+                    // The last look before removal, so the byte comparison above can't have gone stale.
+                    Ok(c) if !self.unchanged(rec) || c.twin.is_some_and(|t| !self.unchanged(t)) => left(CHANGED),
+                    Ok(c) if c.admin && self.elevator.is_some() => {
+                        ctx.plan(&c.drive, rec.stat.size);
                         admin.push(JobItem {
                             id,
                             path: rec.path.to_string_lossy().into_owned(),
@@ -328,41 +408,24 @@ impl Engine {
                         });
                         continue;
                     }
-                    Outcome::Left {
-                        reason: NEEDS_ADMIN.into(),
-                    }
-                }
-                // One path per call, right after its own checks: the gap between checking and
-                // removing stays as small as it can be.
-                Ok(()) => match self
-                    .recycler
-                    .recycle(std::slice::from_ref(&rec.path))
-                    .into_iter()
-                    .next()
-                {
-                    Some(Ok(bin_path)) => {
-                        moved_bytes += rec.stat.size;
-                        Outcome::Moved { bin_path }
-                    }
-                    failure => {
-                        let why = failure
-                            .and_then(Result::err)
-                            .unwrap_or_else(|| "no answer".into());
-                        if std::fs::symlink_metadata(&rec.path).is_ok() {
-                            Outcome::Left { reason: format!("Windows could not move it to the Recycle Bin ({why}), so it was left in place.") }
-                        } else {
-                            // Gone, with no bin location: Windows deleted it for good. Stop everything.
+                    Ok(c) if c.admin => left(NEEDS_ADMIN),
+                    // One path per call, straight after its own last look.
+                    Ok(c) => match self.recycle_step(rec) {
+                        Step::Moved(bin_path) => {
+                            ctx.plan(&c.drive, rec.stat.size);
+                            moved_bytes = moved_bytes.saturating_add(rec.stat.size);
+                            Outcome::Moved { bin_path }
+                        }
+                        Step::Stayed(why) => {
+                            left(&format!("Windows could not move it to the Recycle Bin ({why}), so it was left in place."))
+                        }
+                        Step::Stop(why) => {
                             stopped = Some(format!("{} could not be confirmed in the Recycle Bin ({why}). The rest was left untouched.", rec.path.display()));
-                            out.insert(
-                                0,
-                                mk(Outcome::Left {
-                                    reason: DESTROYED.into(),
-                                }),
-                            );
+                            out.insert(0, mk(left(DESTROYED)));
                             continue;
                         }
-                    }
-                },
+                    },
+                }
             };
             if matches!(outcome, Outcome::Left { .. }) {
                 stayed.insert(id);
@@ -370,8 +433,14 @@ impl Engine {
             out.push(mk(outcome));
         }
 
-        if !admin.is_empty() {
-            self.run_admin(&admin, &mut out, &mut moved_bytes, stopped.is_some());
+        if let Some(e) = self.elevator.as_ref().filter(|_| !admin.is_empty()) {
+            run_admin(
+                e.as_ref(),
+                &admin,
+                &mut out,
+                &mut moved_bytes,
+                stopped.is_some(),
+            );
         }
         Ok(CommitResult {
             items: out,
@@ -380,125 +449,116 @@ impl Engine {
         })
     }
 
-    /// Sends the admin items through the elevator in one call. Every item gets an answer.
-    fn run_admin(
-        &self,
-        jobs: &[JobItem],
-        out: &mut Vec<ItemOutcome>,
-        moved_bytes: &mut u64,
-        stopped: bool,
-    ) {
-        let (answers, why) = match (&self.elevator, stopped) {
-            (Some(e), false) => match e.run(jobs) {
-                Ok(a) => (
-                    a,
-                    "The admin step did not remove this, so it was left in place.".to_string(),
-                ),
-                Err(e) => (
-                    vec![],
-                    format!("The admin step failed ({e}), so this was left in place."),
-                ),
-            },
-            (_, true) => (vec![], STOPPED.to_string()),
-            (None, false) => (vec![], NEEDS_ADMIN.to_string()),
+    /// Recycles one item. If Windows reports failure, the item counts as still there only when it
+    /// is verifiably whole: a file that exists, a folder whose stat equals what review recorded.
+    /// Anything else may have been destroyed, and the caller stops everything.
+    fn recycle_step(&self, rec: &Rec) -> Step {
+        let failure = match self
+            .recycler
+            .recycle(std::slice::from_ref(&rec.path))
+            .into_iter()
+            .next()
+        {
+            Some(Ok(bin_path)) => return Step::Moved(bin_path),
+            other => other
+                .and_then(Result::err)
+                .unwrap_or_else(|| "no answer".into()),
         };
-        for j in jobs {
-            // Only an answer about an item we sent counts; anything else is ignored.
-            let outcome = match answers.iter().find(|a| a.id == j.id) {
-                Some(a) => a.outcome.clone(),
-                None => Outcome::Left {
-                    reason: why.clone(),
-                },
-            };
-            if matches!(outcome, Outcome::Moved { .. }) {
-                *moved_bytes += j.size;
-            }
-            out.push(ItemOutcome {
-                id: j.id,
-                path: j.path.clone(),
-                size: j.size,
-                outcome,
-            });
+        let whole = if rec.stat.is_dir {
+            self.facts.stat(&rec.path).as_ref() == Some(&rec.stat)
+        } else {
+            std::fs::symlink_metadata(&rec.path).is_ok()
+        };
+        if whole {
+            Step::Stayed(failure)
+        } else {
+            Step::Stop(failure)
         }
     }
 
     /// Rule 5 and the rules before it, for one item, reading the disk again.
-    #[allow(clippy::too_many_arguments)]
-    fn check(
+    fn check<'a>(
         &self,
-        review: &Review,
-        sel: &BTreeSet<u32>,
+        plan: &Plan<'a>,
         stayed: &HashSet<u32>,
         id: u32,
-        rec: &Rec,
-        user_protected: &[String],
-        moved_bytes: u64,
-    ) -> Result<(), String> {
+        ctx: &Ctx,
+    ) -> Result<Checked<'a>, String> {
+        let rec: &'a Rec = &plan.review.recs[&id];
         if let Some(l) = rec.lock {
             return Err(lock_reason(l).into());
         }
         let now = self.facts.stat(&rec.path).ok_or(GONE)?;
-        let fid = self.facts.file_id(&rec.path);
-        if now != rec.stat || fid.is_none() || fid != rec.file_id {
+        if now != rec.stat || !self.same_id(rec) {
             return Err(CHANGED.into());
         }
-        let (lock, _) = self.judge(
-            &rec.path,
-            &rec.canon,
-            rec.why,
-            &now,
-            user_protected,
-            moved_bytes + now.size,
-        );
+        let (lock, admin, drive) = self.judge(&rec.path, &rec.canon, rec.why, &now, ctx);
         if let Some(l) = lock {
             return Err(lock_reason(l).into());
         }
-        match (rec.group, fid) {
-            (Some(g), Some(fid)) => self.survivor(review, sel, stayed, id, rec, g, fid),
-            _ => Ok(()),
-        }
+        let twin = match rec.group {
+            Some(g) => Some(self.survivor(plan, stayed, id, g)?),
+            None => None,
+        };
+        Ok(Checked { admin, twin, drive })
+    }
+
+    fn same_id(&self, r: &Rec) -> bool {
+        r.file_id.is_some() && self.facts.file_id(&r.path) == r.file_id
+    }
+
+    /// Still what review saw: same stat, same file on disk (not swapped for a look-alike).
+    fn unchanged(&self, r: &Rec) -> bool {
+        self.facts.stat(&r.path).as_ref() == Some(&r.stat) && self.same_id(r)
     }
 
     /// Rule 4: another copy of the group must stay, unchanged since review, a different file on
-    /// disk (not a hard link) and byte for byte the same. Locked copies count.
-    #[allow(clippy::too_many_arguments)]
-    fn survivor(
+    /// disk (not a hard link), byte for byte the same, and not in the Recycle Bin, not in a
+    /// selected folder that is about to go. Locked copies count. Returns that copy.
+    fn survivor<'a>(
         &self,
-        review: &Review,
-        sel: &BTreeSet<u32>,
+        plan: &Plan<'a>,
         stayed: &HashSet<u32>,
         id: u32,
-        rec: &Rec,
         group: u32,
-        fid: (u32, u64),
-    ) -> Result<(), String> {
+    ) -> Result<&'a Rec, String> {
+        let rec = &plan.review.recs[&id];
+        let going: Vec<&String> = plan
+            .sel
+            .iter()
+            .filter(|d| !stayed.contains(*d) && plan.review.recs[*d].stat.is_dir)
+            .flat_map(|d| &plan.spell[d])
+            .collect();
         let mut candidates = 0;
-        for (oid, o) in review
+        for (oid, o) in plan
+            .review
             .recs
             .iter()
             .filter(|(k, o)| **k != id && o.group == Some(group))
         {
             // Selected copies don't count, unless they were tried first and stayed.
-            if sel.contains(oid) && !stayed.contains(oid) {
+            if plan.sel.contains(oid) && !stayed.contains(oid) {
+                continue;
+            }
+            let os = spellings(&o.path);
+            if os
+                .iter()
+                .any(|s| in_system_store(s) || going.iter().any(|d| is_inside(s, d)))
+            {
                 continue;
             }
             candidates += 1;
-            let unchanged = self.facts.stat(&o.path).as_ref() == Some(&o.stat)
-                && o.file_id.is_some()
-                && self.facts.file_id(&o.path) == o.file_id
-                && o.file_id != Some(fid);
-            if unchanged && self.facts.same_bytes(&rec.path, &o.path) == Ok(true) {
-                return Ok(());
+            if self.unchanged(o)
+                && o.file_id != rec.file_id
+                && self.facts.same_bytes(&rec.path, &o.path) == Ok(true)
+            {
+                return Ok(o);
             }
         }
         Err(if candidates == 0 { LAST_COPY } else { NO_TWIN }.into())
     }
 }
 
-/// 128 random bits from the OS-seeded generator, as hex.
-fn new_token() -> String {
-    format!("{:032x}", rand::random::<u128>())
-}
-
+mod support;
 #[cfg(test)]
 mod tests;
