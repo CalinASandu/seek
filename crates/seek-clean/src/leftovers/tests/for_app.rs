@@ -308,7 +308,7 @@ fn what_is_inside_a_listed_folder_is_not_listed_again() {
 }
 
 #[test]
-fn a_shortcut_named_like_the_app_with_a_dead_or_unreadable_target_is_listed() {
+fn a_shortcut_named_like_the_app_with_a_dead_target_is_listed_and_an_unreadable_one_is_not() {
     let w = world();
     let a = app("Acme Editor", "Initech", None, None);
     let (user_menu, _) = menus(&w);
@@ -316,10 +316,9 @@ fn a_shortcut_named_like_the_app_with_a_dead_or_unreadable_target_is_listed() {
     put(&user_menu, "Acme.lnk", 1);
     put(&user_menu, "Acme Editor Updater.lnk", 1);
     let dead = w.base.join("gone").join("editor.exe");
-    // A short name or a longer one never counts; an unreadable or dead target for the exact one does.
+    // A short name or a longer one never counts, and the exact one's target can't be read here, so it is not listed.
     let rows = after(&w, &a, &Claims::default(), &targets(&[("Acme.lnk", &dead), ("Acme Editor Updater.lnk", &dead)]));
-    assert_eq!(rows.len(), 1, "{rows:?}");
-    assert!(rows[0].path.ends_with("Acme Editor.lnk"));
+    assert!(rows.is_empty(), "{rows:?}");
     let rows = after(&w, &a, &Claims::default(), &targets(&[("Acme Editor.lnk", &dead)]));
     assert_eq!(rows.len(), 1);
 }
@@ -346,4 +345,29 @@ fn folder_facts_come_from_the_index_first_and_the_walk_fills_the_rest() {
     assert_eq!(*walked.lock().unwrap(), vec!["Acme Editor Plus".to_string()]);
     assert_eq!(rows.iter().filter(|r| r.size == 999).count(), 2);
     assert_eq!(find(&rows, "Acme Editor Plus").size, 11);
+}
+
+#[test]
+fn an_inner_exact_match_wins_over_an_outer_rough_one() {
+    let w = world();
+    let suite = w.local.join("Acme Editor Suite");
+    put(&suite.join("Acme Editor"), "a.txt", 5);
+    put(&suite.join("Acme Paint"), "a.txt", 5);
+    let a = app("Acme Editor", "Initech", None, None);
+    let rows = after(&w, &a, &Claims::default(), &unreadable);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert!(listed(&rows, &suite.join("Acme Editor")));
+    // With no exact match inside, the outer rough one still stands.
+    let w = world();
+    put(&w.local.join("Acme Editor Suite").join("Acme Paint"), "a.txt", 5);
+    assert!(listed(&after(&w, &a, &Claims::default(), &unreadable), &w.local.join("Acme Editor Suite")));
+}
+
+#[test]
+fn a_shortcut_that_cannot_be_read_is_never_listed() {
+    let w = world();
+    let a = app("Acme Editor", "Initech", None, None);
+    let (user_menu, _) = menus(&w);
+    put(&user_menu, "Acme Editor.lnk", 1);
+    assert!(after(&w, &a, &Claims::default(), &unreadable).is_empty());
 }

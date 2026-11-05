@@ -612,3 +612,41 @@ fn refresh_makes_the_next_question_read_both_lists_again() {
     h.live.is_claimed(f);
     assert_eq!((h.installed_reads.load(Ordering::SeqCst), h.running_reads.load(Ordering::SeqCst)), (2, 2));
 }
+
+fn env_pf(name: &str) -> Option<String> {
+    match name.to_ascii_lowercase().as_str() {
+        "programfiles" | "programw6432" => Some(r"C:\Program Files".into()),
+        "programfiles(x86)" => Some(r"C:\Program Files (x86)".into()),
+        "commonprogramfiles" | "commonprogramw6432" => Some(r"C:\Program Files\Common Files".into()),
+        "commonprogramfiles(x86)" => Some(r"C:\Program Files (x86)\Common Files".into()),
+        _ => None,
+    }
+}
+
+#[test]
+fn a_target_on_a_drive_that_cannot_be_read_counts_as_there() {
+    // A BitLocker-locked or failing drive: GetVolumeInformationW says no, so nothing can be said.
+    let gone = |_: &str| false;
+    assert!(target_looks_present(r"D:\Apps\a.exe", &env_pf, &|_| false, &gone));
+    // A readable fixed drive where the file is missing: dead.
+    assert!(!target_looks_present(r"D:\Apps\a.exe", &env_pf, &|_| true, &gone));
+    assert!(target_looks_present(r"D:\Apps\a.exe", &env_pf, &|_| true, &|p| p == r"D:\Apps\a.exe"));
+    // No path to look at: taken as working.
+    assert!(target_looks_present("", &env_pf, &|_| true, &gone));
+}
+
+#[test]
+fn a_program_files_target_counts_as_there_under_either_expansion() {
+    let readable = |_: &str| true;
+    let only = |there: &'static str| move |p: &str| p.eq_ignore_ascii_case(there);
+    for raw in [r"%ProgramFiles%\Acme\a.exe", r"C:\Program Files\Acme\a.exe"] {
+        assert!(target_looks_present(raw, &env_pf, &readable, &only(r"C:\Program Files (x86)\Acme\a.exe")), "{raw}");
+        assert!(!target_looks_present(raw, &env_pf, &readable, &only(r"C:\Elsewhere\a.exe")), "{raw}");
+    }
+    for raw in [r"%ProgramFiles(x86)%\Acme\a.exe", r"C:\Program Files (x86)\Acme\a.exe"] {
+        assert!(target_looks_present(raw, &env_pf, &readable, &only(r"C:\Program Files\Acme\a.exe")), "{raw}");
+    }
+    assert!(target_looks_present(r"%CommonProgramFiles%\Acme\a.dll", &env_pf, &readable, &only(r"C:\Program Files (x86)\Common Files\Acme\a.dll")));
+    // Another folder entirely is not swapped.
+    assert!(!target_looks_present(r"C:\Tools\Acme\a.exe", &env_pf, &readable, &only(r"C:\Program Files\Acme\a.exe")));
+}

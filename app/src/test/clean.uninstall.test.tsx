@@ -153,10 +153,26 @@ describe("the uninstall sheet, round 2", () => {
     await user.keyboard("{Escape}");
   });
 
-  it("opens at what's left when the uninstall already finished", async () => {
+  it("offers Uninstall again after a finished one (the app is back), not what's left", async () => {
     const user = await openApps({ ...makeApi(), uninstallState: async () => "finished" });
     await openSheet(user, /^Audacity/);
-    expect(await screen.findByRole("dialog", { name: "Audacity: what's left" })).toBeInTheDocument();
+    const dialog = await screen.findByRole("dialog", { name: "Uninstall Audacity?" });
+    expect(within(dialog).getByRole("button", { name: "Uninstall" })).toBeInTheDocument();
+    await new Promise((r) => setTimeout(r, 50));
+    expect(screen.getByRole("dialog", { name: "Uninstall Audacity?" })).toBeInTheDocument();
+  });
+
+  it("offers Uninstall again when an unresolved one was closed and the sheet is opened again", async () => {
+    const user = await openApps(makeApi());
+    await openSheet(user, /^Legacy Backup Suite/);
+    await user.click(await screen.findByRole("button", { name: "Uninstall" }));
+    await user.click(await screen.findByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    await user.click(screen.getByRole("button", { name: /^Uninstall…/ }));
+    const dialog = await screen.findByRole("dialog", { name: "Uninstall Legacy Backup Suite?" });
+    await new Promise((r) => setTimeout(r, 50));
+    expect(within(dialog).getByRole("button", { name: "Uninstall" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "It's finished" })).toBeNull();
   });
 
   it("shows why what's left can't be listed yet, with Look again", async () => {
