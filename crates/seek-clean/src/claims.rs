@@ -118,6 +118,8 @@ pub struct Skipped {
 pub struct ClaimParts {
     pub paths: Vec<PathClaim>,
     pub names: Vec<NameClaim>,
+    /// The `Publisher` of every uninstall entry that has one, as registered.
+    pub publishers: Vec<String>,
     pub program_names: Vec<ProgramName>,
     /// Places so wide that a claim at or above one of them says nothing about its folders.
     pub broad_roots: Vec<String>,
@@ -130,6 +132,7 @@ impl ClaimParts {
     pub(crate) fn merge(mut self, other: ClaimParts) -> ClaimParts {
         self.paths.extend(other.paths);
         self.names.extend(other.names);
+        self.publishers.extend(other.publishers);
         self.program_names.extend(other.program_names);
         self.broad_roots.extend(other.broad_roots);
         self.failed.extend(other.failed);
@@ -145,6 +148,7 @@ impl ClaimParts {
 pub struct UninstallEntry {
     pub key: String,
     pub display_name: String,
+    pub publisher: String,
     pub install_location: String,
     pub display_icon: String,
     pub uninstall_string: String,
@@ -255,7 +259,7 @@ impl ClaimCheck for SystemClaims {
 // ---- names ---------------------------------------------------------------------------------------
 
 /// Words are runs of letters and digits; `+` counts as a letter so `Notepad++` is not `Notepad`.
-fn words(s: &str) -> Vec<String> {
+pub(crate) fn words(s: &str) -> Vec<String> {
     s.split(|c: char| !(c.is_alphanumeric() || c == '+'))
         .filter(|w| !w.is_empty())
         .map(str::to_lowercase)
@@ -495,6 +499,39 @@ pub fn add_uninstall_entry(parts: &mut ClaimParts, e: &UninstallEntry, env: &dyn
     if !e.display_name.trim().is_empty() {
         parts.names.push(NameClaim { name: e.display_name.trim().to_string(), source: "app names" });
     }
+    if !e.publisher.trim().is_empty() {
+        parts.publishers.push(e.publisher.trim().to_string());
+    }
+}
+
+/// The names of the installed apps and of their publishers, as the uninstall lists give them.
+/// The Leftovers scan (and later the Apps tab) uses them to tell a dead folder from one that
+/// belongs to a longer-named app or to a company that still has software installed.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct InstalledNames {
+    pub apps: Vec<String>,
+    pub publishers: Vec<String>,
+}
+
+impl InstalledNames {
+    /// Distinct names, in the order first seen (two spellings that differ only in case are one).
+    pub fn from_parts(parts: &ClaimParts) -> InstalledNames {
+        fn distinct<'a>(names: impl Iterator<Item = &'a str>) -> Vec<String> {
+            let mut seen = HashSet::new();
+            names.filter(|n| seen.insert(n.to_lowercase())).map(str::to_string).collect()
+        }
+        InstalledNames {
+            apps: distinct(parts.names.iter().map(|n| n.name.as_str())),
+            publishers: distinct(parts.publishers.iter().map(String::as_str)),
+        }
+    }
+}
+
+/// Reads the three uninstall lists (the same reader the claims use) for names only. Quick: it
+/// opens no shortcut and lists no process. If a list can't be read, what it gave is still returned,
+/// and the names can only lower a score.
+pub fn read_installed_names() -> InstalledNames {
+    InstalledNames::from_parts(&real::read_uninstall_parts())
 }
 
 pub fn add_service(parts: &mut ClaimParts, name: &str, image_path: &str, env: &dyn Fn(&str) -> Option<String>) {
@@ -831,6 +868,7 @@ mod real {
                     let e = UninstallEntry {
                         key: name.to_string(),
                         display_name: get("DisplayName"),
+                        publisher: get("Publisher"),
                         install_location: get("InstallLocation"),
                         display_icon: get("DisplayIcon"),
                         uninstall_string: get("UninstallString"),
@@ -1048,6 +1086,13 @@ mod real {
             roots.push(p.join("AppData").to_string_lossy().into_owned());
         }
         roots
+    }
+
+    /// The uninstall lists alone.
+    pub(super) fn read_uninstall_parts() -> ClaimParts {
+        let mut parts = ClaimParts { broad_roots: broad_roots(), ..ClaimParts::default() };
+        uninstall(&mut parts);
+        parts
     }
 
     /// Installed apps, services, startup entries and shortcuts: slow to read (shortcuts alone

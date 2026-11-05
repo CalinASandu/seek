@@ -42,6 +42,25 @@ fn entry(name: &str) -> UninstallEntry {
 }
 
 #[test]
+fn installed_names_come_from_the_uninstall_entries() {
+    let mut p = parts();
+    for (name, publisher) in [("Docker Desktop", "Docker Inc."), ("Docker Desktop", "docker inc."), ("Nameless Publisher", ""), ("", "Ghost Co")] {
+        let mut e = entry(name);
+        e.publisher = publisher.into();
+        add_uninstall_entry(&mut p, &e, &env);
+    }
+    let names = InstalledNames::from_parts(&p);
+    assert_eq!(names.apps, vec!["Docker Desktop".to_string(), "Nameless Publisher".to_string()]);
+    assert_eq!(names.publishers, vec!["Docker Inc.".to_string(), "Ghost Co".to_string()]);
+    // Merging the claims of two reads keeps both lists.
+    let mut other = parts();
+    let mut e = entry("Other");
+    e.publisher = "Other Ltd".into();
+    add_uninstall_entry(&mut other, &e, &env);
+    assert_eq!(InstalledNames::from_parts(&p.merge(other)).publishers.len(), 3);
+}
+
+#[test]
 fn an_uninstall_location_claims() {
     let mut p = parts();
     let mut e = entry("Foo");

@@ -205,7 +205,7 @@ fn the_json_the_window_sends_is_read_and_turned_into_local_and_linked_candidates
         r#"{{"kind":"duplicates","groups":[[{{"path":"C:\\a\\x.bin","deviceId":"{one}"}},{{"path":"C:\\Users\\x\\x.bin","deviceId":"{nine}"}},{{"path":"D:\\b\\x.bin","deviceId":"{one}"}}]]}}"#
     );
     let req: PrepareRequest = serde_json::from_str(&json).unwrap();
-    let groups = duplicate_groups(req).unwrap();
+    let PrepareRequest::Duplicates { groups } = req else { panic!("not a duplicates request") };
     let cands = candidates_from_request(groups, &owners());
     assert_eq!(
         cands,
@@ -216,16 +216,155 @@ fn the_json_the_window_sends_is_read_and_turned_into_local_and_linked_candidates
     );
 }
 
-#[test]
-fn leftover_and_stale_requests_are_read_and_refused_in_plain_words() {
-    let folders = r#"{"kind":"folders","why":"leftover","folders":[{"path":"C:\\x","level":null,"reasons":[{"text":"t","points":3}]}]}"#;
-    let stale = r#"{"kind":"stale","files":["C:\\ProgramData\\Seek\\old.idx"]}"#;
-    for j in [folders, stale] {
-        let req: PrepareRequest = serde_json::from_str(j).unwrap();
-        let e = duplicate_groups(req).unwrap_err();
-        assert!(e.contains("isn't available"), "{e}");
+fn stale(path: &str) -> StaleFile {
+    StaleFile { path: path.to_string(), size: 7, modified: 1_700_000_000_000 }
+}
+
+fn folder_row(path: &str, level: Level) -> LeftoverRow {
+    LeftoverRow {
+        path: path.to_string(),
+        parent: String::new(),
+        size: 1,
+        modified: 0,
+        needs_admin: false,
+        level,
+        reasons: vec![],
+        contents: vec![],
     }
+}
+
+#[test]
+fn leftover_and_stale_requests_are_read_as_the_window_sends_them() {
+    // The shapes `folderRequest` (LeftoversTab) and the `stale` kind of `PrepareRequest` send.
+    let folders = r#"{"kind":"folders","why":"leftover","folders":[{"path":"C:\\x","level":"likely","reasons":[{"text":"t","points":3}]},{"path":"C:\\y","level":null,"reasons":[]}]}"#;
+    let PrepareRequest::Folders { why, folders } = serde_json::from_str(folders).unwrap() else { panic!("not folders") };
+    assert_eq!(why, Why::Leftover);
+    assert_eq!(folders.len(), 2);
+    assert_eq!(folders[0].level, Some(Level::Likely));
+    assert_eq!(folders[0].reasons, vec![Reason { text: "t".into(), points: 3 }]);
+    assert_eq!(folders[1].level, None);
+    let stale = r#"{"kind":"stale","files":["C:\\ProgramData\\Seek\\indexes\\a.seekidx"]}"#;
+    let PrepareRequest::Stale { files } = serde_json::from_str(stale).unwrap() else { panic!("not stale") };
+    assert_eq!(files, vec![r"C:\ProgramData\Seek\indexes\a.seekidx".to_string()]);
     assert!(serde_json::from_str::<PrepareRequest>(r#"{"kind":"nonsense"}"#).is_err());
+}
+
+#[test]
+fn no_service_still_lists_folders() {
+    let folders = vec![folder_row(r"C:\Users\me\AppData\Local\Old", Level::Likely), folder_row(r"C:\Program Files\Gone", Level::VeryLikely)];
+    let rows = merge_leftovers(folders.clone(), Err("lost connection to Seek service".into()));
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|r| !r.path.ends_with(".seekidx")));
+    // Highest level first.
+    assert_eq!(rows[0].path, r"C:\Program Files\Gone");
+    // An answer with nothing stale changes nothing either.
+    assert_eq!(merge_leftovers(folders, Ok(vec![])).len(), 2);
+}
+
+#[test]
+fn stale_data_rows_join_the_list_needing_admin() {
+    let folders = vec![folder_row(r"C:\a\Likely One", Level::Likely), folder_row(r"C:\a\Not Sure", Level::NotSure)];
+    let rows = merge_leftovers(folders, Ok(vec![stale(r"C:\ProgramData\Seek\indexes\old.seekidx")]));
+    let order: Vec<Level> = rows.iter().map(|r| r.level).collect();
+    assert_eq!(order, vec![Level::VeryLikely, Level::Likely, Level::NotSure]);
+    let s = &rows[0];
+    assert_eq!(s.path, r"C:\ProgramData\Seek\indexes\old.seekidx");
+    assert_eq!(s.parent, r"C:\ProgramData\Seek\indexes");
+    assert!(s.needs_admin);
+    assert_eq!((s.size, s.modified), (7, 1_700_000_000_000));
+    assert_eq!(s.reasons.len(), 1);
+    assert_eq!(s.reasons.iter().map(|r| r.points).sum::<i32>(), 5);
+    assert!(!s.reasons[0].text.to_lowercase().contains("safe"));
+}
+
+#[test]
+fn folder_and_stale_requests_become_candidates() {
+    let f = |path: &str| ReqFolder { path: path.into(), level: Some(Level::Likely), reasons: vec![] };
+    let listed = [stale(r"C:\ProgramData\Seek\indexes\old.seekidx")];
+    let cands = folder_candidates(
+        Why::Leftover,
+        vec![f(r"C:\Users\me\AppData\Local\Old"), f(r"c:\programdata\seek\INDEXES\old.seekidx"), f(r"C:\Users\me\AppData\Local\backup.log")],
+        &listed,
+    )
+    .unwrap();
+    assert_eq!(cands.len(), 3);
+    assert!(matches!(&cands[0], Candidate::Folder { why: Why::Leftover, level: Some(Level::Likely), .. }));
+    assert!(matches!(&cands[1], Candidate::StaleFile { .. }));
+    // A folder that merely looks like a log file, and that the service does not list, stays a folder.
+    assert!(matches!(&cands[2], Candidate::Folder { .. }));
+    // Only leftover and uninstall folders are removed this way.
+    assert!(folder_candidates(Why::Duplicate, vec![f(r"C:\x")], &[]).is_err());
+    assert!(folder_candidates(Why::StaleData, vec![f(r"C:\x")], &[]).is_err());
+    assert!(folder_candidates(Why::Uninstall, vec![f(r"C:\x")], &[]).is_ok());
+    // A stale request keeps only what the service still calls stale.
+    let wanted = vec![r"C:\ProgramData\Seek\indexes\old.seekidx".to_string(), r"C:\ProgramData\Seek\indexes\live.seekidx".to_string()];
+    let cands = stale_candidates(wanted, &listed);
+    assert_eq!(cands, vec![Candidate::StaleFile { path: PathBuf::from(r"C:\ProgramData\Seek\indexes\old.seekidx") }]);
+}
+
+/// Claims nothing, so the engine's own rules are what these tests see.
+struct ClaimsNothing;
+impl ClaimCheck for ClaimsNothing {
+    fn is_claimed(&self, _: &Path) -> Option<String> {
+        None
+    }
+}
+
+/// What the Leftovers tab sends for a Program Files folder, an AppData folder and a stale file goes
+/// through `clean_prepare`'s own steps into the real engine: the first and the stale file need the
+/// admin prompt, which does not exist yet, so a commit leaves them where they are and says why.
+/// No recycler is reachable (it panics) and nothing on disk changes.
+#[test]
+fn leftover_rows_go_through_the_engines_rules_and_admin_rows_are_left_without_an_elevator() {
+    let dir = tempfile::tempdir().unwrap();
+    let b = dir.path();
+    let s = |p: &str| b.join(p).to_string_lossy().into_owned();
+    for d in ["win", "pf/Old Vendor", "pd/Seek/indexes", "users/me/appdata/Old App"] {
+        std::fs::create_dir_all(b.join(d)).unwrap();
+    }
+    std::fs::write(b.join("pf/Old Vendor/a.txt"), b"x").unwrap();
+    std::fs::write(b.join("users/me/appdata/Old App/a.txt"), b"x").unwrap();
+    let stale_file = b.join("pd/Seek/indexes/00000000-0000-0000-0000-000000000009.seekidx");
+    std::fs::write(&stale_file, b"old index").unwrap();
+    let places = Places::for_tests(&s("win"), &[&s("pf")], &s("users"), &s("users/me"), &s("pd"), &[&s("users/me/appdata")]);
+    let facts: Arc<dyn FileFacts> = Arc::new(DiskOnly);
+    let engine = Engine::new(places, Arc::new(NeverRecycles), None, facts, Arc::new(ClaimsNothing));
+
+    let tab = |p: String| ReqFolder {
+        path: p,
+        level: Some(Level::VeryLikely),
+        reasons: vec![Reason { text: "Empty, or nothing left but empty folders".into(), points: 4 }],
+    };
+    let listed = [stale(&stale_file.to_string_lossy())];
+    let mut cands = folder_candidates(
+        Why::Leftover,
+        vec![tab(s("pf/Old Vendor")), tab(s("users/me/appdata/Old App")), tab(stale_file.to_string_lossy().into_owned())],
+        &listed,
+    )
+    .unwrap();
+    // A stale-data row asked for through the `stale` kind reaches the engine the same way.
+    cands.extend(stale_candidates(vec![stale_file.to_string_lossy().into_owned()], &listed));
+    let prepared = engine.prepare(cands, &[]);
+    assert_eq!(prepared.items.len(), 4);
+
+    let pf = &prepared.items[0];
+    assert_eq!((pf.why, pf.is_dir, pf.lock, pf.needs_admin), (Why::Leftover, true, None, true));
+    assert_eq!(pf.level, Some(Level::VeryLikely), "the level the window showed comes back with the item");
+    assert_eq!(pf.reasons.len(), 1);
+    let app = &prepared.items[1];
+    assert_eq!((app.why, app.lock, app.needs_admin), (Why::Leftover, None, false));
+    for st in [&prepared.items[2], &prepared.items[3]] {
+        assert_eq!((st.why, st.is_dir, st.lock, st.needs_admin), (Why::StaleData, false, None, true), "{st:?}");
+    }
+
+    // Commit only the admin rows: with no elevator each is left with the admin reason.
+    let r = engine.commit(&prepared.token, &[0, 2], &[]).unwrap();
+    assert_eq!(r.moved_bytes, 0);
+    assert_eq!(r.items.len(), 2);
+    for item in &r.items {
+        assert_eq!(item.outcome, Outcome::Left { reason: "Windows admin rights are needed for this.".into() });
+    }
+    assert!(b.join("pf/Old Vendor/a.txt").exists() && stale_file.exists());
 }
 
 #[test]

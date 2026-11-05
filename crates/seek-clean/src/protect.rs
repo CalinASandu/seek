@@ -1,7 +1,7 @@
 //! Protected places (safety rule 8). One table, in one place. See the spec's table:
 //! `docs/superpowers/specs/2026-11-04-seek-cleanup-design.md`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use windows::core::GUID;
 use windows::Win32::System::Com::CoTaskMemFree;
@@ -14,14 +14,19 @@ use windows::Win32::UI::Shell::{
 use crate::model::{Lock, Why};
 use crate::paths::{canon, is_inside};
 
-fn known(id: &GUID) -> Option<String> {
+/// The folder as Windows writes it (real capitalization), for showing and for reading.
+fn known_raw(id: &GUID) -> Option<String> {
     // SAFETY: the returned buffer is owned by us and freed with CoTaskMemFree right after copying.
     unsafe {
         let p = SHGetKnownFolderPath(id, KF_FLAG_DEFAULT, None).ok()?;
         let s = p.to_string().ok();
         CoTaskMemFree(Some(p.0 as *const _));
-        s.map(|s| canon(Path::new(&s)))
+        s
     }
+}
+
+fn known(id: &GUID) -> Option<String> {
+    known_raw(id).map(|s| canon(Path::new(&s)))
 }
 
 /// The system's special folders, in `canon` form. Empty entries match nothing.
@@ -33,9 +38,18 @@ pub struct Places {
     profile: String,
     program_data: String,
     app_data: Vec<String>,
+    /// Program Files roots, then the AppData folders, as written (not `canon`): the places a
+    /// leftovers scan lists the top-level folders of.
+    scan_roots: Vec<PathBuf>,
 }
 
 impl Places {
+    /// The folders whose top-level folders are leftover candidates: Program Files and its x86
+    /// twin, then Local, Roaming and LocalLow AppData. Real capitalization.
+    pub fn scan_roots(&self) -> &[PathBuf] {
+        &self.scan_roots
+    }
+
     /// Asks Windows for every folder, so nothing depends on a drive letter or a language.
     ///
     /// Fails if the Windows folder, Program Files, the users folder, your profile or ProgramData
@@ -52,7 +66,13 @@ impl Places {
             .into_iter()
             .filter_map(known)
             .collect();
+        let scan_roots = [&FOLDERID_ProgramFiles, &FOLDERID_ProgramFilesX86, &FOLDERID_LocalAppData, &FOLDERID_RoamingAppData, &FOLDERID_LocalAppDataLow]
+            .into_iter()
+            .filter_map(known_raw)
+            .map(PathBuf::from)
+            .collect();
         let places = Places {
+            scan_roots,
             windows,
             program_files,
             users_root: known(&FOLDERID_UserProfiles).unwrap_or_default(),
@@ -105,6 +125,7 @@ impl Places {
     ) -> Places {
         let c = |s: &str| canon(Path::new(s));
         Places {
+            scan_roots: program_files.iter().chain(app_data).map(PathBuf::from).collect(),
             windows: c(windows),
             program_files: program_files.iter().map(|s| c(s)).collect(),
             users_root: c(users_root),

@@ -4,9 +4,11 @@
 #![cfg(windows)]
 
 pub mod claims;
+pub mod confidence;
 pub mod dupes;
 pub mod engine;
 pub mod facts;
+pub mod leftovers;
 pub mod model;
 pub mod paths;
 pub mod protect;

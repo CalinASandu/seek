@@ -17,16 +17,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use seek_clean::claims::LiveClaims;
+use seek_clean::claims::{self, LiveClaims};
 use seek_clean::dupes::{self, ScanEvent, SizeBatch, SizeFile, MIN_DUPLICATE_BYTES};
 use seek_clean::engine::Engine;
 use seek_clean::facts::{FileFacts, RealFacts};
-use seek_clean::model::{Candidate, CommitResult, DupGroup, Outcome, Prepared};
+use seek_clean::leftovers;
+use seek_clean::model::{Candidate, CommitResult, DupGroup, Level, LeftoverRow, Outcome, Prepared, Reason, Why};
 use seek_clean::paths::canon;
 use seek_clean::protect::Places;
 use seek_clean::recycle::ShellRecycler;
 use seek_core::{Device, DeviceId, DeviceState, HostId};
-use seek_ipc::{Request, Response, SizeGroup};
+use seek_ipc::{Request, Response, SizeGroup, StaleFile};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, State};
@@ -323,14 +324,22 @@ pub struct ReqFile {
     pub device_id: String,
 }
 
-/// Same shapes as `PrepareRequest` in `app/src/api/types.ts`. Folders and stale files belong to
-/// later tasks; they are read (extra fields ignored) so they can be refused in plain words.
+/// A folder of a `Folders` request, with the confidence the window showed for it.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReqFolder {
+    pub path: String,
+    pub level: Option<Level>,
+    pub reasons: Vec<Reason>,
+}
+
+/// Same shapes as `PrepareRequest` in `app/src/api/types.ts`.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum PrepareRequest {
     Duplicates { groups: Vec<Vec<ReqFile>> },
-    Folders {},
-    Stale {},
+    Folders { why: Why, folders: Vec<ReqFolder> },
+    Stale { files: Vec<String> },
 }
 
 /// Each group becomes one `Duplicates` of its local copies (locked ones included: they count as
@@ -356,12 +365,92 @@ pub fn candidates_from_request(groups: Vec<Vec<ReqFile>>, owners: &Owners) -> Ve
     out
 }
 
-/// The groups of a request to remove duplicates. The other kinds belong to later tasks.
-pub fn duplicate_groups(req: PrepareRequest) -> Result<Vec<Vec<ReqFile>>, String> {
-    match req {
-        PrepareRequest::Duplicates { groups } => Ok(groups),
-        PrepareRequest::Folders {} | PrepareRequest::Stale {} => Err("Removing leftovers isn't available in this version yet.".to_string()),
+// ---- leftovers: the list, and turning their requests into candidates ----------------------------
+
+/// What the Leftovers list says about one of Seek's own stale files. It is a fact the service
+/// reported, not a guess, so it is the top level, with the one reason to show.
+const STALE_REASON: &str = "No drive Seek knows about uses this file";
+const STALE_POINTS: i32 = 5;
+
+/// The index and journal file names the service can report as stale.
+fn looks_stale(path: &str) -> bool {
+    let ext = Path::new(path).extension().and_then(|e| e.to_str()).unwrap_or("");
+    ext.eq_ignore_ascii_case("seekidx") || ext.eq_ignore_ascii_case("log")
+}
+
+pub fn stale_row(f: &StaleFile) -> LeftoverRow {
+    let parent = Path::new(&f.path).parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+    LeftoverRow {
+        path: f.path.clone(),
+        parent,
+        size: f.size,
+        modified: f.modified,
+        needs_admin: true,
+        level: seek_clean::confidence::level(STALE_POINTS),
+        reasons: vec![Reason { text: STALE_REASON.to_string(), points: STALE_POINTS }],
+        contents: Vec::new(),
     }
+}
+
+/// The folder rows with Seek's own stale files added. If the service could not be asked, the
+/// folders are still the answer and there are simply no stale rows. Highest level first; within
+/// a level the order the scan gave (most likely, then biggest) is kept.
+pub fn merge_leftovers(folders: Vec<LeftoverRow>, stale: Result<Vec<StaleFile>, String>) -> Vec<LeftoverRow> {
+    let mut rows = folders;
+    match stale {
+        Ok(files) => rows.extend(files.iter().map(stale_row)),
+        Err(e) => tracing::warn!("stale Seek data not listed, the service could not be asked: {e}"),
+    }
+    let rank = |l: Level| match l {
+        Level::VeryLikely => 0,
+        Level::Likely => 1,
+        Level::NotSure => 2,
+        Level::ProbablyInUse => 3,
+    };
+    rows.sort_by_key(|r| rank(r.level));
+    rows
+}
+
+/// The folders on this PC that nothing claims, scored. Slow (it reads every folder's metadata),
+/// so only ever called from a thread of its own. It builds its own claims, so it shares no lock
+/// with the removal path.
+fn scan_folders(core: &Core) -> Vec<LeftoverRow> {
+    let claims = LiveClaims::new();
+    let installed = claims::read_installed_names();
+    leftovers::scan(&core.places, &claims, &installed, &*core.facts)
+}
+
+fn same_place(a: &str, b: &str) -> bool {
+    canon(Path::new(a)) == canon(Path::new(b))
+}
+
+/// Candidates for a request to remove leftover folders. A path the service reports as stale is
+/// one of Seek's own files (`StaleFile`); anything else is a folder, and the engine refuses
+/// whatever is not one. `why` can only be `Leftover` or `Uninstall`.
+pub fn folder_candidates(why: Why, folders: Vec<ReqFolder>, stale: &[StaleFile]) -> Result<Vec<Candidate>, String> {
+    if !matches!(why, Why::Leftover | Why::Uninstall) {
+        return Err("Seek can only remove leftover folders this way.".to_string());
+    }
+    Ok(folders
+        .into_iter()
+        .map(|f| {
+            if looks_stale(&f.path) && stale.iter().any(|s| same_place(&s.path, &f.path)) {
+                Candidate::StaleFile { path: PathBuf::from(f.path) }
+            } else {
+                Candidate::Folder { path: PathBuf::from(f.path), why, level: f.level, reasons: f.reasons }
+            }
+        })
+        .collect())
+}
+
+/// Candidates for a request to remove Seek's own stale files: only what the service still calls
+/// stale. A file a drive has since taken over, or that is gone, is left out.
+pub fn stale_candidates(files: Vec<String>, stale: &[StaleFile]) -> Vec<Candidate> {
+    files
+        .into_iter()
+        .filter(|f| stale.iter().any(|s| same_place(&s.path, f)))
+        .map(|path| Candidate::StaleFile { path: PathBuf::from(path) })
+        .collect()
 }
 
 // ---- hidden time -----------------------------------------------------------------------------
@@ -704,6 +793,13 @@ async fn fetch_context(link: &ServiceLink) -> Result<Context, String> {
     Ok(Context { devices, this_host, pc_names })
 }
 
+async fn fetch_stale(link: &ServiceLink) -> Result<Vec<StaleFile>, String> {
+    match link.request(Request::StaleData).await? {
+        Response::StaleData { files } => Ok(files),
+        other => Err(unexpected(other)),
+    }
+}
+
 async fn fetch_page(link: &ServiceLink, ids: Vec<DeviceId>, cursor: Option<u64>) -> Page {
     let req = Request::SameSizeFiles { min_size: MIN_DUPLICATE_BYTES, device_ids: ids, cursor, limit: PAGE_LIMIT };
     match link.request(req).await? {
@@ -813,15 +909,35 @@ pub fn clean_scan_state(clean: Clean<'_>) -> ScanState {
     clean.shared.state()
 }
 
+/// Leftover folders on this PC plus Seek's own stale files. The folder walk runs on a thread of
+/// its own, so the window stays alive, and the service is asked meanwhile.
+#[tauri::command]
+pub async fn clean_leftovers(clean: Clean<'_>, link: State<'_, Arc<ServiceLink>>) -> Result<Vec<LeftoverRow>, String> {
+    let core = clean.core()?;
+    let walk = tauri::async_runtime::spawn_blocking(move || scan_folders(&core));
+    let stale = fetch_stale(&link).await;
+    let folders = walk.await.map_err(|e| format!("Looking for leftovers stopped unexpectedly: {e}"))?;
+    Ok(merge_leftovers(folders, stale))
+}
+
 #[tauri::command]
 pub async fn clean_prepare(clean: Clean<'_>, link: State<'_, Arc<ServiceLink>>, req: PrepareRequest) -> Result<Prepared, String> {
     let core = clean.core()?;
-    let groups = duplicate_groups(req)?;
     let protected = settings::protected_paths_strict()?;
-    // Which copies are on this PC is asked of the service now, not remembered from the scan.
-    let ctx = fetch_context(&link).await?;
-    let owners = owners_of(&ctx.devices, ctx.this_host, &ctx.pc_names);
-    let candidates = candidates_from_request(groups, &owners);
+    let candidates = match req {
+        PrepareRequest::Duplicates { groups } => {
+            // Which copies are on this PC is asked of the service now, not remembered from the scan.
+            let ctx = fetch_context(&link).await?;
+            let owners = owners_of(&ctx.devices, ctx.this_host, &ctx.pc_names);
+            candidates_from_request(groups, &owners)
+        }
+        PrepareRequest::Folders { why, folders } => {
+            // Which files are stale is also asked now. Only a request that names one needs the answer.
+            let stale = if folders.iter().any(|f| looks_stale(&f.path)) { fetch_stale(&link).await? } else { Vec::new() };
+            folder_candidates(why, folders, &stale)?
+        }
+        PrepareRequest::Stale { files } => stale_candidates(files, &fetch_stale(&link).await?),
+    };
     tauri::async_runtime::spawn_blocking(move || core.engine.prepare(candidates, &protected))
         .await
         .map_err(|e| e.to_string())

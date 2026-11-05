@@ -1168,6 +1168,53 @@ async fn same_size_files_survives_an_idle_unload_between_pages() {
     svc.task.await.unwrap().unwrap();
 }
 
+async fn stale_files(c: &mut Client) -> Vec<seek_ipc::StaleFile> {
+    match c.request(Request::StaleData).await.unwrap() {
+        Response::StaleData { files } => files,
+        other => panic!("expected StaleData, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stale_data_lists_only_files_no_known_drive_owns() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = Arc::new(Fake::default());
+    fake.vols.lock().unwrap().push(volume());
+    let svc = start(dir.path(), fake.clone()).await;
+    let mut c = connect(&svc.pipe).await;
+    wait_for(&mut c, "device scanned", scanned_online).await;
+    let live = device_id(&mut c).await;
+
+    let unknown = uuid::Uuid::new_v4();
+    let (indexes, journal) = (dir.path().join("indexes"), dir.path().join("journal"));
+    std::fs::write(indexes.join(format!("{unknown}.seekidx")), vec![0u8; 1234]).unwrap();
+    std::fs::write(journal.join(format!("{unknown}.log")), vec![0u8; 77]).unwrap();
+    // A live drive's files, a stranger's file name and a half-written index are none of its business.
+    std::fs::write(indexes.join(format!("{live}.seekidx")), b"live").unwrap();
+    std::fs::write(journal.join(format!("{live}.log")), b"live").unwrap();
+    std::fs::write(indexes.join("notes.txt"), b"x").unwrap();
+    std::fs::write(indexes.join(format!("{unknown}.seekidx.tmp")), b"x").unwrap();
+    std::fs::write(dir.path().join("devices.json"), b"{}").unwrap();
+
+    let mut files = stale_files(&mut c).await;
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    let mut want = vec![
+        (indexes.join(format!("{unknown}.seekidx")), 1234u64),
+        (journal.join(format!("{unknown}.log")), 77u64),
+    ];
+    want.sort();
+    assert_eq!(
+        files.iter().map(|f| (std::path::PathBuf::from(&f.path), f.size)).collect::<Vec<_>>(),
+        want
+    );
+    // Epoch milliseconds, and recent: the files were just written.
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
+    assert!(files.iter().all(|f| (now - f.modified).abs() < 60_000), "{files:?}");
+
+    let _ = svc.stop.send(true);
+    svc.task.await.unwrap().unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn same_size_files_hides_other_users_rows() {
     let dir = tempfile::tempdir().unwrap();

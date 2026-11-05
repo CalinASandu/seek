@@ -521,6 +521,39 @@ impl State {
     }
 }
 
+impl State {
+    /// `indexes/*.seekidx` and `journal/*.log` whose name is not the id of any device in the
+    /// registry. Only reads. The folder is listed before the registry, so a drive added while this
+    /// runs is never mistaken for a stranger.
+    pub fn stale_data(&self) -> Vec<seek_ipc::StaleFile> {
+        let mut found = Vec::new();
+        for (sub, ext) in [("indexes", "seekidx"), ("journal", "log")] {
+            let Ok(rd) = std::fs::read_dir(self.cfg.data_dir.join(sub)) else { continue };
+            for entry in rd.flatten() {
+                let path = entry.path();
+                let is_ours = path.extension().is_some_and(|e| e.eq_ignore_ascii_case(ext));
+                let id = path.file_stem().and_then(|s| s.to_str()).and_then(|s| s.parse::<DeviceId>().ok());
+                let (true, Some(id)) = (is_ours, id) else { continue };
+                let Ok(md) = entry.metadata() else { continue };
+                if !md.is_file() {
+                    continue;
+                }
+                let modified = md
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map_or(0, |d| d.as_millis() as i64);
+                found.push((id, seek_ipc::StaleFile { path: path.to_string_lossy().into_owned(), size: md.len(), modified }));
+            }
+        }
+        let reg = self.registry.read().unwrap();
+        let mut out: Vec<seek_ipc::StaleFile> =
+            found.into_iter().filter(|(id, _)| reg.get(*id).is_none()).map(|(_, f)| f).collect();
+        out.sort_by(|a, b| a.path.cmp(&b.path));
+        out
+    }
+}
+
 fn index_path(dir: &Path, id: DeviceId) -> PathBuf {
     dir.join("indexes").join(format!("{id}.seekidx"))
 }

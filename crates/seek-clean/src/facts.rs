@@ -68,7 +68,7 @@ pub(crate) fn is_cloud(attrs: u32) -> bool {
     attrs & (ATTR_OFFLINE | ATTR_RECALL_ON_OPEN | ATTR_RECALL_ON_DATA_ACCESS) != 0
 }
 
-fn modified_ms(md: &std::fs::Metadata) -> i64 {
+pub(crate) fn modified_ms(md: &std::fs::Metadata) -> i64 {
     // FILETIME counts 100 ns from 1601; the unix epoch is 11,644,473,600 s later.
     (md.last_write_time() / 10_000) as i64 - 11_644_473_600_000
 }
