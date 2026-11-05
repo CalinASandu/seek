@@ -107,6 +107,26 @@ describe("Review sheet keyboard follows the mouse", () => {
   });
 });
 
+describe("Always protect that cannot be saved", () => {
+  it("says so in the sheet and leaves the row where it was", async () => {
+    const why = "Your settings file (X:\\Seek\\settings.json) couldn't be read. It wasn't overwritten; fix or delete it first.";
+    const { api } = spied();
+    const failing: SeekApi = {
+      ...api,
+      setSettings: async () => {
+        throw why;
+      },
+    };
+    const { user, list, itemRows } = await leftoverSheet(failing, THREE);
+    const before = itemRows().length;
+    await user.click(nameOf(itemRows()[1]!));
+    fireEvent.keyDown(list, { key: "p" });
+    const dialog = screen.getAllByRole("dialog").pop()!;
+    expect(await within(dialog).findByText(new RegExp("wasn't overwritten"))).toBeInTheDocument();
+    expect(itemRows()).toHaveLength(before);
+  });
+});
+
 describe("Focus after a sheet closes", () => {
   it("lands on the active tab when the opener is gone, and the result's Done is focused", async () => {
     const user = await openClean();

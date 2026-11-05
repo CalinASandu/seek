@@ -13,6 +13,8 @@ interface Props {
   peers: Peers | null;
   /** The link to a hub, or the notice that the hub unlinked this PC; `null` without one. */
   hub: HubStatus | null;
+  /** Why the saved settings can't be used (so the protected list can't be read), or null. */
+  problem: string | null;
   onChange: (patch: Partial<Settings>) => void;
   onSharing: (enabled: boolean) => void;
   onLinkPc: () => void;
@@ -27,7 +29,7 @@ const THEMES: SegmentedItem<Settings["theme"]>[] = [
   { id: "dark", label: "Dark", icon: Moon },
 ];
 
-export function SettingsPanel({ settings, version, peers, hub, onChange, onSharing, onLinkPc, onUnlinkHub, onClose }: Props) {
+export function SettingsPanel({ settings, version, peers, hub, problem, onChange, onSharing, onLinkPc, onUnlinkHub, onClose }: Props) {
   const [folder, setFolder] = useState("");
   const [unlinkingHub, setUnlinkingHub] = useState(false);
   const ref = useRef<HTMLElement>(null);
@@ -209,6 +211,11 @@ export function SettingsPanel({ settings, version, peers, hub, onChange, onShari
           <section className="setting-group" aria-labelledby="set-prot">
             <h3 id="set-prot">Protected from Cleanup</h3>
             <p className="setting-desc">Cleanup never moves these files or folders, or anything inside them.</p>
+            {problem && (
+              <p className="setting-desc review-warn" role="alert">
+                {problem} The list couldn't be read, so removals are off until the file is fixed or deleted.
+              </p>
+            )}
             {settings.protectedPaths.length > 0 ? (
               <ul className="excl-list">
                 {settings.protectedPaths.map((f) => (

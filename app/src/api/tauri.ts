@@ -22,6 +22,7 @@ export function createTauriApi(): SeekApi {
     installService: () => invoke("install_service"),
     getSettings: () => invoke("get_settings"),
     setSettings: (settings) => invoke("set_settings", { settings }),
+    settingsProblem: () => invoke("settings_problem"),
     startPairing: () => invoke("start_pairing"),
     discoveredPcs: () => invoke("discovered_pcs"),
     joinPairing: (addr, code) => invoke("join_pairing", { addr, code }),

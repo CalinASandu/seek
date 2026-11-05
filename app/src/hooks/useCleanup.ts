@@ -135,13 +135,29 @@ export function createCleanController(api: SeekApi): CleanController {
     if (done) {
       const mine = gen;
       api.cleanScanState().then(
-        (st) => attached && mine === gen && dup.set((cur) => ({ ...cur, otherPcs: st.otherPcs, notice: st.notice ?? null })),
+        (st) => attached && mine === gen && dup.set((cur) => ({ ...cur, otherPcs: st.otherPcs, notice: st.notice ?? cur.notice })),
         () => undefined,
       );
     }
   }
 
+  /** The backend let go of the finished results: release the groups, ticks and marks at once and offer Scan. */
+  function release() {
+    const now = dup.get().status;
+    if (now === "scanning" || now === "cancelling") return; // a newer scan is under way
+    if (timer) clearTimeout(timer);
+    timer = null;
+    pending = [];
+    latestProgress = null;
+    finished = false;
+    fresh.clear();
+    dupTicks.set(NONE);
+    dup.set(IDLE_DUP);
+  }
+
   function onEvent(e: Parameters<Parameters<SeekApi["onCleanEvent"]>[0]>[0]) {
+    if (e.type === "dropped") return release();
+    if (e.type === "notice") return void dup.set((cur) => ({ ...cur, notice: e.text }));
     if (e.type === "group") pending.push(e.group);
     else if (e.type === "progress") latestProgress = e;
     else finished = true;
@@ -155,10 +171,7 @@ export function createCleanController(api: SeekApi): CleanController {
       if (!st.running && st.found.length === 0) {
         // results dropped after a long absence: offer Scan again, with no groups, ticks or marks left to hold.
         // A scan that really found nothing stays as it is.
-        if (cur.groups.length > 0) {
-          fresh.clear();
-          return IDLE_DUP;
-        }
+        if (cur.groups.length > 0) return IDLE_DUP;
         if (cur.status === "scanning") return { ...cur, status: "done", current: null };
         return cur.status === "cancelling" ? { ...cur, status: "cancelled", current: null } : cur;
       }
@@ -184,8 +197,10 @@ export function createCleanController(api: SeekApi): CleanController {
         notice: st.notice ?? null,
       };
     });
-    if (dup.get().status === "idle") dupTicks.set(NONE);
-    else reconcileTicks();
+    if (dup.get().status === "idle") {
+      fresh.clear();
+      dupTicks.set(NONE);
+    } else reconcileTicks();
   }
 
   /** Ticks must name copies that still exist and are unlocked, and never every removable copy of a group with none locked. */
@@ -308,7 +323,7 @@ export function createCleanController(api: SeekApi): CleanController {
         // the backend knows by now which drives it left out
         () =>
           api.cleanScanState().then(
-            (st) => mine === gen && dup.set((cur) => ({ ...cur, notice: st.notice ?? null })),
+            (st) => mine === gen && dup.set((cur) => ({ ...cur, notice: st.notice ?? cur.notice })),
             () => undefined,
           ),
         (e: unknown) => dup.set((cur) => ({ ...cur, status: "error", error: errText(e) })),

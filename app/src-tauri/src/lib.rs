@@ -101,6 +101,7 @@ pub fn run() {
         .manage(link.clone())
         .manage(clean.clone())
         .setup(move |app| {
+            clean.set_app(app.handle().clone());
             let handle = app.handle().clone();
             let events_link = link.clone();
             tauri::async_runtime::spawn(async move { events_link.run_events(handle).await });
@@ -139,6 +140,7 @@ pub fn run() {
             commands::install_service,
             commands::get_settings,
             commands::set_settings,
+            commands::settings_problem,
             commands::start_pairing,
             commands::discovered_pcs,
             commands::join_pairing,
