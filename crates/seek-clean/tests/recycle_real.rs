@@ -497,3 +497,42 @@ fn real_folder_with_too_long_inner_path_outcome() {
         }
     }
 }
+
+/// The size `SHQueryRecycleBinW` reports for the bin of `root` (`C:\`).
+fn bin_size(root: &str) -> i64 {
+    use windows::Win32::UI::Shell::{SHQueryRecycleBinW, SHQUERYRBINFO};
+    let mut info = SHQUERYRBINFO {
+        cbSize: std::mem::size_of::<SHQUERYRBINFO>() as u32,
+        ..Default::default()
+    };
+    unsafe { SHQueryRecycleBinW(PCWSTR(wide(root).as_ptr()), &mut info) }.expect("SHQueryRecycleBinW");
+    info.i64Size
+}
+
+#[test]
+#[ignore]
+fn real_bin_size_counts_a_moved_item_straight_away() {
+    let _wd = Watchdog::start("bin size after a recycle");
+    let dir = fixed_temp_dir();
+    let root = drive_root(dir.path());
+    let file = dir.path().join("seek-binsize.bin");
+    let size = 3 * 1024 * 1024u64;
+    std::fs::write(&file, vec![7u8; size as usize]).unwrap();
+
+    let before = bin_size(&root);
+    let result = recycle_one(&file);
+    let after = bin_size(&root);
+    println!("BINSIZE: before = {before}, after = {after}, rise = {}, file = {size}", after - before);
+    // Put the file back and remove it, whatever the numbers say.
+    if let Ok(report) = &result {
+        let loc = report.confirmed_location().unwrap().to_string();
+        if let Err(e) = restore(&loc, &file) {
+            println!("BINSIZE: RESTORE FAILED, remove from the bin by hand: {e}");
+        }
+    }
+    if file.exists() {
+        std::fs::remove_file(&file).unwrap();
+    }
+    result.expect("recycle");
+    assert!(after - before >= size as i64, "the bin size lags: rose {} for a {size} byte file", after - before);
+}

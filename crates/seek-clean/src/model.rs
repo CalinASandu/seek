@@ -27,7 +27,7 @@ pub enum Lock {
     AppData,
     ToolFolder,
     NoRecycleBin,
-    /// The drive's Recycle Bin is too full to hold the item (or its size can't be read).
+    /// What is already in the drive's Recycle Bin leaves no room for the item.
     BinFull,
     /// The item, or something inside it, has a path too long for the bin to hold reliably.
     PathTooLong,

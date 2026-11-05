@@ -61,7 +61,7 @@ impl Recycler for FakeRecycler {
                     .unwrap()
                     .path();
                 std::fs::remove_file(first).unwrap();
-                out.push(Err(crate::recycle::failure_text(p, 0x8027_0000_u32 as i32)));
+                out.push(Err(crate::recycle::failure_text(p, 0x8027_0027_u32 as i32)));
                 break;
             }
             if *self.destroy_at.lock().unwrap() == Some(n) {
@@ -687,7 +687,7 @@ fn a_partly_removed_folder_never_claims_to_be_left_in_place() {
     for text in [&item, &stopped] {
         assert!(!text.contains("left in place"), "claims it was left: {text}");
     }
-    assert!(stopped.contains("0x80270000"), "the cause is still shown: {stopped}");
+    assert!(stopped.contains("in use by another program"), "the cause is still shown: {stopped}");
     assert!(item.contains("deleted for good"), "{item}");
 }
 
@@ -886,6 +886,23 @@ fn queued_admin_bytes_count_towards_the_drive_total() {
     env.engine.commit(&prep.token, &[0, 1], &[]).unwrap();
     // "some data" is 9 bytes: the second item is judged with the queued first one added.
     assert_eq!(*env.wrap.batches.lock().unwrap(), vec![9, 18]);
+}
+
+#[test]
+fn moved_items_are_not_counted_again_but_queued_admin_items_are() {
+    // The bin's own size already includes what was moved; only bytes not yet in the bin
+    // (queued for the admin step) are added by the engine.
+    let env = Env::new(true);
+    let prep = env.engine.prepare(
+        vec![env.folder("pf/one"), env.folder("left/a"), env.folder("left/b")],
+        &[],
+    );
+    env.wrap.batches.lock().unwrap().clear();
+    let r = env.engine.commit(&prep.token, &[0, 1, 2], &[]).unwrap();
+    assert!(is_moved(&r, 1) && is_moved(&r, 2));
+    // "some data" is 9 bytes. pf/one: 9. left/a: 9 + the queued 9. left/b: 9 + the queued 9,
+    // not also the 9 that left/a already moved.
+    assert_eq!(*env.wrap.batches.lock().unwrap(), vec![9, 18, 18]);
 }
 
 #[test]

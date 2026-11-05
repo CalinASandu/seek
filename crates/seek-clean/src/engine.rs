@@ -53,7 +53,8 @@ struct Seed {
 }
 
 /// Per-call state for judging: the user's protected entries (as written and as they really are,
-/// in `canon` form) and the bytes already planned for the Recycle Bin of each drive.
+/// in `canon` form) and the bytes queued for the admin step on each drive: not in the bin yet, so
+/// the bin's own size does not include them. Moved items are not added; the bin counts them.
 struct Ctx {
     prot: Vec<String>,
     planned: HashMap<String, u64>,
@@ -410,9 +411,8 @@ impl Engine {
                     }
                     Ok(c) if c.admin => left(NEEDS_ADMIN),
                     // One path per call, straight after its own last look.
-                    Ok(c) => match self.recycle_step(rec) {
+                    Ok(_) => match self.recycle_step(rec) {
                         Step::Moved(bin_path) => {
-                            ctx.plan(&c.drive, rec.stat.size);
                             moved_bytes = moved_bytes.saturating_add(rec.stat.size);
                             Outcome::Moved { bin_path }
                         }

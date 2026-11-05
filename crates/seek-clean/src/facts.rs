@@ -278,8 +278,8 @@ pub(crate) struct Policies {
 
 /// Why settings, policies and the bin's size forbid recycling this batch. `NoRecycleBin` for a
 /// setting, a policy, an unreadable or zero capacity, or a batch that alone exceeds the capacity.
-/// `BinFull` when the batch fits but what is already in the bin leaves no room, or the bin's
-/// size is unknown. An absent `NukeOnDelete` is Windows' default (off).
+/// `BinFull` when the batch fits but what is already in the bin leaves no room. An unknown bin
+/// size is `NoRecycleBin`, since emptying the bin may not help. An absent `NukeOnDelete` is Windows' default (off).
 pub(crate) fn capacity_block(
     s: &BinSettings,
     p: &Policies,
@@ -316,8 +316,9 @@ pub(crate) fn capacity_block(
     if u128::from(batch_bytes) * 100 > limit {
         return Some(Lock::NoRecycleBin);
     }
+    // An unreadable bin size is not the user's full bin: emptying it may not help.
     let Some(used) = bin_used else {
-        return Some(Lock::BinFull);
+        return Some(Lock::NoRecycleBin);
     };
     ((u128::from(used) + u128::from(batch_bytes)) * 100 > limit).then_some(Lock::BinFull)
 }
@@ -375,12 +376,17 @@ pub(crate) fn decide(i: &Inputs) -> Option<Lock> {
     if is_cloud(i.attrs) {
         return Some(Lock::CloudPlaceholder);
     }
+    // The drive first: for a removable or network drive the reader stops early and the root
+    // facts below are unchecked, and the user should hear about the drive.
+    if !drive_allows(i.drive) {
+        return Some(Lock::NoRecycleBin);
+    }
     // A subst drive, a junction to another volume or a folder-mounted volume: the written path is
     // not a place Seek can reason about.
     if !i.same_root || !i.volume_root_ok {
         return Some(Lock::UnsupportedPath);
     }
-    if !drive_allows(i.drive) || !i.fs_ok {
+    if !i.fs_ok {
         return Some(Lock::NoRecycleBin);
     }
     capacity_block(&i.settings, &i.policies, i.volume_total, i.bin_used, i.batch_bytes)
@@ -674,7 +680,7 @@ mod tests {
         assert_eq!(decide(&used(Some(800 * MB))), None); // 900 MB in all, exactly the margin
         assert_eq!(decide(&used(Some(800 * MB + 1))), FULL);
         assert_eq!(decide(&used(Some(5000 * MB))), FULL);
-        assert_eq!(decide(&used(None)), FULL, "a failed bin query blocks");
+        assert_eq!(decide(&used(None)), NO, "a failed bin query blocks, and emptying the bin may not help");
     }
 
     #[test]
@@ -710,6 +716,43 @@ mod tests {
             ..ok_inputs()
         };
         assert_eq!(decide(&i), LONG);
+    }
+
+    #[test]
+    fn a_non_fixed_drive_is_no_recycle_bin_even_when_the_volume_root_is_unknown() {
+        // The reader stops early for a non-fixed drive and leaves the root unchecked; the drive
+        // type must be judged first so the user is told about the drive, not the path.
+        for kind in [DriveType::Removable, DriveType::Remote, DriveType::Unknown] {
+            let i = Inputs {
+                drive: kind,
+                volume_root_ok: false,
+                ..ok_inputs()
+            };
+            assert_eq!(decide(&i), NO, "{kind:?}");
+        }
+        // On a fixed drive the same unknown root is a path problem.
+        let i = Inputs {
+            volume_root_ok: false,
+            ..ok_inputs()
+        };
+        assert_eq!(decide(&i), ODD);
+    }
+
+    #[test]
+    fn a_folder_with_a_nested_path_over_the_limit_is_path_too_long() {
+        // Reads only; the length rule is decided before anything that depends on this PC.
+        let d = tempfile::tempdir().unwrap();
+        let folder = d.path().join("f");
+        let mut deep = folder.clone();
+        for n in 0..14 {
+            deep.push(format!("{n:_>19}")); // 14 segments of 19 units: 279 inside
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+        assert_eq!(RealFacts.recycle_block(&folder, 1), Some(Lock::PathTooLong));
+        // The same folder without the nesting is not judged on length.
+        let shallow = d.path().join("g");
+        std::fs::create_dir(&shallow).unwrap();
+        assert_ne!(RealFacts.recycle_block(&shallow, 1), Some(Lock::PathTooLong));
     }
 
     #[test]
