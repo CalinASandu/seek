@@ -17,9 +17,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+use seek_clean::claims::LiveClaims;
 use seek_clean::dupes::{self, ScanEvent, SizeBatch, SizeFile, MIN_DUPLICATE_BYTES};
 use seek_clean::engine::Engine;
-use seek_clean::facts::{ClaimCheck, FileFacts, RealFacts};
+use seek_clean::facts::{FileFacts, RealFacts};
 use seek_clean::model::{Candidate, CommitResult, DupGroup, Outcome, Prepared};
 use seek_clean::paths::canon;
 use seek_clean::protect::Places;
@@ -598,21 +599,11 @@ pub struct Core {
     pub facts: Arc<dyn FileFacts>,
 }
 
-/// TEMPORARY, replaced in Task 10 by the real check of what apps claim. Until then every folder
-/// counts as claimed, so no folder can be removed; files (duplicates) are not asked about.
-pub struct NoFolderClaimsYet;
-
-impl ClaimCheck for NoFolderClaimsYet {
-    fn is_claimed(&self, _folder: &Path) -> Option<String> {
-        Some("Folder checks are not available yet".to_string())
-    }
-}
-
 impl Core {
     fn real(places: Places) -> Core {
         let facts: Arc<dyn FileFacts> = Arc::new(RealFacts);
         // No elevator until Task 14: Program Files leftovers are left with the admin reason.
-        let engine = Engine::new(places.clone(), Arc::new(ShellRecycler), None, facts.clone(), Arc::new(NoFolderClaimsYet));
+        let engine = Engine::new(places.clone(), Arc::new(ShellRecycler), None, facts.clone(), Arc::new(LiveClaims::new()));
         Core { engine, places, facts }
     }
 }
