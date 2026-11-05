@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 pub use seek_core::{Device, DeviceId, ResultRow, SortKey, SpaceNode, TypeTotal};
 
 pub const PIPE_NAME: &str = r"\\.\pipe\seek-v1";
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 /// Largest accepted frame (share index uploads can be big).
 pub const MAX_FRAME_BYTES: usize = 256 * 1024 * 1024;
 
@@ -71,6 +71,18 @@ pub enum Request {
     SpaceLargest { device_id: DeviceId, path: String, limit: u32 },
     /// Bytes below `path` by kind of file.
     SpaceTypes { device_id: DeviceId, path: String },
+    /// Files that share a size (at least `min_size` bytes) across `device_ids`, largest size first; only
+    /// sizes held by two or more files. `cursor` is the largest size still to return (`None` = from the top).
+    /// A page is whole size groups, about `limit` files, and always at least one group.
+    SameSizeFiles { min_size: u64, device_ids: Vec<DeviceId>, cursor: Option<u64>, limit: u32 },
+}
+
+/// The files of one size, see [`Request::SameSizeFiles`].
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SizeGroup {
+    pub size: u64,
+    pub files: Vec<ResultRow>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -97,6 +109,8 @@ pub enum Response {
     SpaceTree { node: SpaceNode },
     SpaceFiles { files: Vec<ResultRow> },
     SpaceTypes { types: Vec<TypeTotal> },
+    /// `next` = the size to pass as `cursor` for the following page; `None` = that was the last page.
+    SameSizeFiles { groups: Vec<SizeGroup>, next: Option<u64> },
     Memory { report: MemoryReport },
 }
 
@@ -323,5 +337,20 @@ mod tests {
         let l = Request::SpaceLargest { device_id: uuid::Uuid::nil(), path: r"D:\".into(), limit: 50 };
         assert!(serde_json::to_string(&l).unwrap().starts_with(r#"{"type":"spaceLargest","deviceId":"#));
         assert_eq!(serde_json::to_string(&Response::SpaceFiles { files: vec![] }).unwrap(), r#"{"type":"spaceFiles","files":[]}"#);
+    }
+
+    #[test]
+    fn same_size_json_shapes() {
+        let r = Request::SameSizeFiles { min_size: 1_048_576, device_ids: vec![uuid::Uuid::nil()], cursor: None, limit: 200 };
+        let js = serde_json::to_string(&r).unwrap();
+        assert_eq!(
+            js,
+            r#"{"type":"sameSizeFiles","minSize":1048576,"deviceIds":["00000000-0000-0000-0000-000000000000"],"cursor":null,"limit":200}"#
+        );
+        assert_eq!(serde_json::from_str::<Request>(&js).unwrap(), r);
+        let resp = Response::SameSizeFiles { groups: vec![SizeGroup { size: 5, files: vec![] }], next: Some(4) };
+        let js = serde_json::to_string(&resp).unwrap();
+        assert_eq!(js, r#"{"type":"sameSizeFiles","groups":[{"size":5,"files":[]}],"next":4}"#);
+        assert_eq!(serde_json::from_str::<Response>(&js).unwrap(), resp);
     }
 }

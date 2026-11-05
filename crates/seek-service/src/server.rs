@@ -1,6 +1,6 @@
 //! Named-pipe server: one task per connection, requests handled concurrently.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -8,11 +8,11 @@ use std::time::Instant;
 use base64::Engine;
 use seek_core::{
     decode_index, materialize, normalize_unc, query, search, Device, DeviceId, DeviceIdentity,
-    DeviceKind, DeviceIndex, DeviceState, FolderTotals, Hit, SearchDevice, SortKey,
+    DeviceKind, DeviceIndex, DeviceState, FolderTotals, Hit, ResultRow, SearchDevice, SortKey,
 };
 use seek_ipc::{
     create_server, read_frame, write_frame, Envelope, IndexProgress, PcInfo, PcSummary, Request,
-    Response, StatusInfo, UserVolume, PROTOCOL_VERSION,
+    Response, SizeGroup, StatusInfo, UserVolume, PROTOCOL_VERSION,
 };
 use seek_sync::peers::PeerState;
 use tokio::net::windows::named_pipe::NamedPipeServer;
@@ -279,6 +279,9 @@ async fn handle(state: Arc<State>, conn: Arc<Conn>, req: Request) -> Response {
             })
             .await
         }
+        Request::SameSizeFiles { min_size, device_ids, cursor, limit } => {
+            same_size_files(state, conn, min_size, device_ids, cursor, limit).await
+        }
         Request::Status => Response::Status(status(&state)),
         Request::Subscribe => Response::Ok,
         Request::StartPairing
@@ -524,6 +527,92 @@ async fn space(
     })
     .await
     .unwrap_or_else(|e| err(format!("space view failed: {e}")))
+}
+
+/// One page of files that share a size across `device_ids` (first stage of the duplicate finder). Reads the
+/// index only and keeps nothing between pages: each call recomputes from the cursor, so an index change
+/// between pages can shift results, but every page's sizes are strictly below the previous page's.
+async fn same_size_files(
+    state: Arc<State>,
+    conn: Arc<Conn>,
+    min_size: u64,
+    device_ids: Vec<DeviceId>,
+    cursor: Option<u64>,
+    limit: u32,
+) -> Response {
+    if device_ids.is_empty() {
+        return Response::SameSizeFiles { groups: Vec::new(), next: None };
+    }
+    tokio::task::spawn_blocking(move || {
+        let mut snap = state.snapshot("same size");
+        // unknown ids simply match nothing; the order is stable whatever the snapshot's order
+        snap.retain(|s| device_ids.contains(&s.device.id));
+        snap.sort_by_key(|s| s.device.id);
+        let guards: Vec<_> = snap.iter().map(|s| s.index.read().unwrap()).collect();
+        let masks: Vec<_> = snap
+            .iter()
+            .zip(&guards)
+            .map(|(s, g)| {
+                let hidden = state.hidden_for(&s.device, &conn.sid, conn.elevated, &conn.hidden);
+                state.hidden_mask(&s.device, g, &conn.sid, &hidden)
+            })
+            .collect();
+        let mask_of = |d: usize| masks[d].as_deref().map(Vec::as_slice);
+
+        // files per size over all chosen drives; only sizes held by two or more files are candidates
+        let mut counts: HashMap<u64, u64> = HashMap::new();
+        for (d, g) in guards.iter().enumerate() {
+            for (size, n) in seek_core::sizes_with_files(g, mask_of(d), min_size) {
+                *counts.entry(size).or_default() += u64::from(n);
+            }
+        }
+        let mut sizes: Vec<(u64, u64)> = counts
+            .into_iter()
+            .filter(|&(size, n)| n >= 2 && cursor.is_none_or(|c| size <= c))
+            .collect();
+        sizes.sort_unstable_by_key(|&(size, _)| std::cmp::Reverse(size));
+
+        // whole groups, up to about `limit` files, and always at least one
+        let (mut taken, mut files) = (0, 0u64);
+        for &(_, n) in &sizes {
+            if taken > 0 && files + n > u64::from(limit) {
+                break;
+            }
+            taken += 1;
+            files += n;
+        }
+        let next = sizes.get(taken).map(|&(size, _)| size);
+        let page: Vec<u64> = sizes[..taken].iter().map(|&(size, _)| size).collect();
+        let wanted: HashSet<u64> = page.iter().copied().collect();
+
+        let devs: Vec<SearchDevice> = snap
+            .iter()
+            .zip(&guards)
+            .map(|(s, g)| SearchDevice {
+                device: &s.device,
+                index: g,
+                mount: &s.device.last_mount_point,
+                online: s.online,
+                pc: &s.pc,
+            })
+            .collect();
+        let mut by_size: HashMap<u64, Vec<ResultRow>> = HashMap::new();
+        for (d, g) in guards.iter().enumerate() {
+            for (size, rows) in seek_core::files_of_size(g, mask_of(d), &wanted) {
+                by_size
+                    .entry(size)
+                    .or_default()
+                    .extend(rows.into_iter().map(|row| materialize(&devs, Hit { dev: d as u16, row })));
+            }
+        }
+        let groups = page
+            .into_iter()
+            .map(|size| SizeGroup { size, files: by_size.remove(&size).unwrap_or_default() })
+            .collect();
+        Response::SameSizeFiles { groups, next }
+    })
+    .await
+    .unwrap_or_else(|e| err(format!("same-size search failed: {e}")))
 }
 
 /// `Some(None)` for the drive root, `Some(Some(row))` for a live folder, `None` when there is no such folder.
