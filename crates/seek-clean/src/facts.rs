@@ -9,9 +9,10 @@ use std::path::{Path, PathBuf};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_SUCCESS};
 use windows::Win32::Storage::FileSystem::{
-    GetDriveTypeW, GetFileInformationByHandle, GetVolumeNameForVolumeMountPointW, BY_HANDLE_FILE_INFORMATION,
+    GetDiskFreeSpaceExW, GetDriveTypeW, GetFileInformationByHandle, GetVolumeInformationW,
+    GetVolumeNameForVolumeMountPointW, GetVolumePathNameW, BY_HANDLE_FILE_INFORMATION,
 };
-use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
+use windows::Win32::System::Registry::{RegGetValueW, HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD};
 use windows::Win32::UI::Shell::{SHQueryRecycleBinW, SHQUERYRBINFO};
 
 use crate::model::{ItemOutcome, JobItem, Lock};
@@ -138,29 +139,53 @@ impl FileFacts for RealFacts {
     /// Reads the facts from this PC, then decides with `decide`. Anything it cannot read blocks.
     fn recycle_block(&self, path: &Path, batch_bytes: u64) -> Option<Lock> {
         use std::os::windows::ffi::OsStrExt;
-        let path_units = path.as_os_str().encode_wide().count();
+        let written_units = path.as_os_str().encode_wide().count();
+        let name_units = path.file_name().map_or(0, |n| n.encode_wide().count());
         let Ok(md) = std::fs::symlink_metadata(path) else {
             return Some(Lock::UnsupportedPath);
         };
+        let attrs = md.file_attributes();
+        let is_dir = attrs & ATTR_DIRECTORY != 0 && attrs & ATTR_REPARSE == 0;
+        let Ok(inner_suffix) = longest_inner_suffix(path, is_dir) else {
+            return Some(Lock::UnsupportedPath); // an unreadable entry: an unknown folder is not one to remove
+        };
         // The drive of the real location: a link into another volume is judged by that volume.
-        let drive = crate::paths::real_location(path).and_then(|r| drive_root(&r));
-        let kind = match &drive {
-            Some(root) => DriveType::from_raw(drive_type(root)),
-            None => DriveType::Unknown,
-        };
-        let drive_ok = drive_allows(kind);
-        let (bin_query_ok, settings) = match (&drive, drive_ok) {
-            (Some(root), true) => (bin_query_succeeds(root), read_bin_settings(root)),
-            _ => (false, BinSettings::default()),
-        };
-        decide(&Inputs {
-            path_units,
-            attrs: md.file_attributes(),
-            drive: kind,
-            bin_query_ok,
-            settings,
+        let real = crate::paths::real_location(path);
+        let real_units = real.as_deref().map_or(0, |r| r.encode_utf16().count());
+        let drive = real.as_deref().and_then(drive_root);
+        let mut i = Inputs {
+            top_units: written_units.max(real_units),
+            name_units,
+            inner_suffix,
+            attrs,
+            drive: DriveType::Unknown,
+            same_root: real
+                .as_deref()
+                .is_some_and(|r| same_drive(&path.to_string_lossy(), r)),
+            volume_root_ok: false,
+            fs_ok: false,
+            bin_used: None,
+            settings: BinSettings::default(),
+            policies: Policies::default(),
+            volume_total: None,
             batch_bytes,
-        })
+        };
+        let Some(root) = drive else {
+            return decide(&i);
+        };
+        i.drive = DriveType::from_raw(drive_type(&root));
+        if !drive_allows(i.drive) {
+            return decide(&i);
+        }
+        i.volume_root_ok = real.as_deref().is_some_and(|r| volume_path_name(r).is_some_and(|v| v.eq_ignore_ascii_case(&root)));
+        i.fs_ok = file_system(&root).is_some_and(|f| fs_allows(&f));
+        i.bin_used = bin_used_bytes(&root);
+        i.settings = read_bin_settings(&root);
+        i.policies = read_policies();
+        if i.policies.recycle_bin_size != PolicyValue::Absent {
+            i.volume_total = volume_total_bytes(&root);
+        }
+        decide(&i)
     }
 }
 
@@ -169,6 +194,12 @@ impl FileFacts for RealFacts {
 /// minus the terminator, so this is conservative: some longer paths may recycle fine and are
 /// refused anyway, which only costs the user a manual removal.
 pub(crate) const MAX_ORIGINAL_PATH_UNITS: usize = 259;
+
+/// What the bin adds in front of a stored path (its `$Recycle.Bin\<SID>\$R...` location), in
+/// UTF-16 units. A generous estimate: the SID is about 46 units and the rest about 25. The path
+/// inside the bin is that prefix plus the item's path relative to the selected folder, and it too
+/// must stay under `MAX_ORIGINAL_PATH_UNITS`.
+pub(crate) const BIN_PREFIX_UNITS: usize = 80;
 
 /// A batch above this share of the bin's `MaxCapacity` is refused. Windows does not document the
 /// exact point at which it deletes permanently instead, so the margin is deliberate.
@@ -216,38 +247,135 @@ pub(crate) struct BinSettings {
     pub(crate) max_capacity_mb: Option<u32>,
 }
 
-/// True when the bin settings alone forbid recycling this batch. An absent `NukeOnDelete` is
-/// Windows' default (off). An absent or unreadable `MaxCapacity` blocks.
-pub(crate) fn bin_settings_block(s: &BinSettings, batch_bytes: u64) -> bool {
+/// A policy value under `Policies\Explorer`, merged over HKCU and HKLM.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum PolicyValue {
+    #[default]
+    Absent,
+    Value(u32),
+    /// Present but not readable as a DWORD.
+    Unreadable,
+}
+
+impl PolicyValue {
+    /// Combines two hives: unreadable wins, then `pick` chooses between two values.
+    pub(crate) fn merge(self, other: PolicyValue, pick: fn(u32, u32) -> u32) -> PolicyValue {
+        match (self, other) {
+            (PolicyValue::Unreadable, _) | (_, PolicyValue::Unreadable) => PolicyValue::Unreadable,
+            (PolicyValue::Absent, o) | (o, PolicyValue::Absent) => o,
+            (PolicyValue::Value(a), PolicyValue::Value(b)) => PolicyValue::Value(pick(a, b)),
+        }
+    }
+}
+
+/// `NoRecycleFiles` (non-zero: files are deleted for good) and `RecycleBinSize` (percent of the
+/// volume the bin may use).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Policies {
+    pub(crate) no_recycle_files: PolicyValue,
+    pub(crate) recycle_bin_size: PolicyValue,
+}
+
+/// True when settings, policies and the bin's current size forbid recycling this batch. An
+/// absent `NukeOnDelete` is Windows' default (off). Anything that cannot be read, a zero
+/// capacity, or a policy that needs the volume size when that was unreadable, blocks. The bin's
+/// current size counts: what is already in it uses up the capacity.
+pub(crate) fn capacity_block(
+    s: &BinSettings,
+    p: &Policies,
+    volume_total: Option<u64>,
+    bin_used: Option<u64>,
+    batch_bytes: u64,
+) -> bool {
     if s.nuke_on_delete.unwrap_or(0) != 0 {
         return true;
+    }
+    match p.no_recycle_files {
+        PolicyValue::Absent | PolicyValue::Value(0) => {}
+        PolicyValue::Value(_) | PolicyValue::Unreadable => return true,
     }
     let Some(mb) = s.max_capacity_mb else {
         return true;
     };
-    let capacity = u128::from(mb) * BYTES_PER_CAPACITY_UNIT;
-    u128::from(batch_bytes) * 100 > capacity * CAPACITY_MARGIN_PERCENT
+    let mut capacity = u128::from(mb) * BYTES_PER_CAPACITY_UNIT;
+    match p.recycle_bin_size {
+        PolicyValue::Absent => {}
+        PolicyValue::Unreadable => return true,
+        PolicyValue::Value(percent) => {
+            let Some(total) = volume_total else {
+                return true;
+            };
+            capacity = capacity.min(u128::from(total) * u128::from(percent) / 100);
+        }
+    }
+    if capacity == 0 {
+        return true;
+    }
+    let Some(used) = bin_used else {
+        return true;
+    };
+    (u128::from(used) + u128::from(batch_bytes)) * 100 > capacity * CAPACITY_MARGIN_PERCENT
+}
+
+/// True when the item (or anything inside it) has a path the bin cannot store. `top_units` is the
+/// selected path (the longer of its written and real spellings), `name_units` its last segment,
+/// and `inner_suffix` the longest path inside it, relative to it, if it is a folder with contents.
+pub(crate) fn path_too_long(top_units: usize, name_units: usize, inner_suffix: Option<usize>) -> bool {
+    let inner = inner_suffix.map_or(0, |s| s + 1); // the separator plus the relative path
+    top_units + inner > MAX_ORIGINAL_PATH_UNITS
+        || BIN_PREFIX_UNITS + name_units + inner > MAX_ORIGINAL_PATH_UNITS
+}
+
+/// Only NTFS and ReFS keep a bin Seek can rely on; Windows may delete from other formats for good.
+pub(crate) fn fs_allows(name: &str) -> bool {
+    name.eq_ignore_ascii_case("NTFS") || name.eq_ignore_ascii_case("ReFS")
+}
+
+/// True when both paths start with the same drive letter (case-insensitive). A subst drive or a
+/// junction to another volume makes the written and real roots differ.
+pub(crate) fn same_drive(written: &str, real: &str) -> bool {
+    match (drive_root(written), drive_root(real)) {
+        (Some(a), Some(b)) => a.eq_ignore_ascii_case(&b),
+        _ => false,
+    }
 }
 
 /// Everything `decide` needs, already read.
 pub(crate) struct Inputs {
-    pub(crate) path_units: usize,
+    /// The longer of the written and real spellings of the path.
+    pub(crate) top_units: usize,
+    pub(crate) name_units: usize,
+    /// Longest path inside a folder, relative to it.
+    pub(crate) inner_suffix: Option<usize>,
     pub(crate) attrs: u32,
     pub(crate) drive: DriveType,
-    pub(crate) bin_query_ok: bool,
+    /// The written path and the real path start on the same drive letter.
+    pub(crate) same_root: bool,
+    /// The real location's volume mount point is exactly the drive's `x:\`.
+    pub(crate) volume_root_ok: bool,
+    pub(crate) fs_ok: bool,
+    /// Bytes in the drive's bin, `None` when `SHQueryRecycleBinW` failed.
+    pub(crate) bin_used: Option<u64>,
     pub(crate) settings: BinSettings,
+    pub(crate) policies: Policies,
+    pub(crate) volume_total: Option<u64>,
     pub(crate) batch_bytes: u64,
 }
 
 /// The pre-checks of the spec, as a pure function. The first failing one names the lock.
 pub(crate) fn decide(i: &Inputs) -> Option<Lock> {
-    if i.path_units > MAX_ORIGINAL_PATH_UNITS {
+    if path_too_long(i.top_units, i.name_units, i.inner_suffix) {
         return Some(Lock::UnsupportedPath);
     }
     if is_cloud(i.attrs) {
         return Some(Lock::CloudPlaceholder);
     }
-    if !drive_allows(i.drive) || !i.bin_query_ok || bin_settings_block(&i.settings, i.batch_bytes) {
+    if !drive_allows(i.drive)
+        || !i.same_root
+        || !i.volume_root_ok
+        || !i.fs_ok
+        || capacity_block(&i.settings, &i.policies, i.volume_total, i.bin_used, i.batch_bytes)
+    {
         return Some(Lock::NoRecycleBin);
     }
     None
@@ -274,14 +402,60 @@ fn drive_type(root: &str) -> u32 {
     unsafe { GetDriveTypeW(PCWSTR(wide_z(root).as_ptr())) }
 }
 
-/// `SHQueryRecycleBinW` must succeed for the drive; a failure means Seek cannot vouch for its bin.
-fn bin_query_succeeds(root: &str) -> bool {
+/// The bin's current size in bytes from `SHQueryRecycleBinW`. A failed call (or a nonsense
+/// negative size) is `None`, which blocks: Seek cannot vouch for a bin it cannot query.
+fn bin_used_bytes(root: &str) -> Option<u64> {
     let mut info = SHQUERYRBINFO {
         cbSize: std::mem::size_of::<SHQUERYRBINFO>() as u32,
         ..Default::default()
     };
     // SAFETY: `info` is a valid out-structure with its size set; the string is NUL-terminated.
-    unsafe { SHQueryRecycleBinW(PCWSTR(wide_z(root).as_ptr()), &mut info) }.is_ok()
+    unsafe { SHQueryRecycleBinW(PCWSTR(wide_z(root).as_ptr()), &mut info) }.ok()?;
+    u64::try_from(info.i64Size).ok()
+}
+
+/// The mount point of the volume holding `path`; `x:\` for a volume mounted as a drive letter.
+fn volume_path_name(path: &str) -> Option<String> {
+    let mut buf = [0u16; 1024];
+    // SAFETY: NUL-terminated input, valid output buffer.
+    unsafe { GetVolumePathNameW(PCWSTR(wide_z(path).as_ptr()), &mut buf) }.ok()?;
+    let end = buf.iter().position(|&c| c == 0)?;
+    Some(String::from_utf16_lossy(&buf[..end]))
+}
+
+/// The file system name (`NTFS`) of the volume at `root`.
+fn file_system(root: &str) -> Option<String> {
+    let mut buf = [0u16; 64];
+    // SAFETY: NUL-terminated input, valid output buffer.
+    unsafe { GetVolumeInformationW(PCWSTR(wide_z(root).as_ptr()), None, None, None, None, Some(&mut buf)) }.ok()?;
+    let end = buf.iter().position(|&c| c == 0)?;
+    Some(String::from_utf16_lossy(&buf[..end]))
+}
+
+fn volume_total_bytes(root: &str) -> Option<u64> {
+    let mut total = 0u64;
+    // SAFETY: NUL-terminated input, valid out-pointer.
+    unsafe { GetDiskFreeSpaceExW(PCWSTR(wide_z(root).as_ptr()), None, Some(&mut total), None) }.ok()?;
+    Some(total)
+}
+
+const POLICIES_EXPLORER: &str = r"Software\Microsoft\Windows\CurrentVersion\Policies\Explorer";
+
+/// `NoRecycleFiles` and `RecycleBinSize` from both HKCU and HKLM, read only.
+fn read_policies() -> Policies {
+    let key = wide_z(POLICIES_EXPLORER);
+    let one = |name: &str, pick: fn(u32, u32) -> u32| {
+        let of = |hive| match read_dword(hive, &key, name) {
+            Ok(None) => PolicyValue::Absent,
+            Ok(Some(v)) => PolicyValue::Value(v),
+            Err(()) => PolicyValue::Unreadable,
+        };
+        of(HKEY_CURRENT_USER).merge(of(HKEY_LOCAL_MACHINE), pick)
+    };
+    Policies {
+        no_recycle_files: one("NoRecycleFiles", u32::max),
+        recycle_bin_size: one("RecycleBinSize", u32::min),
+    }
 }
 
 const BIT_BUCKET_VOLUMES: &str = r"Software\Microsoft\Windows\CurrentVersion\Explorer\BitBucket\Volume";
@@ -301,19 +475,19 @@ fn read_bin_settings(root: &str) -> BinSettings {
     let key = wide_z(&format!(r"{BIT_BUCKET_VOLUMES}\{{{guid}}}"));
     BinSettings {
         // Unreadable (not merely absent) counts as on.
-        nuke_on_delete: read_dword(&key, "NukeOnDelete").unwrap_or(Some(1)),
-        max_capacity_mb: read_dword(&key, "MaxCapacity").unwrap_or(None),
+        nuke_on_delete: read_dword(HKEY_CURRENT_USER, &key, "NukeOnDelete").unwrap_or(Some(1)),
+        max_capacity_mb: read_dword(HKEY_CURRENT_USER, &key, "MaxCapacity").unwrap_or(None),
     }
 }
 
-/// Ok(None) = value absent; Err = present or key present but unreadable.
-fn read_dword(key: &[u16], value: &str) -> Result<Option<u32>, ()> {
+/// Ok(None) = value (or key) absent; Err = present but not readable as a DWORD.
+fn read_dword(hive: HKEY, key: &[u16], value: &str) -> Result<Option<u32>, ()> {
     let mut data = 0u32;
     let mut size = std::mem::size_of::<u32>() as u32;
     // SAFETY: `key` and the value name are NUL-terminated; `data`/`size` describe a u32.
     let rc = unsafe {
         RegGetValueW(
-            HKEY_CURRENT_USER,
+            hive,
             PCWSTR(key.as_ptr()),
             PCWSTR(wide_z(value).as_ptr()),
             RRF_RT_REG_DWORD,
@@ -359,6 +533,32 @@ fn walk(root: &Path, s: &mut Stat) -> Option<()> {
     Some(())
 }
 
+/// The longest path inside a folder, in UTF-16 units relative to it (`sub\file.txt` is 12), or
+/// `None` for a file or an empty folder. Links inside are counted but not entered. Any unreadable
+/// entry is an Err: an unknown folder is not one to remove.
+fn longest_inner_suffix(root: &Path, is_dir: bool) -> Result<Option<usize>, ()> {
+    use std::os::windows::ffi::OsStrExt;
+    if !is_dir {
+        return Ok(None);
+    }
+    let mut longest: Option<usize> = None;
+    let mut stack = vec![(root.to_path_buf(), 0usize)];
+    while let Some((dir, dir_suffix)) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).map_err(|_| ())? {
+            let entry = entry.map_err(|_| ())?;
+            let md = entry.metadata().map_err(|_| ())?;
+            let name = entry.file_name().encode_wide().count();
+            let suffix = if dir_suffix == 0 { name } else { dir_suffix + 1 + name };
+            longest = Some(longest.map_or(suffix, |l| l.max(suffix)));
+            let attrs = md.file_attributes();
+            if attrs & ATTR_DIRECTORY != 0 && attrs & ATTR_REPARSE == 0 {
+                stack.push((entry.path(), suffix));
+            }
+        }
+    }
+    Ok(longest)
+}
+
 fn open(p: &Path) -> Result<File, String> {
     File::open(p).map_err(|e| format!("Cannot read {}: {e}", p.display()))
 }
@@ -384,17 +584,37 @@ mod tests {
 
     fn ok_inputs() -> Inputs {
         Inputs {
-            path_units: 40,
+            top_units: 40,
+            name_units: 10,
+            inner_suffix: None,
             attrs: 0x20,
             drive: DriveType::Fixed,
-            bin_query_ok: true,
+            same_root: true,
+            volume_root_ok: true,
+            fs_ok: true,
+            bin_used: Some(0),
             settings: BinSettings {
                 nuke_on_delete: Some(0),
                 max_capacity_mb: Some(1000),
             },
+            policies: Policies::default(),
+            volume_total: None,
             batch_bytes: 10 * MB,
         }
     }
+
+    fn with_settings(max_mb: Option<u32>, batch: u64) -> Inputs {
+        Inputs {
+            settings: BinSettings {
+                nuke_on_delete: Some(0),
+                max_capacity_mb: max_mb,
+            },
+            batch_bytes: batch,
+            ..ok_inputs()
+        }
+    }
+
+    const NO: Option<Lock> = Some(Lock::NoRecycleBin);
 
     #[test]
     fn an_ordinary_item_is_allowed() {
@@ -410,63 +630,72 @@ mod tests {
                 drive: DriveType::from_raw(raw),
                 ..ok_inputs()
             };
-            assert_eq!(decide(&i), Some(Lock::NoRecycleBin), "drive type {raw}");
+            assert_eq!(decide(&i), NO, "drive type {raw}");
         }
     }
 
     #[test]
     fn nuke_on_delete_blocks() {
         for (nuke, blocks) in [(Some(0), false), (None, false), (Some(1), true), (Some(7), true)] {
-            let i = Inputs {
-                settings: BinSettings {
-                    nuke_on_delete: nuke,
-                    max_capacity_mb: Some(1000),
-                },
-                ..ok_inputs()
-            };
-            assert_eq!(decide(&i) == Some(Lock::NoRecycleBin), blocks, "NukeOnDelete {nuke:?}");
+            let mut i = ok_inputs();
+            i.settings.nuke_on_delete = nuke;
+            assert_eq!(decide(&i) == NO, blocks, "NukeOnDelete {nuke:?}");
         }
     }
 
     #[test]
     fn a_batch_over_max_capacity_blocks() {
-        let at = |mb: Option<u32>, bytes: u64| Inputs {
-            settings: BinSettings {
-                nuke_on_delete: Some(0),
-                max_capacity_mb: mb,
-            },
-            batch_bytes: bytes,
-            ..ok_inputs()
-        };
         // 90% of 1000 MB is 900 MB.
-        assert_eq!(decide(&at(Some(1000), 900 * MB)), None);
-        assert_eq!(decide(&at(Some(1000), 900 * MB + 1)), Some(Lock::NoRecycleBin));
-        assert_eq!(decide(&at(Some(1000), 2000 * MB)), Some(Lock::NoRecycleBin));
-        // The capacity is in MB: a 1000 MB batch is not "tiny" next to a 1000 value.
-        assert_eq!(decide(&at(Some(1000), 1000 * MB)), Some(Lock::NoRecycleBin));
-        // Unreadable capacity refuses, even for an empty batch.
-        assert_eq!(decide(&at(None, 0)), Some(Lock::NoRecycleBin));
+        assert_eq!(decide(&with_settings(Some(1000), 900 * MB)), None);
+        assert_eq!(decide(&with_settings(Some(1000), 900 * MB + 1)), NO);
+        assert_eq!(decide(&with_settings(Some(1000), 2000 * MB)), NO);
+        assert_eq!(decide(&with_settings(Some(1000), 1000 * MB)), NO);
+        // Unreadable or zero capacity refuses, even for an empty batch.
+        assert_eq!(decide(&with_settings(None, 0)), NO);
+        assert_eq!(decide(&with_settings(Some(0), 0)), NO);
         // Huge values do not overflow.
-        assert_eq!(decide(&at(Some(u32::MAX), u64::MAX)), Some(Lock::NoRecycleBin));
+        assert_eq!(decide(&with_settings(Some(u32::MAX), u64::MAX)), NO);
     }
 
     #[test]
-    fn a_failed_bin_query_blocks() {
-        let i = Inputs {
-            bin_query_ok: false,
-            ..ok_inputs()
+    fn what_is_already_in_the_bin_counts() {
+        let used = |bin_used| Inputs {
+            bin_used,
+            ..with_settings(Some(1000), 100 * MB)
         };
-        assert_eq!(decide(&i), Some(Lock::NoRecycleBin));
+        assert_eq!(decide(&used(Some(800 * MB))), None); // 900 MB in all, exactly the margin
+        assert_eq!(decide(&used(Some(800 * MB + 1))), NO);
+        assert_eq!(decide(&used(Some(5000 * MB))), NO);
+        assert_eq!(decide(&used(None)), NO, "a failed bin query blocks");
     }
 
     #[test]
     fn a_too_long_path_blocks_with_its_own_reason() {
-        let at = |n| Inputs {
-            path_units: n,
+        let long = |top, name, suffix| Inputs {
+            top_units: top,
+            name_units: name,
+            inner_suffix: suffix,
             ..ok_inputs()
         };
-        assert_eq!(decide(&at(MAX_ORIGINAL_PATH_UNITS)), None);
-        assert_eq!(decide(&at(MAX_ORIGINAL_PATH_UNITS + 1)), Some(Lock::UnsupportedPath));
+        assert_eq!(decide(&long(MAX_ORIGINAL_PATH_UNITS, 10, None)), None);
+        assert_eq!(decide(&long(MAX_ORIGINAL_PATH_UNITS + 1, 10, None)), Some(Lock::UnsupportedPath));
+        // A file with a long name: the bin prefix counts.
+        assert_eq!(decide(&long(100, 179, None)), None);
+        assert_eq!(decide(&long(100, 180, None)), Some(Lock::UnsupportedPath));
+    }
+
+    #[test]
+    fn a_long_path_inside_a_folder_blocks() {
+        let inner = |top, name, suffix| path_too_long(top, name, Some(suffix));
+        // Full length: top + 1 + suffix.
+        assert!(!inner(250, 10, 8)); // 250 + 9 = 259
+        assert!(inner(250, 10, 9)); // 260
+        // Relative to the selected folder: 80 + name + 1 + suffix.
+        assert!(!inner(30, 10, 168)); // 80 + 10 + 169 = 259
+        assert!(inner(30, 10, 169)); // 260, though the full path is only 200
+        // The plain case the review found: a short folder with a 241-unit inner path.
+        assert!(inner(40, 10, 241));
+        assert!(!path_too_long(40, 10, None));
     }
 
     #[test]
@@ -478,6 +707,76 @@ mod tests {
             };
             assert_eq!(decide(&i), Some(Lock::CloudPlaceholder), "attribute {attr:#x}");
         }
+    }
+
+    #[test]
+    fn a_folder_mounted_volume_or_a_different_root_blocks() {
+        let i = Inputs {
+            volume_root_ok: false,
+            ..ok_inputs()
+        };
+        assert_eq!(decide(&i), NO);
+        let i = Inputs {
+            same_root: false,
+            ..ok_inputs()
+        };
+        assert_eq!(decide(&i), NO);
+        assert!(same_drive(r"X:\a\b", r"x:\other\b"));
+        assert!(!same_drive(r"X:\a", r"d:\a"));
+        assert!(!same_drive(r"\\server\share", r"c:\a"));
+        assert!(!same_drive(r"c:\a", ""));
+    }
+
+    #[test]
+    fn only_ntfs_and_refs_pass() {
+        for (name, ok) in [("NTFS", true), ("ntfs", true), ("ReFS", true), ("FAT32", false), ("exFAT", false), ("", false), ("CDFS", false)] {
+            assert_eq!(fs_allows(name), ok, "{name}");
+        }
+        let i = Inputs {
+            fs_ok: false,
+            ..ok_inputs()
+        };
+        assert_eq!(decide(&i), NO);
+    }
+
+    #[test]
+    fn policies_block_or_shrink_the_capacity() {
+        let with = |p: Policies, total: Option<u64>, batch| Inputs {
+            policies: p,
+            volume_total: total,
+            batch_bytes: batch,
+            ..ok_inputs()
+        };
+        let pol = |nrf, size| Policies {
+            no_recycle_files: nrf,
+            recycle_bin_size: size,
+        };
+        use PolicyValue::*;
+        assert_eq!(decide(&with(pol(Value(0), Absent), None, MB)), None);
+        assert_eq!(decide(&with(pol(Value(1), Absent), None, MB)), NO);
+        assert_eq!(decide(&with(pol(Unreadable, Absent), None, MB)), NO);
+        assert_eq!(decide(&with(pol(Absent, Unreadable), None, MB)), NO);
+        // 10% of a 2000 MB volume is 200 MB, below MaxCapacity 1000 MB: 90% of it is 180 MB.
+        let ten = pol(Absent, Value(10));
+        assert_eq!(decide(&with(ten, Some(2000 * MB), 180 * MB)), None);
+        assert_eq!(decide(&with(ten, Some(2000 * MB), 181 * MB)), NO);
+        // A policy percent above MaxCapacity changes nothing.
+        assert_eq!(decide(&with(pol(Absent, Value(100)), Some(2000 * MB), 900 * MB)), None);
+        // The policy is present but the volume size could not be read.
+        assert_eq!(decide(&with(ten, None, MB)), NO);
+        // A zero percent leaves no room.
+        assert_eq!(decide(&with(pol(Absent, Value(0)), Some(2000 * MB), 0)), NO);
+    }
+
+    #[test]
+    fn policy_values_merge_over_both_hives() {
+        use PolicyValue::*;
+        assert_eq!(Absent.merge(Absent, u32::max), Absent);
+        assert_eq!(Absent.merge(Value(3), u32::max), Value(3));
+        assert_eq!(Value(0).merge(Value(1), u32::max), Value(1));
+        assert_eq!(Value(30).merge(Value(10), u32::min), Value(10));
+        assert_eq!(Value(30).merge(Unreadable, u32::min), Unreadable);
+        assert_eq!(Unreadable.merge(Absent, u32::max), Unreadable);
     }
 
     #[test]
@@ -497,8 +796,27 @@ mod tests {
         assert_eq!(drive_root(""), None);
     }
 
-    /// This PC has the bin settings for its fixed drives; a normal file there must be allowed.
     #[test]
+    fn the_walk_reports_the_longest_inner_path() {
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("f");
+        assert_eq!(longest_inner_suffix(&f, false), Ok(None));
+        std::fs::create_dir_all(f.join("sub").join("deeper")).unwrap();
+        std::fs::write(f.join("a.txt"), b"1").unwrap();
+        // `sub\deeper` is 10 units and empty so far.
+        assert_eq!(longest_inner_suffix(&f, true), Ok(Some(10)));
+        std::fs::write(f.join("sub").join("deeper").join("x.bin"), b"1").unwrap();
+        assert_eq!(longest_inner_suffix(&f, true), Ok(Some(16))); // sub\deeper\x.bin
+        assert_eq!(longest_inner_suffix(&d.path().join("none"), true), Err(()));
+        let empty = d.path().join("empty");
+        std::fs::create_dir(&empty).unwrap();
+        assert_eq!(longest_inner_suffix(&empty, true), Ok(None));
+    }
+
+    /// Depends on this PC's registry, bin level and drive format, so it runs on purpose only:
+    /// `cargo test -p seek-clean --lib -- --ignored a_normal_temp_file`.
+    #[test]
+    #[ignore]
     fn a_normal_temp_file_on_this_pc_is_allowed() {
         let d = tempfile::tempdir().unwrap();
         let f = d.path().join("a.txt");

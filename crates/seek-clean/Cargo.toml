@@ -30,10 +30,6 @@ windows-core = "0.62"
 # Exposes `recycle::observe_recycle`, which can destroy files. For the real spike tests only.
 spike = []
 
-[[test]]
-name = "recycle_real"
-required-features = ["spike"]
-
 [dev-dependencies]
 tempfile = { workspace = true }
 serde_json = { workspace = true }

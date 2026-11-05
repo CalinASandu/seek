@@ -105,6 +105,16 @@ Observed on this PC (Windows 11 26300) with `cargo test -p seek-clean --test rec
 3. *What prevents one:* only Seek's own pre-checks (fixed local drive, bin enabled, `NukeOnDelete` off, batch fits `MaxCapacity`, no cloud placeholders, no UNC paths). The sink can stop a batch after the first destroyed item but cannot stop that item, so a missing location is reported as a possible permanent deletion, not a retryable failure.
 4. *Not observed:* a permanent delete of an item that fit the bin's capacity but was refused for another reason (path too long, `NukeOnDelete` on, a drive with no bin), because creating those cases would need changed bin settings or a non-fixed drive. They are assumed to behave like the capacity case.
 
+**More pre-checks added after review** (each locks the item with a reason and fails closed when the fact can't be read):
+- *Inner paths.* A folder is walked and its longest inner path measured. Locked when the full path exceeds 259 UTF-16 units, or when 80 (`BIN_PREFIX_UNITS`, the bin's own prefix) plus the path relative to the selected folder, including the folder's name, exceeds 259. A single file counts its file name.
+- *Volume and root.* The real location's volume mount point must be exactly the drive's `x:\` (no folder-mounted volumes), and the written path's drive letter must equal the real one (no `subst`, no junction to another volume). The top-level length is the longer of the two spellings.
+- *File system.* Only NTFS and ReFS pass; any other format, or a failed query, locks.
+- *Policies.* `NoRecycleFiles` (non-zero) under `Policies\Explorer` in HKCU or HKLM locks. `RecycleBinSize` caps the capacity at that percent of the volume. A policy value that exists but can't be read as a DWORD locks.
+- *Bin occupancy.* What is already in the bin (`SHQueryRecycleBinW`'s size) plus the batch must fit 90% of the capacity. A zero capacity locks. The reason tells the user to empty the Recycle Bin first.
+- *Confirming a recycle.* At least one `PostDeleteItem`, and every successful one must name a location under `$Recycle.Bin`. A real folder with a nested folder and three files gave one Post with one location.
+
+**Long inner paths, observed** (Windows 11 26300, `real_folder_with_too_long_inner_path_outcome`, temp folders the test made, 67-unit top folder): inner paths of 241 and of 378 units (full paths 309 and 446) were both recycled normally. One Post each, success `hrDelete`, a location in the bin, the folder gone and restorable. So this Windows did not delete them permanently, and the long-path refusal is a deliberate precaution for other Windows versions or settings, not a rule this PC proved.
+
 ## Duplicates
 
 **Finding them.** A new read-only service request, `SameSizeFiles { min_size, device_ids, cursor, limit }`, returns files grouped by exact size, biggest first, with the caller's access rule applied. It is computed by a new function in `seek-core` over the size column. Paging 5M rows through search (500 per page) would take about 10,000 round trips and could be cleared whenever indexes unload; this request avoids that. The cursor is simply the next size to return, so the service stores nothing between pages and unloading can't break a scan. Anything that changes between pages is caught by the later checks. `PROTOCOL_VERSION` goes up.

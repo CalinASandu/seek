@@ -1,6 +1,7 @@
 //! Real Recycle Bin spike tests. Run on purpose only:
 //! `cargo test -p seek-clean --test recycle_real --features spike -- --ignored --nocapture`
 //! They only ever touch temp files the test itself created, on a fixed drive.
+//! Tests that observe a real permanent delete need the `spike` feature; the rest run without it.
 
 #![cfg(windows)]
 
@@ -172,6 +173,7 @@ impl Drop for Watchdog {
 
 /// Logs what happened to a test-created file after an observed recycle. If it landed in the bin,
 /// puts it back and removes it, so nothing is left behind.
+#[cfg(feature = "spike")]
 fn settle(label: &str, file: &Path, report: &seek_clean::recycle::RecycleReport) {
     println!("{label} REPORT: {report:#?}");
     println!("{label}: original still exists = {}", file.exists());
@@ -192,6 +194,7 @@ fn settle(label: &str, file: &Path, report: &seek_clean::recycle::RecycleReport)
     }
 }
 
+#[cfg(feature = "spike")]
 #[test]
 #[ignore]
 fn real_sparse_oversized_file_outcome() {
@@ -209,6 +212,7 @@ fn real_sparse_oversized_file_outcome() {
     }
 }
 
+#[cfg(feature = "spike")]
 #[test]
 #[ignore]
 fn real_sparse_oversized_with_nuke_warning_outcome() {
@@ -282,7 +286,7 @@ fn real_locked_file_stays_with_a_reason() {
     assert_eq!(content.as_deref(), Some(&b"seek locked file"[..]), "contents changed");
     assert!(err.contains("seek-locked.txt"), "reason does not name the file: {err}");
     assert!(err.contains("in use"), "reason is not a plain 'in use' sentence: {err}");
-    assert!(err.ends_with('.') && !err.contains("0x"), "reason is not a plain sentence: {err}");
+    assert!(!err.contains("0x") && !err.contains("left in place"), "reason is not just a plain cause: {err}");
 }
 
 #[test]
@@ -370,6 +374,7 @@ fn real_oversized_sparse_file_is_refused_before_the_recycler() {
     assert!(still_there, "the oversized file was removed");
 }
 
+#[cfg(feature = "spike")]
 #[test]
 #[ignore]
 fn real_unc_path_outcome() {
@@ -393,6 +398,7 @@ fn real_unc_path_outcome() {
 
 /// A permanent delete looks like a success to the sink: hrDelete >= 0, but no new item and so no
 /// bin location, and the original is gone.
+#[cfg(feature = "spike")]
 fn assert_destroyed_silently(report: &seek_clean::recycle::RecycleReport, gone: bool) {
     assert!(gone, "expected the original to be destroyed");
     assert_eq!(report.bin_location(), None);
@@ -401,5 +407,93 @@ fn assert_destroyed_silently(report: &seek_clean::recycle::RecycleReport, gone: 
     for p in &report.posts {
         assert!(p.hr_delete >= 0, "hrDelete was a failure: {:#x}", p.hr_delete);
         assert!(p.new_item_missing, "a new item was reported");
+    }
+}
+
+#[test]
+#[ignore]
+fn real_folder_with_children_is_confirmed_by_every_post() {
+    let _wd = Watchdog::start("folder with children");
+    let dir = fixed_temp_dir();
+    let folder = dir.path().join("seek-folder");
+    std::fs::create_dir_all(folder.join("nested").join("deeper")).unwrap();
+    std::fs::write(folder.join("a.txt"), b"a").unwrap();
+    std::fs::write(folder.join("nested").join("b.txt"), b"b").unwrap();
+    std::fs::write(folder.join("nested").join("deeper").join("c.txt"), b"c").unwrap();
+
+    let result = recycle_one(&folder);
+    println!("FOLDER: result = {result:?}, original exists = {}", folder.exists());
+    let exists = folder.exists();
+    if let Ok(report) = &result {
+        let loc = report.confirmed_location().expect("Ok is confirmed").to_string();
+        println!("FOLDER: {} post(s), confirmed at {loc}", report.posts.len());
+        if let Err(e) = restore(&loc, &folder) {
+            println!("FOLDER: RESTORE FAILED, remove from the bin by hand: {e}");
+        }
+    }
+    let restored = folder.join("nested").join("deeper").join("c.txt").exists();
+    if folder.exists() {
+        std::fs::remove_dir_all(&folder).unwrap();
+    }
+    assert!(result.is_ok(), "a real folder must be confirmed, or the rule needs rethinking: {result:?}");
+    assert!(!exists, "reported recycled but the folder is still there");
+    assert!(restored, "the folder did not come back whole");
+}
+
+/// Builds `<dir>\<name>` holding a chain of folders (50 units each at most) and a small file at
+/// the end, so the longest path inside, relative to it, is `suffix` units. Returns that length.
+#[cfg(feature = "spike")]
+fn folder_with_inner_path(dir: &Path, name: &str, suffix: usize) -> (PathBuf, usize) {
+    let folder = dir.join(name);
+    let mut inner = PathBuf::new();
+    let mut len = 0usize;
+    let mut n = 0;
+    // The directories fill `suffix - 6` units, so `<dirs>\x.txt` is exactly `suffix` long.
+    let dirs_budget = suffix - r"\x.txt".len();
+    while len < dirs_budget {
+        let sep = if len == 0 { 0 } else { 1 };
+        let seg_len = (dirs_budget - len - sep).min(50);
+        inner.push(format!("{:0>seg_len$}", format!("s{n}")));
+        len += sep + seg_len;
+        n += 1;
+    }
+    let file = folder.join(&inner).join("x.txt");
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, b"seek long inner path").unwrap();
+    (folder, len + r"\x.txt".len())
+}
+
+#[cfg(feature = "spike")]
+#[test]
+#[ignore]
+fn real_folder_with_too_long_inner_path_outcome() {
+    let _wd = Watchdog::start("long inner path");
+    for target in [241usize, 378] {
+        let dir = fixed_temp_dir();
+        let (folder, suffix) = folder_with_inner_path(dir.path(), "seek-long", target);
+        let top = folder.to_string_lossy().encode_utf16().count();
+        println!("LONGINNER: target {target}: folder is {top} units, longest inner path {suffix} units, full {}", top + 1 + suffix);
+        let result = seek_clean::recycle::observe_recycle(&folder, 0);
+        let survived = std::fs::metadata(&folder).is_ok();
+        match &result {
+            Ok(report) => {
+                println!("LONGINNER {target}: posts = {:#?}", report.posts);
+                println!("LONGINNER {target}: perform_error = {:?}, aborted = {}", report.perform_error, report.aborted);
+                println!("LONGINNER {target}: bin location = {:?}", report.bin_location());
+                if let Some(loc) = report.bin_location() {
+                    if !survived {
+                        match restore(loc, &folder) {
+                            Ok(()) => println!("LONGINNER {target}: restored from the bin"),
+                            Err(e) => println!("LONGINNER {target}: RESTORE FAILED, remove from the bin by hand: {e}"),
+                        }
+                    }
+                }
+            }
+            Err(e) => println!("LONGINNER {target}: observe failed: {e}"),
+        }
+        println!("LONGINNER {target}: folder survived = {survived}, exists now = {}", std::fs::metadata(&folder).is_ok());
+        if std::fs::metadata(&folder).is_ok() {
+            std::fs::remove_dir_all(&folder).unwrap();
+        }
     }
 }

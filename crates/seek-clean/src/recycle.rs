@@ -63,6 +63,26 @@ impl RecycleReport {
             .filter(|p| p.hr_delete >= 0)
             .find_map(|p| p.new_path.as_deref().or(p.new_parsing_name.as_deref()))
     }
+
+    /// The bin location, but only if everything Windows reported backs it up: at least one
+    /// `PostDeleteItem`, and every successful one carrying a location under `$Recycle.Bin`.
+    /// A successful post without a location may be a permanent delete hiding next to a real one.
+    pub fn confirmed_location(&self) -> Result<&str, String> {
+        if self.posts.is_empty() {
+            return Err("Windows reported no result for the item".into());
+        }
+        let mut first = None;
+        for p in self.posts.iter().filter(|p| p.hr_delete >= 0) {
+            match p.new_path.as_deref().or(p.new_parsing_name.as_deref()) {
+                Some(loc) if loc.to_ascii_lowercase().contains("$recycle.bin") => {
+                    first.get_or_insert(loc);
+                }
+                Some(loc) => return Err(format!("Windows reported a location outside the Recycle Bin: {loc}")),
+                None => return Err("Windows reported no Recycle Bin location for the item".into()),
+            }
+        }
+        first.ok_or_else(|| "Windows reported no Recycle Bin location for the item".into())
+    }
 }
 
 #[derive(Default)]
@@ -214,11 +234,8 @@ pub fn recycle_one(path: &Path) -> Result<RecycleReport, String> {
         ));
     }
     let report = run(path, false, 0, true)?;
-    match report.bin_location() {
-        Some(loc) if loc.to_ascii_lowercase().contains("$recycle.bin") => Ok(report),
-        Some(loc) => Err(format!("Windows reported a location outside the Recycle Bin: {loc}")),
-        None => Err("Windows reported no Recycle Bin location for the item".into()),
-    }
+    report.confirmed_location()?;
+    Ok(report)
 }
 
 /// True for `X:\...` or `X:/...` only. Relative paths, UNC and `\\?\` paths, `::{CLSID}` shell
@@ -236,10 +253,7 @@ impl Recycler for ShellRecycler {
     fn recycle(&self, paths: &[PathBuf]) -> Vec<Result<String, String>> {
         recycle_in_order(paths, |p| {
             let report = recycle_one(p)?;
-            report
-                .bin_location()
-                .map(str::to_string)
-                .ok_or_else(|| "Windows reported no Recycle Bin location for the item".to_string())
+            report.confirmed_location().map(str::to_string)
         })
     }
 }
@@ -264,8 +278,9 @@ fn recycle_in_order(
     out
 }
 
-/// A plain sentence for why one item did not reach the bin.
-fn failure_text(path: &Path, hr: i32) -> String {
+/// The cause of one item not reaching the bin, as a clause with no full stop and no word on what
+/// became of the item: the engine alone knows whether it was left in place or lost.
+pub(crate) fn failure_text(path: &Path, hr: i32) -> String {
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -274,11 +289,11 @@ fn failure_text(path: &Path, hr: i32) -> String {
         // ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION, COPYENGINE_E_SHARING_VIOLATION_SRC
         // (0x80270027 is what a file held open with no sharing really gives, seen on this PC).
         0x8007_0020 | 0x8007_0021 | 0x8027_0027 => {
-            format!("{name} is in use by another program, so it was left in place.")
+            format!("{name} is in use by another program")
         }
         // E_ACCESSDENIED, COPYENGINE_E_ACCESS_DENIED_SRC
-        0x8007_0005 | 0x8027_0021 => format!("Windows denied access to {name}, so it was left in place."),
-        h => format!("Windows could not move {name} to the Recycle Bin (error 0x{h:08X})."),
+        0x8007_0005 | 0x8027_0021 => format!("Windows denied access to {name}"),
+        h => format!("Windows reported error 0x{h:08X} for {name}"),
     }
 }
 
@@ -333,7 +348,7 @@ fn run(path: &Path, abort_after_pre: bool, extra_flags: u32, strict: bool) -> Re
             if strict {
                 if g.report.refused_no_recycle {
                     return Err(format!(
-                        "Windows would delete {} for good instead of recycling it, so it was left in place.",
+                        "Windows would delete {} for good instead of recycling it",
                         path.display()
                     ));
                 }
@@ -516,6 +531,44 @@ mod tests {
         assert!(t.contains("locked.bin") && t.contains("in use"), "{t}");
         let t = failure_text(Path::new(r"C:\x\locked.bin"), 0x8027_0027_u32 as i32);
         assert!(t.contains("in use"), "{t}");
+        for hr in [0x8007_0020_u32, 0x8027_0027, 0x8007_0005, 0x8027_0021, 0x8027_0000] {
+            let t = failure_text(Path::new(r"C:\x\f.bin"), hr as i32);
+            assert!(!t.contains("left in place") && !t.ends_with('.'), "cause only: {t}");
+        }
+    }
+
+    fn post(hr: i32, loc: Option<&str>) -> super::PostRecord {
+        super::PostRecord {
+            flags: 0x282,
+            hr_delete: hr,
+            new_path: loc.map(str::to_string),
+            new_parsing_name: None,
+            new_item_missing: loc.is_none(),
+        }
+    }
+
+    fn report(posts: Vec<super::PostRecord>) -> super::RecycleReport {
+        super::RecycleReport {
+            posts,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_result_needs_every_success_post_to_name_a_bin_location() {
+        const OK: i32 = 0x0027_0008;
+        let bin = r"C:\$Recycle.Bin\S-1\$RAAAAAA.txt";
+        assert_eq!(report(vec![post(OK, Some(bin))]).confirmed_location(), Ok(bin));
+        assert_eq!(report(vec![post(OK, Some(bin)), post(OK, Some(bin))]).confirmed_location(), Ok(bin));
+        // No posts at all, a missing location, one missing among good ones, or a location
+        // outside the bin: all refused.
+        assert!(report(vec![]).confirmed_location().is_err());
+        assert!(report(vec![post(OK, None)]).confirmed_location().is_err());
+        assert!(report(vec![post(OK, Some(bin)), post(OK, None)]).confirmed_location().is_err());
+        assert!(report(vec![post(OK, None), post(OK, Some(bin))]).confirmed_location().is_err());
+        assert!(report(vec![post(OK, Some(r"C:\Users\a\x.txt"))]).confirmed_location().is_err());
+        // A failed post alone confirms nothing.
+        assert!(report(vec![post(0x8000_4004_u32 as i32, None)]).confirmed_location().is_err());
     }
 
     const BIN: &str = r"C:\$Recycle.Bin\S-1\$RAB12CD.txt";
