@@ -951,7 +951,7 @@ fn a_block_from_the_pre_checks_holds_at_prepare_and_at_commit() {
     assert_eq!(prep.items[0].lock, None);
     env.wrap.block.lock().unwrap().insert(later.clone());
     let r = env.engine.commit(&prep.token, &[0], &[]).unwrap();
-    assert!(left(&r, 0).contains("no Recycle Bin"));
+    assert!(left(&r, 0).contains("for good"));
     assert!(later.exists() && env.rec.calls().is_empty());
 }
 

@@ -116,7 +116,8 @@ impl Places {
 }
 
 /// Why `canon_path` can't be removed for this purpose, if it can't. `canon_path` must be in
-/// `canon` form. `Lock::NoRecycleBin`, `CloudPlaceholder` and `LinkedPc` are not decided here.
+/// `canon` form. The pre-check results (`Lock::NoRecycleBin`, `BinFull`, `PathTooLong`, `CloudPlaceholder`)
+/// and `LinkedPc` are not decided here.
 pub fn lock_for(
     places: &Places,
     canon_path: &str,

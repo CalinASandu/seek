@@ -15,7 +15,8 @@ pub enum Why {
     StaleData,
 }
 
-/// Why an item cannot be removed. `NoRecycleBin` and `CloudPlaceholder` come from the pre-checks,
+/// Why an item cannot be removed. `NoRecycleBin`, `BinFull`, `PathTooLong`, `UnsupportedPath` and
+/// `CloudPlaceholder` come from the pre-checks (`UnsupportedPath` also from `protect::lock_for`),
 /// `LinkedPc` from the engine; the rest from `protect::lock_for`.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "camelCase")]
@@ -26,6 +27,10 @@ pub enum Lock {
     AppData,
     ToolFolder,
     NoRecycleBin,
+    /// The drive's Recycle Bin is too full to hold the item (or its size can't be read).
+    BinFull,
+    /// The item, or something inside it, has a path too long for the bin to hold reliably.
+    PathTooLong,
     CloudPlaceholder,
     Protected,
     LinkedPc,
@@ -198,6 +203,8 @@ mod tests {
     #[test]
     fn lock_and_level_serialize_as_camel_case_strings() {
         assert_eq!(serde_json::to_string(&Lock::NoRecycleBin).unwrap(), "\"noRecycleBin\"");
+        assert_eq!(serde_json::to_string(&Lock::BinFull).unwrap(), "\"binFull\"");
+        assert_eq!(serde_json::to_string(&Lock::PathTooLong).unwrap(), "\"pathTooLong\"");
         assert_eq!(serde_json::to_string(&Level::ProbablyInUse).unwrap(), "\"probablyInUse\"");
         assert_eq!(serde_json::to_string(&Why::StaleData).unwrap(), "\"staleData\"");
     }
