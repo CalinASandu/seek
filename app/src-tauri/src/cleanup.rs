@@ -803,6 +803,8 @@ impl CleanState {
             return;
         }
         let had_results = self.shared.drop_results();
+        // The app icons go with the results: they are cheap to extract again.
+        apps::clear_icon_cache();
         if let Some(core) = self.core.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
             core.engine.drop_reviews();
         }

@@ -174,7 +174,12 @@ export function UninstallSheet({ app, protectedPaths, onReview, onUninstalled, o
             <dl className="un-facts">
               <dt>Install folder</dt>
               <dd>
-                {app.folder ? <MidPath path={app.folder} /> : "Seek couldn't find this app's folder, so leftovers are matched by name and publisher only."}
+                {app.folder ? (
+                  <>
+                    <MidPath path={app.folder} />
+                    {app.folderGuessed && " (Seek's best guess)"}
+                  </>
+                ) : "Seek couldn't find this app's folder, so leftovers are matched by name and publisher only."}
               </dd>
               <dt>Size</dt>
               <dd className="tnum">{formatSize(app.size)}</dd>

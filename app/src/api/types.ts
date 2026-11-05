@@ -227,6 +227,8 @@ export interface AppRow {
   installDate: number | null;
   icon: string | null;
   folder: string | null;
+  /** True when the folder did not come from the app's InstallLocation: Seek's best guess. */
+  folderGuessed: boolean;
   note: string | null;
   running: boolean;
 }

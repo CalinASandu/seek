@@ -340,6 +340,28 @@ pub(crate) fn should_expand_short_names(path: &str, drive_type: &mut dyn FnMut(c
     b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' && drive_type(b[0] as char) == DRIVE_FIXED
 }
 
+/// True if `path` starts with a drive letter whose type `drive_type` says is a fixed local disk.
+/// UNC paths, relative paths and removable, optical, network or unknown drives are not.
+pub(crate) fn on_fixed_drive(path: &str, drive_type: &mut dyn FnMut(char) -> u32) -> bool {
+    let b = path.as_bytes();
+    b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' && drive_type((b[0] as char).to_ascii_uppercase()) == DRIVE_FIXED
+}
+
+/// [`on_fixed_drive`] asked of this PC. Nothing is read from the path itself.
+pub fn is_fixed_local(path: &str) -> bool {
+    on_fixed_drive(path, &mut real::drive_type)
+}
+
+/// `path` with 8.3 names (`PROGRA~1`) written out, in the disk's own case, when it is on a fixed
+/// local drive; otherwise as given. This is the rule the claims use (`should_expand_short_names`).
+pub fn expand_short_spelling(path: &str) -> String {
+    if should_expand_short_names(path, &mut real::drive_type) {
+        crate::paths::expand_short(&path.replace('/', "\\"))
+    } else {
+        path.to_string()
+    }
+}
+
 /// Replaces `%NAME%` with the value `env` gives. Unknown names and stray `%` stay as they are.
 pub fn expand_env(s: &str, env: &dyn Fn(&str) -> Option<String>) -> String {
     let mut out = String::with_capacity(s.len());
@@ -540,8 +562,9 @@ impl InstalledNames {
 }
 
 /// Every entry of the three uninstall lists (both views of HKLM and HKCU), as registered. The
-/// second value names the lists that could not be read. Only reads.
-pub fn read_uninstall_entries() -> (Vec<UninstallEntry>, Vec<String>) {
+/// second value is the (hive, view) of each list that could not be read, as in
+/// [`UninstallEntry::hive`] and [`UninstallEntry::view`]. Only reads.
+pub fn read_uninstall_entries() -> (Vec<UninstallEntry>, Vec<(String, String)>) {
     real::read_entries()
 }
 
@@ -934,29 +957,41 @@ mod real {
         }
     }
 
-    fn each_entry(parts: &mut ClaimParts, mut each: impl FnMut(&mut ClaimParts, UninstallEntry)) {
+    pub(super) fn drive_type(letter: char) -> u32 {
+        // SAFETY: a NUL-terminated root path.
+        unsafe { GetDriveTypeW(PCWSTR(wide(&format!("{}:\\", letter.to_ascii_uppercase())).as_ptr())) }
+    }
+
+    /// Calls `each` for every entry. Returns the (hive, view) of every list that could not be read.
+    fn each_entry(parts: &mut ClaimParts, mut each: impl FnMut(&mut ClaimParts, UninstallEntry)) -> Vec<(String, String)> {
+        let mut failed = Vec::new();
         for (hn, hive) in hives() {
             for (vn, view) in views() {
                 // The 64-bit machine list exists on every Windows install.
                 let required = hn == "HKLM" && vn == "64-bit";
                 let label = format!("the {hn} {vn} uninstall list");
+                let before = parts.failed.len();
                 for_each_child(parts, (hive, view), &format!(r"{WIN}\Uninstall"), &label, required, |parts, name, k| {
                     let e = read_entry(name, k, hn, view_tag(vn), &mut parts.skipped);
                     each(parts, e);
                 });
+                if parts.failed.len() > before {
+                    failed.push((hn.to_string(), view_tag(vn).to_string()));
+                }
             }
         }
+        failed
     }
 
     fn uninstall(parts: &mut ClaimParts) {
-        each_entry(parts, |parts, e| add_uninstall_entry(parts, &e, &env));
+        let _ = each_entry(parts, |parts, e| add_uninstall_entry(parts, &e, &env));
     }
 
-    pub(super) fn read_entries() -> (Vec<UninstallEntry>, Vec<String>) {
+    pub(super) fn read_entries() -> (Vec<UninstallEntry>, Vec<(String, String)>) {
         let mut parts = ClaimParts::default();
         let mut out = Vec::new();
-        each_entry(&mut parts, |_, e| out.push(e));
-        (out, parts.failed)
+        let failed = each_entry(&mut parts, |_, e| out.push(e));
+        (out, failed)
     }
 
     pub(super) fn read_one_entry(hn: &str, vn: &str, key: &str) -> Option<UninstallEntry> {

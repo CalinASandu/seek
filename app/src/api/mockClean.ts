@@ -391,13 +391,13 @@ function buildApps(scenario: CleanScenario, now: number): AppRow[] {
     folder: string | null, extra: Partial<AppRow> = {},
   ): AppRow => ({
     id, name, publisher, version, size: Math.round(mb * MB), installDate: ageDays === null ? null : now - ageDays * DAY,
-    icon: null, folder, note: null, running: false, ...extra,
+    icon: null, folder, folderGuessed: false, note: null, running: false, ...extra,
   });
   const runtime = "Other apps may need this.";
   return [
     a("app-chrome", "Google Chrome", "Google LLC", "130.0.6723.92", 640, 12, `${PF}\\Google\\Chrome`),
     a("app-vscode", "Microsoft Visual Studio Code", "Microsoft Corporation", "1.95.1", 410, 30, `${LOCAL}\\Programs\\Microsoft VS Code`),
-    a("app-spotify", "Spotify", "Spotify AB", "1.2.52", 360, 45, `${ROAM}\\Spotify`, { running: true }),
+    a("app-spotify", "Spotify", "Spotify AB", "1.2.52", 360, 45, `${ROAM}\\Spotify`, { running: true, folderGuessed: true }),
     a("app-vlc", "VLC media player", "VideoLAN", "3.0.21", 170, 200, `${PF}\\VideoLAN\\VLC`),
     a("app-7zip", "7-Zip", "Igor Pavlov", "24.08", 5.6, 120, `${PF}\\7-Zip`),
     a("app-zoom", "Zoom Workplace", "Zoom Video Communications", "6.2.5", 410, 20, `${PF}\\Zoom`),

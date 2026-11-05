@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use crate::claims::{self, command_paths, expand_env, is_abs, location_paths, unquoted_lens};
-use crate::model::AppRow;
+use crate::model::{AppRow, FolderSource};
 use crate::paths::{canon_lexical, is_inside};
 use crate::protect::Places;
 
@@ -36,44 +36,110 @@ fn is_msiexec(path: &str) -> bool {
     file.eq_ignore_ascii_case("msiexec.exe") || file.eq_ignore_ascii_case("msiexec")
 }
 
+/// `{8-4-4-4-12}` in hex, braces included, and nothing else.
+fn is_guid(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 38
+        && b[0] == b'{'
+        && b[37] == b'}'
+        && b[1..37].iter().enumerate().all(|(i, c)| match i {
+            8 | 13 | 18 | 23 => *c == b'-',
+            _ => c.is_ascii_hexdigit(),
+        })
+}
+
 /// The `{GUID}` after `/X`, `/I` or `/uninstall` in the arguments of `msiexec`.
 fn msi_guid(args: &str) -> Option<String> {
     let low = args.to_ascii_lowercase();
     for flag in ["/x", "/i", "-x", "-i", "/uninstall", "/package"] {
         for (at, _) in low.match_indices(flag) {
             let rest = args[at + flag.len()..].trim_start_matches([' ', '=']);
-            if rest.starts_with('{') {
-                if let Some(end) = rest.find('}') {
-                    return Some(rest[..=end].to_string());
-                }
+            if let Some(guid) = rest.get(..38).filter(|g| is_guid(g)) {
+                return Some(guid.to_string());
             }
         }
     }
     None
 }
 
-/// Splits an `UninstallString`. A quoted program ends at the closing quote; an unquoted one may
-/// contain spaces and is cut after its last file extension that is not followed by an argument
-/// (the same rule the claims use for the folders a command names). `MsiExec` with a product
-/// code becomes [`UninstallCommand::Msi`]. `%VAR%` is expanded.
-pub fn parse_uninstall(cmd: &str) -> UninstallCommand {
-    let full = expand_env(cmd.trim(), &process_env);
+/// What the parser needs from the machine, so tests can answer for it.
+pub struct Ctx<'a> {
+    pub env: &'a dyn Fn(&str) -> Option<String>,
+    /// Writes 8.3 names out in full (`PROGRA~1`). Fixed local drives only, in the real one.
+    pub expand: &'a dyn Fn(&str) -> String,
+    pub dir_exists: &'a dyn Fn(&str) -> bool,
+    pub file_exists: &'a dyn Fn(&str) -> bool,
+}
+
+/// Runs `f` with this PC's answers. A folder or file on a drive that is not a fixed local one is
+/// never asked for: a folder is taken as there, a file as not there.
+pub fn with_real_ctx<R>(f: impl FnOnce(&Ctx) -> R) -> R {
+    f(&Ctx {
+        env: &process_env,
+        expand: &claims::expand_short_spelling,
+        dir_exists: &|p| !claims::is_fixed_local(p) || Path::new(p).is_dir(),
+        file_exists: &|p| claims::is_fixed_local(p) && Path::new(p).is_file(),
+    })
+}
+
+const BARE_SYSTEM_PROGRAMS: [&str; 2] = ["rundll32", "msiexec"];
+
+/// An absolute path to an `.exe`: as given, or for a bare `rundll32` / `msiexec` the one in the
+/// Windows directory. Any other relative or bare name is something Seek can't pin down.
+fn resolve_program(path: &str, ctx: &Ctx) -> Option<String> {
+    let path = path.trim();
+    if is_abs(path) {
+        return path.to_ascii_lowercase().ends_with(".exe").then(|| path.to_string());
+    }
+    if path.contains(['\\', '/', ':']) {
+        return None;
+    }
+    let low = path.to_ascii_lowercase();
+    let stem = low.strip_suffix(".exe").unwrap_or(&low);
+    if !BARE_SYSTEM_PROGRAMS.contains(&stem) {
+        return None;
+    }
+    let root = (ctx.env)("SystemRoot").or_else(|| (ctx.env)("windir"))?;
+    Some(format!(r"{}\System32\{stem}.exe", root.trim_end_matches('\\')))
+}
+
+/// Splits an `UninstallString` into something that can be run, or `None` when Seek can't tell
+/// what to run (it will not guess). A quoted program ends at the closing quote (unclosed is
+/// `None`). An unquoted absolute one may contain spaces: of the candidates ending in `.exe`
+/// (the claims' own rule for where a path can end) the shortest that exists wins, else the
+/// shortest. `%VAR%` is expanded. `MsiExec` with a product code becomes [`UninstallCommand::Msi`].
+pub fn parse_uninstall_with(cmd: &str, ctx: &Ctx) -> Option<UninstallCommand> {
+    let full = expand_env(cmd.trim(), ctx.env);
     let full = full.trim();
+    if full.is_empty() {
+        return None;
+    }
     let (path, args) = if let Some(inner) = full.strip_prefix('"') {
-        match inner.find('"') {
-            Some(end) => (inner[..end].to_string(), inner[end + 1..].trim().to_string()),
-            None => (inner.to_string(), String::new()),
-        }
-    } else {
-        let n = unquoted_lens(full).last().copied().unwrap_or(full.len()).min(full.len());
+        let end = inner.find('"')?;
+        (inner[..end].to_string(), inner[end + 1..].trim().to_string())
+    } else if is_abs(full) {
+        let ends: Vec<usize> = unquoted_lens(full)
+            .into_iter()
+            .filter(|&n| full.is_char_boundary(n) && full[..n].to_ascii_lowercase().ends_with(".exe"))
+            .collect();
+        let n = ends.iter().copied().find(|&n| (ctx.file_exists)(full[..n].trim())).or_else(|| ends.first().copied())?;
         (full[..n].trim().to_string(), full[n..].trim().to_string())
+    } else {
+        let (first, rest) = full.split_once(char::is_whitespace).unwrap_or((full, ""));
+        (first.to_string(), rest.trim().to_string())
     };
+    let path = resolve_program(&path, ctx)?;
     if is_msiexec(&path) {
         if let Some(guid) = msi_guid(&args) {
-            return UninstallCommand::Msi { guid };
+            return Some(UninstallCommand::Msi { guid });
         }
     }
-    UninstallCommand::Exe { path, args }
+    Some(UninstallCommand::Exe { path, args })
+}
+
+/// [`parse_uninstall_with`] on this PC.
+pub fn parse_uninstall(cmd: &str) -> Option<UninstallCommand> {
+    with_real_ctx(|ctx| parse_uninstall_with(cmd, ctx))
 }
 
 // ---- the id ---------------------------------------------------------------------------------------
@@ -90,17 +156,19 @@ pub fn app_id(e: &RawEntry) -> String {
 /// backslash would reach into another key) gives `None`.
 pub fn parse_app_id(id: &str) -> Option<(&str, &str, &str)> {
     let (head, key) = id.split_once('\\')?;
-    if key.is_empty() || key.contains('\\') || head.len() != 6 || !head.is_char_boundary(4) {
+    if key.is_empty() || key.contains('\\') || key.chars().any(char::is_control) || head.len() != 6 || !head.is_char_boundary(4) {
         return None;
     }
     let (hive, view) = head.split_at(4);
     (HIVES.contains(&hive) && VIEWS.contains(&view)).then_some((hive, view, key))
 }
 
-/// The registry entry behind an id, read now. `None` if the id is malformed or the app is gone.
+/// The registry entry behind an id, read now. `None` if the id is malformed, the key is gone, or
+/// the entry is one the list does not show (Seek, a system component, a child entry, an app with
+/// no normal uninstaller): an id can't reach what the list hides.
 pub fn entry_by_id(id: &str) -> Option<RawEntry> {
     let (hive, view, key) = parse_app_id(id)?;
-    claims::read_uninstall_entry(hive, view, key)
+    claims::read_uninstall_entry(hive, view, key).filter(is_listed)
 }
 
 // ---- which entries are listed -----------------------------------------------------------------
@@ -114,8 +182,9 @@ fn is_seek(e: &RawEntry) -> bool {
     e.display_name.trim().eq_ignore_ascii_case(SEEK_NAME) && e.publisher.trim().eq_ignore_ascii_case(SEEK_PUBLISHER)
 }
 
+/// Only the normal uninstaller counts: Seek runs that one, never the quiet one.
 fn has_command(e: &RawEntry) -> bool {
-    !e.uninstall_string.trim().is_empty() || !e.quiet_uninstall_string.trim().is_empty()
+    !e.uninstall_string.trim().is_empty()
 }
 
 fn is_listed(e: &RawEntry) -> bool {
@@ -142,6 +211,7 @@ pub const RUNTIME_PATTERNS: &[&str] = &[
 ];
 
 pub const RUNTIME_NOTE: &str = "Other apps may need this.";
+pub const CANT_START_NOTE: &str = "Seek can't start this app's uninstaller.";
 
 fn glob(pattern: &str, text: &str) -> bool {
     let mut parts = pattern.split('*');
@@ -165,21 +235,39 @@ pub fn note_for(name: &str) -> Option<&'static str> {
 
 // ---- the folder -----------------------------------------------------------------------------------
 
+/// Whether `canon` (lowercase, lexical) has `appdata\local\temp` as consecutive whole segments.
 fn in_temp(canon: &str) -> bool {
     let temp = canon_lexical(&std::env::temp_dir());
-    is_inside(canon, &temp) || canon.contains("\\appdata\\local\\temp")
+    let segs: Vec<&str> = canon.split('\\').collect();
+    is_inside(canon, &temp) || segs.windows(3).any(|w| w == ["appdata", "local", "temp"])
 }
 
-/// A folder an app may be said to live in. Windows (with `Installer`), temp folders, the package
-/// cache, a Program Files root itself and any other place Seek knows are not.
-fn acceptable_folder(places: &Places, path: &str) -> Option<PathBuf> {
-    let c = canon_lexical(Path::new(path));
-    let bad = places.in_windows(&c)
+/// A drive root (`c:`) or a UNC share root (`\\server\share`).
+fn is_root(canon: &str) -> bool {
+    canon.len() <= 2 || (canon.starts_with("\\\\") && canon[2..].matches('\\').count() <= 1)
+}
+
+/// A folder an app may be said to live in, in its expanded spelling (so `C:\PROGRA~1\x` is judged
+/// as `C:\Program Files\x`). Rejected: one that is not there, Windows (with `Installer`), temp
+/// folders, the package cache, a drive or share root, a Program Files root, the user profile or a
+/// folder directly in it, any other place Seek knows and, for a guess, one that is or holds the
+/// folder of another listed app (`others`, in lowercase lexical form). That last rule holds for an
+/// `InstallLocation` too: a vendor folder that holds other apps is not one app's folder.
+fn acceptable_folder(places: &Places, ctx: &Ctx, raw: &str, guessed: bool, others: &[String]) -> Option<PathBuf> {
+    let expanded = (ctx.expand)(raw.trim()).replace('/', "\\");
+    let spelled = if expanded.len() > 3 { expanded.trim_end_matches('\\') } else { expanded.as_str() };
+    let c = canon_lexical(Path::new(spelled));
+    let bad = is_root(&c)
+        || places.in_windows(&c)
         || places.is_or_contains_place(&c)
         || places.in_package_cache(&c)
         || places.is_program_files_root(&c)
-        || in_temp(&c);
-    (!bad).then(|| PathBuf::from(path))
+        || places.is_profile_or_child(&c)
+        || in_temp(&c)
+        || (guessed && places.in_common_files(&c))
+        || others.iter().any(|o| is_inside(o, &c))
+        || !(ctx.dir_exists)(spelled);
+    (!bad).then(|| PathBuf::from(spelled))
 }
 
 fn parent_folder(file: &str) -> Option<String> {
@@ -187,26 +275,41 @@ fn parent_folder(file: &str) -> Option<String> {
     (!parent.is_empty()).then(|| parent.to_string())
 }
 
+/// An app's folder and where it came from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Found {
+    pub path: PathBuf,
+    pub source: FolderSource,
+}
+
 /// The folder an app is installed in: `InstallLocation`, else the folder of its `DisplayIcon`,
-/// else the folder of its uninstaller. A folder from any of them is dropped if it is Windows, a
-/// temp folder, the package cache or a Program Files root. `None` when nothing is left; the app
-/// is still listed.
-pub fn install_folder(e: &RawEntry, places: &Places) -> Option<PathBuf> {
-    let env: &dyn Fn(&str) -> Option<String> = &process_env;
-    if let Some(found) = location_paths(&e.install_location, env).iter().find_map(|p| acceptable_folder(places, p)) {
-        return Some(found);
+/// else the folder of its uninstaller. A candidate that fails [`acceptable_folder`] (including a
+/// stale `InstallLocation` that no longer exists) falls through to the next. `others` are the
+/// canonical folders of the other listed apps. The path is returned in expanded spelling: 8.3 names
+/// written out in the disk's case on fixed drives, otherwise as registered, with `\` separators
+/// and no trailing `\`. `None` when nothing is left; the app is still listed.
+pub fn find_folder(e: &RawEntry, places: &Places, ctx: &Ctx, others: &[String]) -> Option<Found> {
+    if let Some(path) = location_paths(&e.install_location, ctx.env).iter().find_map(|p| acceptable_folder(places, ctx, p, false, others)) {
+        return Some(Found { path, source: FolderSource::InstallLocation });
     }
-    if let Some(found) = command_paths(&e.display_icon, env)
+    if let Some(path) = command_paths(&e.display_icon, ctx.env)
         .first()
         .and_then(|icon| parent_folder(icon))
-        .and_then(|p| acceptable_folder(places, &p))
+        .and_then(|p| acceptable_folder(places, ctx, &p, true, others))
     {
-        return Some(found);
+        return Some(Found { path, source: FolderSource::Icon });
     }
-    [&e.uninstall_string, &e.quiet_uninstall_string].into_iter().find_map(|cmd| match parse_uninstall(cmd) {
-        UninstallCommand::Exe { path, .. } if is_abs(&path) => parent_folder(&path).and_then(|p| acceptable_folder(places, &p)),
+    match parse_uninstall_with(&e.uninstall_string, ctx) {
+        Some(UninstallCommand::Exe { path, .. }) => parent_folder(&path)
+            .and_then(|p| acceptable_folder(places, ctx, &p, true, others))
+            .map(|path| Found { path, source: FolderSource::Uninstaller }),
         _ => None,
-    })
+    }
+}
+
+/// [`find_folder`] on this PC, knowing nothing of other apps.
+pub fn install_folder(e: &RawEntry, places: &Places) -> Option<PathBuf> {
+    with_real_ctx(|ctx| find_folder(e, places, ctx, &[])).map(|f| f.path)
 }
 
 /// True if a running program's exe is inside `folder`.
@@ -303,88 +406,109 @@ fn size_bytes(kb: Option<u64>) -> u64 {
 // ---- the rows -------------------------------------------------------------------------------------------
 
 /// The rows for these entries: hidden ones dropped, the same app in both views once (the 64-bit
-/// view wins), sorted by name. `icon` stays empty. Pure.
-pub fn rows(entries: Vec<RawEntry>, places: &Places, running_exes: &[String], local_to_utc: &dyn Fn(i64) -> Option<i64>) -> Vec<AppRow> {
+/// view wins), sorted by name. `icon` stays empty. Folders are found twice: once alone, then
+/// again knowing every other app's folder, so a guess that is or holds another app's folder
+/// (`C:\Program Files\Adobe`) is dropped. A row whose uninstall command can't be understood stays,
+/// with a note saying so. Pure but for `ctx`.
+pub fn rows(
+    entries: Vec<RawEntry>,
+    places: &Places,
+    running_exes: &[String],
+    ctx: &Ctx,
+    local_to_utc: &dyn Fn(i64) -> Option<i64>,
+) -> Vec<AppRow> {
     let mut entries: Vec<RawEntry> = entries.into_iter().filter(is_listed).collect();
     // "64" sorts after "32", so reversing puts the 64-bit view first; the sort is stable.
     entries.sort_by(|a, b| b.view.cmp(&a.view));
     let mut seen = HashSet::new();
+    entries.retain(|e| seen.insert((e.hive.clone(), e.key.to_lowercase(), e.display_name.trim().to_lowercase())));
+
+    let alone: Vec<Option<String>> =
+        entries.iter().map(|e| find_folder(e, places, ctx, &[]).map(|f| canon_lexical(&f.path))).collect();
     let mut out: Vec<AppRow> = Vec::new();
-    for e in entries {
-        let same_app = (e.hive.clone(), e.key.to_lowercase(), e.display_name.trim().to_lowercase());
-        if !seen.insert(same_app) {
-            continue;
-        }
-        let folder = install_folder(&e, places);
+    for (i, e) in entries.iter().enumerate() {
+        let others: Vec<String> = alone.iter().enumerate().filter(|(j, _)| *j != i).filter_map(|(_, f)| f.clone()).collect();
+        let found = find_folder(e, places, ctx, &others);
         let name = e.display_name.trim().to_string();
+        let mut notes: Vec<&str> = note_for(&name).into_iter().collect();
+        if parse_uninstall_with(&e.uninstall_string, ctx).is_none() {
+            notes.push(CANT_START_NOTE);
+        }
         out.push(AppRow {
-            id: app_id(&e),
-            note: note_for(&name).map(str::to_string),
+            id: app_id(e),
+            note: (!notes.is_empty()).then(|| notes.join(" ")),
             name,
             publisher: e.publisher.trim().to_string(),
             version: e.display_version.trim().to_string(),
             size: size_bytes(e.estimated_size_kb),
             install_date: install_date_ms(&e.install_date, local_to_utc),
             icon: None,
-            running: is_running(folder.as_deref(), running_exes),
-            folder: folder.map(|p| p.to_string_lossy().into_owned()),
+            running: is_running(found.as_ref().map(|f| f.path.as_path()), running_exes),
+            folder_guessed: found.as_ref().is_some_and(|f| f.source != FolderSource::InstallLocation),
+            folder_source: found.as_ref().map(|f| f.source),
+            folder: found.map(|f| f.path.to_string_lossy().into_owned()),
         });
     }
     out.sort_by_key(|r| r.name.to_lowercase());
     out
 }
 
-/// The rows for these entries on this PC: this PC's Windows folders, no icons, and nothing
-/// counted as running (the caller has no process list).
+/// The rows for these entries on this PC: no icons, and nothing counted as running (the caller
+/// has no process list).
 pub fn from_entries(entries: Vec<RawEntry>) -> Vec<AppRow> {
     match Places::from_system() {
-        Ok(places) => rows(entries, &places, &[], &local_to_utc_ms),
+        Ok(places) => with_real_ctx(|ctx| rows(entries, &places, &[], ctx, &local_to_utc_ms)),
         Err(_) => Vec::new(),
     }
 }
 
-/// A folder from the registry that is not there any more is no folder. Network folders are not
-/// asked: a disconnected one can take many seconds.
-fn exists(folder: &str) -> bool {
-    folder.starts_with("\\\\") || Path::new(folder).is_dir()
+/// The installed apps on this PC. The registry is read once. With `with_icons`, icons come from a
+/// cache (path, index and modified time), so a second call extracts none again; only files on
+/// fixed local drives are touched.
+fn list_with(with_icons: bool) -> Result<Vec<AppRow>, String> {
+    let places = Places::from_system()?;
+    let (entries, failed) = claims::read_uninstall_entries();
+    if failed.iter().any(|(hive, view)| hive == "HKLM" && view == "64") {
+        let lists: Vec<String> = failed.iter().map(|(h, v)| format!("{h} {v}-bit")).collect();
+        return Err(format!("Seek couldn't read the list of installed apps ({}).", lists.join(", ")));
+    }
+    let running = claims::running_exes();
+    with_real_ctx(|ctx| {
+        let sources: HashMap<String, (String, i32)> = if with_icons {
+            entries.iter().filter(|e| is_listed(e)).filter_map(|e| icon_source(e, ctx).map(|s| (app_id(e), s))).collect()
+        } else {
+            HashMap::new()
+        };
+        let mut out = rows(entries, &places, &running, ctx, &local_to_utc_ms);
+        for r in &mut out {
+            r.icon = sources
+                .get(&r.id)
+                .filter(|(path, _)| claims::is_fixed_local(path))
+                .and_then(|(path, idx)| icon_cache().get(path, *idx, icons_win::extract_png));
+        }
+        Ok(out)
+    })
+}
+
+/// The installed apps on this PC, with icons.
+pub fn try_list() -> Result<Vec<AppRow>, String> {
+    list_with(true)
 }
 
 /// The installed apps on this PC, without icons.
 pub fn try_list_plain() -> Result<Vec<AppRow>, String> {
-    let places = Places::from_system()?;
-    let (entries, failed) = claims::read_uninstall_entries();
-    if failed.iter().any(|f| f.contains("HKLM 64-bit")) {
-        return Err(format!("Seek couldn't read the list of installed apps ({}).", failed.join(", ")));
-    }
-    let mut out = rows(entries, &places, &claims::running_exes(), &local_to_utc_ms);
-    for r in &mut out {
-        if r.folder.as_deref().is_some_and(|f| !exists(f)) {
-            r.folder = None;
-            r.running = false;
-        }
-    }
-    Ok(out)
-}
-
-/// The installed apps on this PC, with icons. Icons come from a cache (path and modified time),
-/// so a second call extracts none again.
-pub fn try_list() -> Result<Vec<AppRow>, String> {
-    let (entries, _) = claims::read_uninstall_entries();
-    let mut out = try_list_plain()?;
-    let sources: HashMap<String, (String, i32)> = entries
-        .iter()
-        .filter(|e| is_listed(e))
-        .filter_map(|e| icon_source(e).map(|s| (app_id(e), s)))
-        .collect();
-    for r in &mut out {
-        r.icon = sources.get(&r.id).and_then(|(path, idx)| icon_cache().get(path, *idx, icons_win::extract_png));
-    }
-    Ok(out)
+    list_with(false)
 }
 
 /// [`try_list`], or nothing if the list can't be read.
 pub fn list() -> Vec<AppRow> {
     try_list().unwrap_or_default()
+}
+
+/// Lets go of every extracted icon (the window has been hidden long enough for Cleanup to drop
+/// its results).
+pub fn clear_icon_cache() {
+    icon_cache().clear();
 }
 
 // ---- icons ----------------------------------------------------------------------------------------------
@@ -408,9 +532,9 @@ pub fn split_icon(value: &str) -> Option<(String, i32)> {
 }
 
 /// Where an app's icon comes from: its `DisplayIcon`, else its uninstaller's own icon.
-fn icon_source(e: &RawEntry) -> Option<(String, i32)> {
-    split_icon(&e.display_icon).or_else(|| match parse_uninstall(&e.uninstall_string) {
-        UninstallCommand::Exe { path, .. } if is_abs(&path) => Some((path, 0)),
+fn icon_source(e: &RawEntry, ctx: &Ctx) -> Option<(String, i32)> {
+    split_icon(&e.display_icon).or_else(|| match parse_uninstall_with(&e.uninstall_string, ctx) {
+        Some(UninstallCommand::Exe { path, .. }) => Some((path, 0)),
         _ => None,
     })
 }
@@ -433,6 +557,10 @@ fn modified_ms(path: &str) -> u64 {
 }
 
 impl IconCache {
+    pub fn clear(&self) {
+        self.map.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+
     /// The icon for `path`, extracted by `extract` only if this file at this modified time has
     /// not been asked for.
     pub fn get(&self, path: &str, index: i32, extract: impl FnOnce(&str, i32) -> Option<String>) -> Option<String> {
@@ -538,8 +666,8 @@ pub(crate) mod icons_win {
     /// The large icon `index` of `path` as a PNG data URL. `None` for anything that goes wrong.
     /// Every handle is released by a guard, on every path out.
     pub fn extract_png(path: &str, index: i32) -> Option<String> {
-        if path.starts_with("\\\\") {
-            // A network file can stall for a long time; the letter tile does fine.
+        if !crate::claims::is_fixed_local(path) {
+            // A network, removable or optical drive can stall for a long time; the letter tile does fine.
             return None;
         }
         let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
