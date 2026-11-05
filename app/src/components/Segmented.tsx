@@ -1,9 +1,11 @@
 import { useLayoutEffect, useRef, type KeyboardEvent } from "react";
+import type { LucideIcon } from "lucide-react";
 
 export interface SegmentedItem<T extends string> {
   id: T;
   label: string;
   hint?: string;
+  icon?: LucideIcon;
 }
 
 interface Props<T extends string> {
@@ -163,12 +165,14 @@ export function Segmented<T extends string>({ items, value, onChange, label, kin
           onPointerEnter={() => showHalo(i)}
           onKeyDown={(e) => onKey(e, i)}
         >
+          {it.icon && <it.icon size={14} aria-hidden="true" />}
           {it.label}
         </button>
       ))}
       <div ref={ink} className="seg-ink" aria-hidden="true">
         {items.map((it) => (
           <span key={it.id} className="seg-btn">
+            {it.icon && <it.icon size={14} aria-hidden="true" />}
             {it.label}
           </span>
         ))}

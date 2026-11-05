@@ -232,6 +232,25 @@ describe("Seek app", () => {
     expect(within(dialog).getByText(/Valid for [12]:\d\d · works once/)).toBeInTheDocument();
   });
 
+  it("uses the shared selector for Settings' theme and the Link dialog's tabs", async () => {
+    const user = userEvent.setup();
+    render(<App api={makeApi()} />);
+    await user.click(await screen.findByRole("button", { name: "Settings" }));
+    const settings = await screen.findByRole("dialog", { name: "Settings" });
+    const theme = within(settings).getByRole("radiogroup", { name: "Theme" });
+    expect(theme).toHaveClass("seg");
+    const radios = within(theme).getAllByRole("radio");
+    expect(radios.map((r) => r.textContent)).toEqual(["System", "Light", "Dark"]);
+    for (const r of radios) expect(r.querySelector("svg")).not.toBeNull();
+
+    await user.click(within(settings).getByRole("button", { name: /Link a device/ }));
+    const dialog = await screen.findByRole("dialog", { name: "Link a device" });
+    const tabs = within(dialog).getByRole("tablist", { name: "How to link" });
+    expect(tabs).toHaveClass("seg", "is-block");
+    expect(within(tabs).getAllByRole("tab").map((t) => t.textContent)).toEqual(["Show a code", "Enter a code", "Hub"]);
+    expect(document.querySelector(".segmented, .link-tabs")).toBeNull();
+  });
+
   it("links with a discovered PC by entering its code", async () => {
     const base = makeApi();
     const joinPairing = vi.fn(base.joinPairing);

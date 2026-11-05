@@ -3,6 +3,7 @@ import { Link2, Link2Off, Monitor, Moon, Plus, Sun, X } from "lucide-react";
 import type { HubStatus, Peers, Settings } from "../api/types";
 import { hubSyncedText, hubUnlinked, inHubMode } from "../lib/pcs";
 import { Dialog } from "./Dialog";
+import { Segmented, type SegmentedItem } from "./Segmented";
 import { syncedText } from "./Sidebar";
 
 interface Props {
@@ -20,7 +21,7 @@ interface Props {
   onClose: () => void;
 }
 
-const THEMES: { id: Settings["theme"]; label: string; icon: typeof Sun }[] = [
+const THEMES: SegmentedItem<Settings["theme"]>[] = [
   { id: "system", label: "System", icon: Monitor },
   { id: "light", label: "Light", icon: Sun },
   { id: "dark", label: "Dark", icon: Moon },
@@ -64,19 +65,7 @@ export function SettingsPanel({ settings, version, peers, hub, onChange, onShari
         <div className="panel-body">
           <section className="setting-group" aria-labelledby="set-theme">
             <h3 id="set-theme">Appearance</h3>
-            <div className="segmented" role="radiogroup" aria-label="Theme">
-              {THEMES.map(({ id, label, icon: Icon }) => (
-                <button
-                  key={id}
-                  role="radio"
-                  aria-checked={settings.theme === id}
-                  className={settings.theme === id ? "is-on" : ""}
-                  onClick={() => onChange({ theme: id })}
-                >
-                  <Icon size={14} aria-hidden="true" /> {label}
-                </button>
-              ))}
-            </div>
+            <Segmented items={THEMES} value={settings.theme} onChange={(theme) => onChange({ theme })} label="Theme" kind="radio" className="is-block" />
           </section>
 
           <section className="setting-group" aria-labelledby="set-general">
