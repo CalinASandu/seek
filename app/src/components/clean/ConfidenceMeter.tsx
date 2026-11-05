@@ -21,10 +21,11 @@ export function ReasonList({ reasons, label = "Why Seek thinks so" }: { reasons:
 }
 
 /** Four bars and the level written out. Hovering it lists the reasons; it never ticks anything. */
-export function ConfidenceMeter({ level, reasons }: { level: Level; reasons: Reason[] }) {
+export function ConfidenceMeter({ level, reasons, quiet = false }: { level: Level; reasons: Reason[]; quiet?: boolean }) {
   const ref = useRef<HTMLSpanElement>(null);
   const [tip, setTip] = useState<{ x: number; y: number } | null>(null);
   const show = () => {
+    if (quiet) return; // an expanded row already lists them
     const r = ref.current?.getBoundingClientRect();
     if (r) setTip({ x: Math.max(8, Math.min(r.left, window.innerWidth - 320)), y: r.bottom + 6 });
   };
@@ -44,7 +45,7 @@ export function ConfidenceMeter({ level, reasons }: { level: Level; reasons: Rea
         ))}
       </span>
       <span className="meter-label">{LEVEL_TEXT[level]}</span>
-      {tip &&
+      {tip && !quiet &&
         createPortal(
           <span className="meter-tip" role="tooltip" style={{ left: tip.x, top: tip.y }}>
             <span className="meter-tip-title">{LEVEL_TEXT[level]}</span>

@@ -92,6 +92,15 @@ export function UninstallSheet({ app, protectedPaths, onReview, onUninstalled, o
     }
   };
 
+  // a leftover that was protected meanwhile (from its review) is no longer ticked
+  useEffect(() => {
+    setTicked((cur) =>
+      cur.size === 0 || ![...cur].some((p) => isProtectedPath(p, protectedPaths))
+        ? cur
+        : new Set([...cur].filter((p) => !isProtectedPath(p, protectedPaths))),
+    );
+  }, [protectedPaths]);
+
   const pickedRows = useMemo(() => (rows ?? []).filter((r) => ticked.has(r.path)), [rows, ticked]);
   const toggle = (path: string) =>
     setTicked((cur) => {

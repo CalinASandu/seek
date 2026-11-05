@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { Lock, Shield } from "lucide-react";
 import { splitTail } from "../../lib/clean";
 
@@ -9,6 +9,19 @@ export function MidPath({ path, className = "" }: { path: string; className?: st
     <span className={`mid ${className}`} title={path}>
       {head && <span className="mid-head">{head}</span>}
       <span className="mid-tail">{tail}</span>
+    </span>
+  );
+}
+
+/** A file name cut in the middle: the start gives way, the end (with the extension) stays. */
+export function MidName({ name, className = "" }: { name: string; className?: string }) {
+  const dot = name.lastIndexOf(".");
+  const keep = dot > 0 ? Math.min(name.length - dot + 5, 14) : 6;
+  if (name.length <= keep + 8) return <span className={className}>{name}</span>;
+  return (
+    <span className={`mid ${className}`} title={name}>
+      <span className="mid-head">{name.slice(0, name.length - keep)}</span>
+      <span className="mid-tail">{name.slice(name.length - keep)}</span>
     </span>
   );
 }
@@ -87,10 +100,38 @@ export function Collapse({ open, children }: { open: boolean; children: ReactNod
   );
 }
 
+/**
+ * An entrance that runs once, for the real event. An element that only comes back with its panel (display none to shown)
+ * has nothing to announce, so it only animates when it is on screen as it appears. The class is cleared on animationend
+ * and by a timer, so reduced motion (which may not fire the event) ends in the same state.
+ */
+export function useEntrance<T extends HTMLElement>() {
+  const ref = useRef<T>(null);
+  const [entering, setEntering] = useState(false);
+  useLayoutEffect(() => {
+    if (!ref.current || ref.current.getClientRects().length === 0) return;
+    setEntering(true);
+    const t = setTimeout(() => setEntering(false), 600);
+    return () => clearTimeout(t);
+  }, []);
+  return { ref, entering, onAnimationEnd: () => setEntering(false) };
+}
+
+/** The bar that rises once something is ticked. */
+export function SelBar({ children }: { children: ReactNode }) {
+  const e = useEntrance<HTMLDivElement>();
+  return (
+    <div ref={e.ref} className={`sel-bar${e.entering ? " is-entering" : ""}`} role="region" aria-label="Selection" onAnimationEnd={e.onAnimationEnd}>
+      {children}
+    </div>
+  );
+}
+
 /** A centred message for a state with nothing to list: before the first scan, scanning, nothing found, an error. */
 export function Placeholder({ icon, title, children }: { icon: ReactNode; title: string; children?: ReactNode }) {
+  const e = useEntrance<HTMLDivElement>();
   return (
-    <div className="clean-empty">
+    <div ref={e.ref} className={`clean-empty${e.entering ? " is-entering" : ""}`} onAnimationEnd={e.onAnimationEnd}>
       <div className="clean-empty-glyph" aria-hidden="true">
         {icon}
       </div>

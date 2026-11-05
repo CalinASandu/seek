@@ -3,11 +3,11 @@ import { ChevronRight } from "lucide-react";
 import { useApi } from "../../api/context";
 import type { CommitResult, Level, PrepareRequest, Prepared, ReviewItem } from "../../api/types";
 import { ICONS, iconGroup } from "../../lib/fileicons";
-import { fileName, folderOf, lockText, LEVEL_TEXT } from "../../lib/clean";
+import { fileName, folderOf, lockText, LEVEL_TEXT, normPath } from "../../lib/clean";
 import { formatInt, formatSize } from "../../lib/format";
 import { errText } from "../../lib/pcs";
 import { Dialog } from "../Dialog";
-import { LockNote, MidPath, Shielded, SkeletonRows, Tick } from "./parts";
+import { LockNote, MidName, MidPath, Shielded, SkeletonRows, Tick } from "./parts";
 import { VirtualRows } from "./VirtualRows";
 
 interface Props {
@@ -18,8 +18,8 @@ interface Props {
   contents: ReadonlyMap<string, string[]>;
   /** "Always protect": the item leaves this removal and goes on the protected list. */
   onProtect: (path: string) => void;
-  /** Called when the sheet closes, with the paths that really went to the Recycle Bin (and were not put back). */
-  onClose: (moved: string[]) => void;
+  /** Called when the sheet closes: the paths that really went to the Recycle Bin (and were not put back), and whether a removal ran. */
+  onClose: (moved: string[], committed: boolean) => void;
 }
 
 type Row =
@@ -29,6 +29,9 @@ type Row =
   | { t: "more"; key: string; n: number };
 
 const H = { folder: 32, item: 52, child: 26, more: 26 } as const;
+/** The list is never taller than this; with few rows it is exactly as tall as they are. */
+const MAX_LIST = "min(50vh, 460px)";
+const PREPARING_H = 180;
 const SHOWN_INSIDE = 8;
 
 function buildRows(items: ReviewItem[], open: ReadonlySet<number>, contents: ReadonlyMap<string, string[]>): Row[] {
@@ -75,8 +78,13 @@ export function ReviewSheet({ request, picked, contents, onProtect, onClose }: P
   const [result, setResult] = useState<CommitResult | null>(null);
   const [putBack, setPutBack] = useState<{ busy: boolean; done: number; failed: string[] } | null>(null);
   const [restored, setRestored] = useState<ReadonlySet<string>>(new Set());
-  const resultRef = useRef<HTMLDivElement>(null);
+  const root = useRef<HTMLDivElement>(null);
+  const listRef = useRef<HTMLDivElement | null>(null);
   const first = useRef(request);
+  // the list height is set once from what was found, so unticking never changes the sheet height
+  const [listHeight, setListHeight] = useState<number | null>(null);
+  const pickedN = useMemo(() => (picked ? new Set([...picked].map(normPath)) : null), [picked]);
+  const isPicked = (path: string) => !pickedN || pickedN.has(normPath(path));
 
   useEffect(() => {
     let live = true;
@@ -84,7 +92,9 @@ export function ReviewSheet({ request, picked, contents, onProtect, onClose }: P
       (p) => {
         if (!live) return;
         setPrepared(p);
-        setTicked(new Set(p.items.filter((i) => i.lock === null && (!picked || picked.has(i.path))).map((i) => i.id)));
+        const mine = p.items.filter((i) => isPicked(i.path));
+        setTicked(new Set(mine.filter((i) => i.lock === null).map((i) => i.id)));
+        setListHeight(buildRows(mine, new Set(), contents).reduce((s, r) => s + H[r.t], 0) + 2);
         setPhase("ready");
       },
       (e: unknown) => {
@@ -101,13 +111,14 @@ export function ReviewSheet({ request, picked, contents, onProtect, onClose }: P
   }, [api]);
 
   const shown = useMemo(
-    () => (prepared ? prepared.items.filter((it) => (!picked || picked.has(it.path)) && !hidden.has(it.id)) : []),
-    [prepared, picked, hidden],
+    () => (prepared ? prepared.items.filter((it) => isPicked(it.path) && !hidden.has(it.id)) : []),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [prepared, pickedN, hidden],
   );
   const missing = useMemo(() => {
-    if (!prepared || !picked) return 0;
-    return picked.size - prepared.items.filter((i) => picked.has(i.path)).length;
-  }, [prepared, picked]);
+    if (!prepared || !pickedN) return 0;
+    return pickedN.size - prepared.items.filter((i) => pickedN.has(normPath(i.path))).length;
+  }, [prepared, pickedN]);
   const rows = useMemo(() => buildRows(shown, open, contents), [shown, open, contents]);
   const focusable = useMemo(() => rows.flatMap((r, i) => (r.t === "folder" || r.t === "item" ? [i] : [])), [rows]);
 
@@ -176,12 +187,18 @@ export function ReviewSheet({ request, picked, contents, onProtect, onClose }: P
   const movedPaths = result ? result.items.filter((i) => i.outcome.kind === "moved").map((i) => i.path) : [];
   const close = () => {
     if (phase === "moving") return;
-    onClose(movedPaths.filter((p) => !restored.has(p)));
+    onClose(movedPaths.filter((p) => !restored.has(p)), result !== null);
   };
 
+  // Where the result or an error shows, focus goes to its Done or Close button (Esc still works); Put back never gets it.
   useEffect(() => {
-    if (phase === "done") resultRef.current?.focus();
+    if (phase === "done" || phase === "failed") {
+      root.current?.closest(".dialog")?.querySelector<HTMLElement>("[data-autofocus]")?.focus();
+    }
   }, [phase]);
+
+  // The row that has focus; when it is gone (protected away), the row that took its place, clamped to the end.
+  const at = focusable.includes(focus) ? focus : (focusable.find((i) => i >= focus) ?? focusable[focusable.length - 1] ?? 0);
 
   const doPutBack = async () => {
     if (!result) return;
@@ -204,18 +221,21 @@ export function ReviewSheet({ request, picked, contents, onProtect, onClose }: P
 
   // ---- keyboard: the list owns it; Enter never removes anything ------------------------------------
   const onKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
-    if (focusable.length === 0 || e.altKey || e.ctrlKey || e.metaKey) return;
-    const at = Math.max(0, focusable.findIndex((i) => i >= focus));
-    const row = rows[focus];
+    // a key that reaches here from a control inside a row belongs to that control
+    if (e.target !== e.currentTarget || focusable.length === 0 || e.altKey || e.ctrlKey || e.metaKey) return;
+    const pos = Math.max(0, focusable.indexOf(at));
+    const row = rows[at];
     const go = (k: number) => setFocus(focusable[Math.max(0, Math.min(focusable.length - 1, k))]!);
-    if (e.key === "ArrowDown") go(at + 1);
-    else if (e.key === "ArrowUp") go(at - 1);
-    else if (e.key === "PageDown") go(at + 8);
-    else if (e.key === "PageUp") go(at - 8);
+    if (e.key === "ArrowDown") go(pos + 1);
+    else if (e.key === "ArrowUp") go(pos - 1);
+    else if (e.key === "PageDown") go(pos + 8);
+    else if (e.key === "PageUp") go(pos - 8);
     else if (e.key === "Home") go(0);
     else if (e.key === "End") go(focusable.length - 1);
     else if (e.key === " " && row) (row.t === "item" ? toggle(row.item) : row.t === "folder" && toggleFolder(row.ids));
-    else if ((e.key === "p" || e.key === "P") && row?.t === "item") protect(row.item);
+    else if ((e.key === "p" || e.key === "P") && row?.t === "item") {
+      if (!e.repeat) protect(row.item); // a held key protects one row, not a run of them
+    }
     else if (e.key === "Enter" && row?.t === "item") toggleOpen(row.item);
     else if (e.key === "ArrowRight" && row?.t === "item" && row.item.isDir && !open.has(row.item.id)) toggleOpen(row.item);
     else if (e.key === "ArrowLeft" && row?.t === "item" && open.has(row.item.id)) toggleOpen(row.item);
@@ -248,13 +268,13 @@ export function ReviewSheet({ request, picked, contents, onProtect, onClose }: P
             Put back
           </button>
         )}
-        <button className="btn btn-primary" onClick={close}>
+        <button className="btn btn-primary" data-autofocus onClick={close}>
           Done
         </button>
       </>
     ) : (
       <>
-        <button className="btn" onClick={close} disabled={phase === "moving"}>
+        <button className="btn" data-autofocus={phase === "failed" ? "" : undefined} onClick={close} disabled={phase === "moving"}>
           {phase === "failed" ? "Close" : "Cancel"}
         </button>
         {phase !== "failed" && (
@@ -267,8 +287,9 @@ export function ReviewSheet({ request, picked, contents, onProtect, onClose }: P
 
   return (
     <Dialog title={title} onClose={close} width={720} footer={footer}>
+      <div ref={root} className="sheet-root">
       {phase === "done" && result ? (
-        <div className="review-result" ref={resultRef} tabIndex={-1}>
+        <div className="review-result">
           <p className="review-note">
             {movedPaths.length > 0
               ? `${plural(movedPaths.length)} ${movedPaths.length === 1 ? "is" : "are"} in the Recycle Bin. You can put ${movedPaths.length === 1 ? "it" : "them"} back from there, or here.`
@@ -320,13 +341,15 @@ export function ReviewSheet({ request, picked, contents, onProtect, onClose }: P
             aria-label="Items to move"
             aria-rowcount={rows.length}
             autoFocus
+            listRef={listRef}
+            style={{ height: listHeight ?? PREPARING_H, maxHeight: MAX_LIST }}
             rows={rows}
             keyOf={(r) => r.key}
             size={(r) => H[r.t]}
-            focusIndex={focus}
+            focusIndex={at}
             onKeyDown={onKeyDown}
-            rowClass={(_, i) => (i === focus ? "is-focus" : "")}
-            render={(r) => {
+            rowClass={(_, i) => (i === at ? "is-focus" : "")}
+            render={(r, i) => {
               if (r.t === "folder") {
                 const ids = shown.filter((i) => r.ids.includes(i.id) && i.lock === null);
                 const on = ids.filter((i) => ticked.has(i.id)).length;
@@ -357,7 +380,15 @@ export function ReviewSheet({ request, picked, contents, onProtect, onClose }: P
               const Icon = ICONS[iconGroup(fileName(it.path), it.isDir)];
               const locked = it.lock !== null;
               return (
-                <div className={`rv-item${locked ? " is-locked" : ""}`} onClick={() => toggle(it)}>
+                <div
+                  className={`rv-item${locked ? " is-locked" : ""}`}
+                  onMouseDown={(e) => e.preventDefault() /* clicking never moves DOM focus off the list */}
+                  onClickCapture={() => {
+                    setFocus(i);
+                    listRef.current?.focus();
+                  }}
+                  onClick={() => toggle(it)}
+                >
                   {locked ? (
                     <span className="rv-lock">
                       <LockNote text={lockText(it.lock!)} label={false} />
@@ -383,7 +414,7 @@ export function ReviewSheet({ request, picked, contents, onProtect, onClose }: P
                   )}
                   <div className="rv-main">
                     <div className="rv-name">
-                      <span className="rv-name-text">{fileName(it.path)}</span>
+                      {it.isDir ? <span className="rv-name-text">{fileName(it.path)}</span> : <MidName name={fileName(it.path)} className="rv-name-text" />}
                       {it.level && <LevelTag level={it.level} />}
                       {it.needsAdmin && <Shielded />}
                     </div>
@@ -408,9 +439,10 @@ export function ReviewSheet({ request, picked, contents, onProtect, onClose }: P
               );
             }}
           />
-          {phase === "preparing" && <SkeletonRows count={5} />}
+          {phase === "preparing" && <SkeletonRows count={4} />}
         </>
       )}
+      </div>
     </Dialog>
   );
 }

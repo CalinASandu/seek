@@ -115,6 +115,11 @@ describe("Decimator view", () => {
     expect(screen.getAllByRole("checkbox").length).toBeGreaterThan(4);
     expect(checkedBoxes()).toHaveLength(0);
     expect(screen.queryByRole("region", { name: "Selection" })).toBeNull();
+    // after Use suggestions and Clear it is back to nothing
+    await user.click(screen.getByRole("button", { name: "Use suggestions" }));
+    expect(checkedBoxes().length).toBeGreaterThan(0);
+    await user.click(screen.getByRole("button", { name: "Clear" }));
+    expect(checkedBoxes()).toHaveLength(0);
 
     await toLeftovers(user);
     await user.click(screen.getByRole("button", { name: /^Probably still in use/ }));
@@ -126,7 +131,7 @@ describe("Decimator view", () => {
 
     await user.click(tab("Apps"));
     await screen.findByText("Google Chrome");
-    expect(checkedBoxes()).toHaveLength(0);
+    expect(screen.queryAllByRole("checkbox")).toHaveLength(0); // Apps has nothing to tick
     expect(screen.queryByRole("region", { name: "Selection" })).toBeNull();
   });
 

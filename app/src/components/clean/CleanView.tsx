@@ -28,6 +28,8 @@ export interface SheetSpec {
   picked: ReadonlySet<string> | null;
   contents: ReadonlyMap<string, string[]>;
   after?: (moved: string[]) => void;
+  /** Runs when a removal went through (not on Cancel): the tab's ticks are cleared. */
+  clear?: () => void;
 }
 
 interface Props {
@@ -52,6 +54,20 @@ export const CleanView = memo(function CleanView({ active, deviceId, deviceName,
   const [removedOpen, setRemovedOpen] = useState(false);
   const [uninstalling, setUninstalling] = useState<AppRow | null>(null);
   const body = useRef<HTMLDivElement>(null);
+  const top = useRef<HTMLDivElement>(null);
+  const anySheet = !!sheet || !!uninstalling || removedOpen;
+  const wasSheet = useRef(false);
+
+  // When a sheet closes and what opened it is gone (its rows were removed), focus goes to the active tab, not the page.
+  useEffect(() => {
+    if (wasSheet.current && !anySheet) {
+      const at = document.activeElement as HTMLElement | null;
+      if (!at || at === document.body || !at.isConnected || (at as HTMLButtonElement).disabled) {
+        top.current?.querySelector<HTMLElement>('[role="tab"][aria-selected="true"]')?.focus();
+      }
+    }
+    wasSheet.current = anySheet;
+  }, [anySheet]);
 
   useEffect(() => ctl.setProtected(protectedPaths), [ctl, protectedPaths]);
 
@@ -64,9 +80,10 @@ export const CleanView = memo(function CleanView({ active, deviceId, deviceName,
   }, [active, tab, ctl]);
 
   const openSheet = useCallback((spec: SheetSpec) => setSheet(spec), []);
-  const closeSheet = (moved: string[]) => {
+  const closeSheet = (moved: string[], committed: boolean) => {
     const done = sheet;
     setSheet(null);
+    if (committed) done?.clear?.();
     if (moved.length > 0) {
       ctl.moveOut(moved, body.current?.querySelector<HTMLElement>(".clean-panel:not([hidden]) .clean-scroll") ?? null);
     }
@@ -78,7 +95,7 @@ export const CleanView = memo(function CleanView({ active, deviceId, deviceName,
   return (
     <main className="main clean" hidden={!active}>
       <header className="clean-head">
-        <div className="clean-top">
+        <div className="clean-top" ref={top}>
           <Segmented items={TABS} value={tab} onChange={setTab} label="Cleanup" kind="tab" />
           <button className="clean-recent" onClick={() => setRemovedOpen(true)}>
             <History size={14} aria-hidden="true" />
@@ -197,12 +214,16 @@ function DuplicatesHead({ ctl, deviceId, deviceName, onScan }: { ctl: CleanContr
   const prot = useStore(ctl.protect, (s) => s);
   const shown = useMemo(() => visibleGroups(groups, deviceId, prot), [groups, deviceId, prot]);
   const free = useMemo(() => shown.reduce((s, g) => s + groupFreeable(g, prot), 0), [shown, prot]);
-  const scanning = status === "scanning";
+  const stopping = status === "cancelling";
+  const scanning = status === "scanning" || stopping;
+  const none = (status === "done" || status === "cancelled") && shown.length === 0;
   const where = deviceName ? ` on ${deviceName}` : "";
 
-  const figure = status === "idle" || status === "error" ? "Duplicate files" : formatSize(free);
+  const figure = status === "idle" || status === "error" || none ? "Duplicate files" : formatSize(free);
   const caption =
-    status === "idle"
+    none
+      ? "None found in the last scan"
+      : status === "idle"
       ? deviceName
         ? `Finds exact copies on ${deviceName}.`
         : "Finds files that are exact copies of each other."
@@ -220,9 +241,9 @@ function DuplicatesHead({ ctl, deviceId, deviceName, onScan }: { ctl: CleanContr
       {scanning ? (
         <ScanLine
           fraction={total > 0 ? Math.min(1, checked / total) : null}
-          text={total > 0 ? `${formatSize(checked)} of ${formatSize(total)}` : "Starting…"}
-          current={current}
-          onCancel={() => ctl.scanCancel()}
+          text={stopping ? "Stopping…" : total > 0 ? `${formatSize(checked)} of ${formatSize(total)}` : "Starting…"}
+          current={stopping ? null : current}
+          onCancel={stopping ? undefined : () => ctl.scanCancel()}
         />
       ) : (
         <IdleLine />
@@ -238,12 +259,15 @@ function LeftoversHead({ ctl, onScan }: { ctl: CleanController; onScan: () => vo
   const likely = useMemo(() => rows.filter((r) => r.level !== "probablyInUse"), [rows]);
   const bytes = useMemo(() => likely.reduce((s, r) => s + r.size, 0), [likely]);
   const first = status === "idle" || (loading && rows.length === 0);
+  const none = status === "ready" && rows.length === 0;
   return (
     <>
       <Hero
-        figure={first ? "Leftovers" : formatSize(bytes)}
+        figure={first || none ? "Leftovers" : formatSize(bytes)}
         caption={
-          first
+          none
+            ? "None found in the last scan"
+            : first
             ? "Folders that apps you removed left behind."
             : status === "error"
               ? "Couldn't look for leftovers."
@@ -264,11 +288,12 @@ function AppsHead({ ctl, onScan }: { ctl: CleanController; onScan: () => void })
   const loading = status === "loading";
   const bytes = useMemo(() => rows.reduce((s, a) => s + a.size, 0), [rows]);
   const first = status === "idle" || (loading && rows.length === 0);
+  const none = status === "ready" && rows.length === 0;
   return (
     <>
       <Hero
-        figure={first ? "Apps" : formatSize(bytes)}
-        caption={first ? "Programs installed on this PC." : status === "error" ? "Couldn't read the list of apps." : `in ${pluralize(rows.length, "app")}`}
+        figure={first || none ? "Apps" : formatSize(bytes)}
+        caption={none ? "None found in the last scan" : first ? "Programs installed on this PC." : status === "error" ? "Couldn't read the list of apps." : `in ${pluralize(rows.length, "app")}`}
         action={first ? "Scan" : "Rescan"}
         disabled={loading}
         onAction={onScan}

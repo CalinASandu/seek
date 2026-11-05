@@ -1,10 +1,10 @@
 import { useEffect, useMemo } from "react";
 import type { AppRow, DupCopy, DupGroup, DupScanState, LeftoverRow, OtherPcMatch, SeekApi } from "../api/types";
-import { freeableOf, groupFreeable, isProtectedPath, lockOf } from "../lib/clean";
+import { freeableOf, groupFreeable, isProtectedPath, lockOf, normPath } from "../lib/clean";
 import { errText } from "../lib/pcs";
 import { createStore, type Store } from "../lib/store";
 
-export type ScanStatus = "idle" | "scanning" | "done" | "cancelled" | "error";
+export type ScanStatus = "idle" | "scanning" | "cancelling" | "done" | "cancelled" | "error";
 export type LoadStatus = "idle" | "loading" | "ready" | "error";
 
 export interface DupState {
@@ -62,7 +62,7 @@ export interface CleanController {
   moveOut(paths: string[], container: HTMLElement | null): void;
 }
 
-const lower = (p: string) => p.toLowerCase();
+const lower = normPath;
 
 /** A group can't have all its local copies ticked unless a locked copy stays. */
 export function canTick(group: DupGroup, path: string, ticked: ReadonlySet<string>, prot: readonly string[]): boolean {
@@ -127,7 +127,7 @@ export function createCleanController(api: SeekApi): CleanController {
         checkedBytes: progress?.checkedBytes ?? cur.checkedBytes,
         totalBytes: progress?.totalBytes ?? cur.totalBytes,
         current: done ? null : progress ? progress.current : cur.current,
-        status: done && cur.status === "scanning" ? "done" : cur.status,
+        status: done ? (cur.status === "scanning" ? "done" : cur.status === "cancelling" ? "cancelled" : cur.status) : cur.status,
       };
     });
     if (done) {
@@ -153,7 +153,8 @@ export function createCleanController(api: SeekApi): CleanController {
       if (!st.running && st.found.length === 0) {
         // results dropped after a long absence: offer Scan again. A scan that really found nothing stays as it is.
         if (cur.groups.length > 0) return IDLE_DUP;
-        return cur.status === "scanning" ? { ...cur, status: "done", current: null } : cur;
+        if (cur.status === "scanning") return { ...cur, status: "done", current: null };
+        return cur.status === "cancelling" ? { ...cur, status: "cancelled", current: null } : cur;
       }
       const byId = new Map(cur.groups.map((g) => [g.id, g]));
       const groups = st.found.map((g) => {
@@ -161,7 +162,13 @@ export function createCleanController(api: SeekApi): CleanController {
         return old && old.copies.length === g.copies.length && old.freeable === g.freeable ? old : g;
       });
       return {
-        status: st.running ? "scanning" : cur.status === "cancelled" ? "cancelled" : "done",
+        status: st.running
+          ? cur.status === "cancelling"
+            ? "cancelling"
+            : "scanning"
+          : cur.status === "cancelled" || cur.status === "cancelling"
+            ? "cancelled"
+            : "done",
         groups,
         otherPcs: st.otherPcs,
         checkedBytes: st.checkedBytes,
@@ -171,6 +178,30 @@ export function createCleanController(api: SeekApi): CleanController {
       };
     });
     if (dup.get().status === "idle") dupTicks.set(NONE);
+    else reconcileTicks();
+  }
+
+  /** Ticks must name copies that still exist and are unlocked, and never every removable copy of a group with none locked. */
+  function reconcileTicks() {
+    const prot = protect.get();
+    const groups = dup.get().groups;
+    dupTicks.set((cur) => {
+      const copies = new Map<string, DupCopy>();
+      groups.forEach((g) => g.copies.forEach((c) => copies.set(c.path, c)));
+      const next = new Set<string>();
+      cur.forEach((p) => {
+        const c = copies.get(p);
+        if (c && lockOf(c, prot) === null) next.add(p);
+      });
+      for (const g of groups) {
+        const removable = g.copies.filter((c) => lockOf(c, prot) === null);
+        const anyLocked = removable.length < g.copies.length;
+        if (!anyLocked && removable.length > 0 && removable.every((c) => next.has(c.path))) {
+          next.delete(removable[removable.length - 1]!.path);
+        }
+      }
+      return next.size === cur.size && [...next].every((p) => cur.has(p)) ? cur : next;
+    });
   }
 
   function drop(movedLower: Set<string>) {
@@ -257,6 +288,9 @@ export function createCleanController(api: SeekApi): CleanController {
     },
 
     scanStart(deviceIds) {
+      // events carry no scan id, so a new scan waits until the old one has said it is done
+      const now = dup.get().status;
+      if (now === "scanning" || now === "cancelling") return;
       gen++;
       fresh.clear();
       pending = [];
@@ -267,10 +301,16 @@ export function createCleanController(api: SeekApi): CleanController {
       );
     },
     scanCancel() {
-      gen++;
       flush();
-      dup.set((cur) => (cur.status === "scanning" ? { ...cur, status: "cancelled", current: null } : cur));
-      api.cleanScanCancel().catch(() => undefined);
+      dup.set((cur) => (cur.status === "scanning" ? { ...cur, status: "cancelling", current: null } : cur));
+      // stopping is over when "done" arrives, or when the backend says nothing is running
+      api
+        .cleanScanCancel()
+        .then(() => api.cleanScanState())
+        .then(
+          (st) => !st.running && dup.set((cur) => (cur.status === "cancelling" ? { ...cur, status: "cancelled" } : cur)),
+          () => undefined,
+        );
     },
 
     loadLeftovers() {

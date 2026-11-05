@@ -1,4 +1,4 @@
-import { memo, useMemo, useState, type CSSProperties } from "react";
+import { memo, useEffect, useMemo, useState, type CSSProperties } from "react";
 import { ChevronRight, CopyCheck, ScanSearch } from "lucide-react";
 import type { DupCopy, DupGroup, PrepareRequest } from "../../api/types";
 import { canTick, type CleanController } from "../../hooks/useCleanup";
@@ -6,7 +6,7 @@ import { folderOf, groupFreeable, lockOf, lockText, visibleGroups } from "../../
 import { ICONS, iconGroup } from "../../lib/fileicons";
 import { formatInt, formatModified, formatSize, pluralize } from "../../lib/format";
 import { useStore } from "../../lib/store";
-import { Collapse, LockNote, MidPath, Placeholder, SkeletonRows, Tick } from "./parts";
+import { Collapse, LockNote, MidName, MidPath, Placeholder, SelBar, SkeletonRows, Tick } from "./parts";
 import type { SheetSpec } from "./CleanView";
 
 const FIRST_COPIES = 40;
@@ -82,10 +82,15 @@ const GroupRow = memo(function GroupRow({ group, ctl }: { group: DupGroup; ctl: 
   const leave = useStore(ctl.leaving, (m) => m.get(`g:${group.id}`));
   const [open, setOpen] = useState(false);
   // a group that arrived while the end of the list was on screen rises once; read when the row first exists
-  const [isNew] = useState(() => {
+  const [isNew, setIsNew] = useState(() => {
     const at = ctl.fresh.get(group.id);
     return at !== undefined && Date.now() - at < 800;
   });
+  useEffect(() => {
+    if (!isNew) return;
+    const t = setTimeout(() => setIsNew(false), 700); // reduced motion may never fire animationend
+    return () => clearTimeout(t);
+  }, [isNew]);
   const free = groupFreeable(group, prot);
   const Icon = ICONS[iconGroup(group.name, false)];
   const n = group.copies.length;
@@ -95,6 +100,7 @@ const GroupRow = memo(function GroupRow({ group, ctl }: { group: DupGroup; ctl: 
       className={`cl-row${leave !== undefined ? " is-leaving" : ""}${isNew ? " is-new" : ""}`}
       style={leave !== undefined ? ({ "--i": leave } as CSSProperties) : undefined}
       data-key={`g:${group.id}`}
+      onAnimationEnd={(e) => e.target === e.currentTarget && setIsNew(false)}
     >
       <div className="cl-row-inner">
         <button className="cl-head" aria-expanded={open} aria-label={`${group.name}, ${n} copies`} onClick={() => setOpen((o) => !o)}>
@@ -102,7 +108,7 @@ const GroupRow = memo(function GroupRow({ group, ctl }: { group: DupGroup; ctl: 
           <Icon size={18} strokeWidth={1.75} className={`ficon ficon-${iconGroup(group.name, false)}`} aria-hidden="true" />
           <span className="cl-main">
             <span className="cl-name">
-                <span className="cl-name-text">{group.name}</span>
+                <MidName name={group.name} className="cl-name-text" />
               </span>
             <span className="cl-sub tnum">
               {n} copies · {formatSize(group.size)} each
@@ -247,11 +253,11 @@ function DupBar({ ctl, groups, onReview }: { ctl: CleanController; groups: DupGr
         .groups.filter((g) => g.copies.some((c) => picked.has(c.path)))
         .map((g) => g.copies.map((c) => ({ path: c.path, deviceId: c.deviceId }))),
     };
-    onReview({ request, picked: new Set(picked), contents: NO_CONTENTS });
+    onReview({ request, picked: new Set(picked), contents: NO_CONTENTS, clear: () => ctl.clearDup() });
   };
 
   return (
-    <div className="sel-bar" role="region" aria-label="Selection">
+    <SelBar>
       <span className="sel-text tnum">
         {formatInt(count)} {count === 1 ? "item" : "items"}, {formatSize(bytes)}
       </span>
@@ -261,6 +267,6 @@ function DupBar({ ctl, groups, onReview }: { ctl: CleanController; groups: DupGr
       <button className="btn btn-primary" onClick={review}>
         Review…
       </button>
-    </div>
+    </SelBar>
   );
 }
