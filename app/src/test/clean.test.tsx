@@ -456,6 +456,20 @@ describe("Apps, Recently removed and Settings", () => {
     expect(uninstallStart).not.toHaveBeenCalled();
   });
 
+  it("marks a folder Seek only guessed, and not one the app registered", async () => {
+    const user = await openClean();
+    await user.click(tab("Apps"));
+    await user.click(await screen.findByRole("button", { name: /^Spotify/ }));
+    await user.click(screen.getByRole("button", { name: /^Uninstall…/ }));
+    const dialog = await screen.findByRole("dialog", { name: "Uninstall Spotify?" });
+    expect(dialog).toHaveTextContent(/Install folder.*\(Seek's best guess\)/);
+    await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    await user.click(await screen.findByRole("button", { name: /^Google Chrome/ }));
+    await user.click(screen.getByRole("button", { name: /^Uninstall…/ }));
+    const chrome = await screen.findByRole("dialog", { name: "Uninstall Google Chrome?" });
+    expect(chrome).not.toHaveTextContent(/best guess/);
+  });
+
   it("offers 'It's finished' when an uninstaller never settles", async () => {
     const user = await openClean();
     await user.click(tab("Apps"));

@@ -181,6 +181,14 @@ pub struct LeftoverRow {
     pub contents: Vec<String>,
 }
 
+/// Where an app's folder came from. Only `InstallLocation` is something the app said itself.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum FolderSource {
+    InstallLocation,
+    Icon,
+    Uninstaller,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct AppRow {
@@ -192,6 +200,11 @@ pub struct AppRow {
     pub install_date: Option<i64>,
     pub icon: Option<String>,
     pub folder: Option<String>,
+    /// Not sent to the window (it gets `folder_guessed`); Task 13 reads it.
+    #[serde(skip)]
+    pub folder_source: Option<FolderSource>,
+    /// True when the folder did not come from `InstallLocation`: Seek's best guess.
+    pub folder_guessed: bool,
     pub note: Option<String>,
     pub running: bool,
 }

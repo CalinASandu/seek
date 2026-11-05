@@ -108,7 +108,7 @@ fn lexical(raw: &str) -> String {
 
 /// Expand short names using the longest prefix that exists on disk. Prefixes with no `~` cannot
 /// contain a short name, so the search stops there.
-fn expand_short(path: &str) -> String {
+pub(crate) fn expand_short(path: &str) -> String {
     let mut cuts: Vec<usize> = path.match_indices('\\').map(|(i, _)| i).collect();
     cuts.push(path.len());
     for &cut in cuts.iter().rev() {

@@ -113,6 +113,19 @@ impl Places {
         self.program_files.iter().any(|p| p == canon_path.trim_end_matches('\\'))
     }
 
+    /// True if `canon_path` (in `canon` form) is `Common Files` of a Program Files root, or inside it.
+    pub fn in_common_files(&self, canon_path: &str) -> bool {
+        self.program_files.iter().any(|p| is_inside(canon_path, &format!("{}\\common files", p.trim_end_matches('\\'))))
+    }
+
+    /// True if `canon_path` (in `canon` form) is the user profile or directly inside it
+    /// (Downloads, Desktop, Documents and the like).
+    pub fn is_profile_or_child(&self, canon_path: &str) -> bool {
+        let profile = self.profile.trim_end_matches('\\');
+        !profile.is_empty()
+            && (canon_path == profile || canon_path.rsplit_once('\\').is_some_and(|(parent, _)| parent == profile))
+    }
+
     /// True if `canon_path` (in `canon` form) is inside `<ProgramData>\Package Cache`.
     pub fn in_package_cache(&self, canon_path: &str) -> bool {
         !self.program_data.is_empty() && is_inside(canon_path, &format!("{}\\package cache", self.program_data.trim_end_matches('\\')))
