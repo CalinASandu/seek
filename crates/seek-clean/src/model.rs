@@ -29,6 +29,8 @@ pub enum Lock {
     CloudPlaceholder,
     Protected,
     LinkedPc,
+    /// Not an absolute drive-letter path (relative, UNC, device, volume-GUID...). Fails closed.
+    UnsupportedPath,
 }
 
 /// How sure Seek is that a leftover folder is dead.

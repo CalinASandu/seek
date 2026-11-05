@@ -37,7 +37,10 @@ pub struct Places {
 
 impl Places {
     /// Asks Windows for every folder, so nothing depends on a drive letter or a language.
-    pub fn from_system() -> Places {
+    ///
+    /// Fails if the Windows folder, Program Files, the users folder, your profile or ProgramData
+    /// can't be found: Cleanup must refuse to run rather than run unprotected.
+    pub fn from_system() -> Result<Places, String> {
         let windows = known(&FOLDERID_Windows)
             .or_else(|| std::env::var("SystemRoot").ok().map(|s| canon(Path::new(&s))))
             .unwrap_or_default();
@@ -49,13 +52,29 @@ impl Places {
             .into_iter()
             .filter_map(known)
             .collect();
-        Places {
+        let places = Places {
             windows,
             program_files,
             users_root: known(&FOLDERID_UserProfiles).unwrap_or_default(),
             profile: known(&FOLDERID_Profile).unwrap_or_default(),
             program_data: known(&FOLDERID_ProgramData).unwrap_or_default(),
             app_data,
+        };
+        let missing: Vec<&str> = [
+            ("Windows folder", places.windows.is_empty()),
+            ("Program Files", places.program_files.is_empty()),
+            ("users folder", places.users_root.is_empty()),
+            ("user profile", places.profile.is_empty()),
+            ("ProgramData", places.program_data.is_empty()),
+        ]
+        .into_iter()
+        .filter(|(_, m)| *m)
+        .map(|(n, _)| n)
+        .collect();
+        if missing.is_empty() {
+            Ok(places)
+        } else {
+            Err(format!("Cannot determine protected places: {}", missing.join(", ")))
         }
     }
 
@@ -89,7 +108,11 @@ pub fn lock_for(
     user_protected: &[String],
 ) -> Option<Lock> {
     let dup = why == Why::Duplicate;
-    if is_system(places, canon_path) {
+    if !is_supported(canon_path) {
+        return Some(Lock::UnsupportedPath);
+    }
+    // Second guard: with no Windows folder known, nothing can be judged.
+    if places.windows.is_empty() || is_system(places, canon_path) {
         return Some(Lock::SystemFolder);
     }
     if is_other_user(places, canon_path) {
@@ -117,9 +140,21 @@ pub fn lock_for(
 
 /// Leftover scans never list these at all.
 pub fn never_listed(places: &Places, canon_path: &str) -> bool {
-    is_system(places, canon_path)
+    !is_supported(canon_path)
+        || places.windows.is_empty()
+        || is_system(places, canon_path)
         || is_other_user(places, canon_path)
         || is_inside(canon_path, &places.program_data)
+}
+
+/// Only an absolute path on a drive letter (`x:\...`) or a drive root (`x:`) can be removed.
+/// Relative, drive-relative, UNC, `\\?\Volume{}`, GLOBALROOT and device paths all fail closed.
+fn is_supported(p: &str) -> bool {
+    let b = p.as_bytes();
+    b.len() >= 2
+        && b[0].is_ascii_alphabetic()
+        && b[1] == b':'
+        && (b.len() == 2 || b[2] == b'\\')
 }
 
 fn is_drive_root(p: &str) -> bool {
@@ -211,6 +246,55 @@ mod tests {
         }
         assert_eq!(lock(r"D:\Photos\a.jpg", Why::Duplicate), None);
         assert!(!hidden(r"D:\Photos"));
+    }
+
+    #[test]
+    fn alternate_data_stream_spellings_lock_like_the_folder() {
+        for p in [
+            r"C:\Windows:x",
+            r"C:\Windows::$INDEX_ALLOCATION",
+            r"C:\Windows::$INDEX_ALLOCATION\system32\x",
+            r"C:\$Recycle.Bin::$INDEX_ALLOCATION",
+            r"C:\Windows\system32:evil:$DATA",
+        ] {
+            assert_eq!(lock(p, Why::Duplicate), Some(Lock::SystemFolder), "{p}");
+            assert!(hidden(p), "{p}");
+        }
+        assert_eq!(lock(r"C:\Program Files:x", Why::Duplicate), Some(Lock::ProgramFiles));
+        assert_eq!(lock(r"C:\Program Files::$INDEX_ALLOCATION", Why::Duplicate), Some(Lock::ProgramFiles));
+        assert_eq!(lock(r"C:\Program Files:x", Why::Leftover), None);
+        assert_eq!(canon(Path::new(r"D:\a\b.txt:stream:$DATA")), r"d:\a\b.txt");
+    }
+
+    #[test]
+    fn anything_but_an_absolute_drive_path_is_unsupported() {
+        for p in [
+            "",
+            r"Windows\x",
+            r"C:Windows\x",
+            r"\\?\Volume{12345678-1234-1234-1234-123456789abc}\Windows\x",
+            r"\\?\GLOBALROOT\Device\HarddiskVolume3\Windows\x",
+            r"\\localhost\c$\Windows\x",
+            r"\\server\share\x",
+            r"\\?\UNC\server\share\x",
+            r"\\.\PhysicalDrive0",
+            r"\\.\GLOBALROOT\Device\x",
+            r"\x",
+        ] {
+            assert_eq!(lock(p, Why::Duplicate), Some(Lock::UnsupportedPath), "{p:?}");
+            assert_eq!(lock(p, Why::Leftover), Some(Lock::UnsupportedPath), "{p:?}");
+            assert_eq!(lock(p, Why::StaleData), Some(Lock::UnsupportedPath), "{p:?}");
+            assert!(hidden(p), "{p:?}");
+        }
+        // The device-prefixed drive spelling is a plain drive path once canonical.
+        assert_eq!(lock(r"\\.\C:\Windows\x", Why::Duplicate), Some(Lock::SystemFolder));
+    }
+
+    #[test]
+    fn empty_windows_place_locks_everything() {
+        let p = Places::for_tests("", &[], "", "", "", &[]);
+        assert_eq!(lock_for(&p, r"d:\photos\a.jpg", Why::Duplicate, &[]), Some(Lock::SystemFolder));
+        assert!(never_listed(&p, r"d:\photos"));
     }
 
     #[test]
@@ -314,7 +398,7 @@ mod tests {
 
     #[test]
     fn real_system_places_agree_with_the_environment() {
-        let places = Places::from_system();
+        let places = Places::from_system().expect("system places");
         let win = std::env::var("SystemRoot").unwrap();
         let cw = canon(Path::new(&win));
         assert_eq!(lock_for(&places, &format!(r"{cw}\system32\x"), Why::Duplicate, &[]), Some(Lock::SystemFolder));
