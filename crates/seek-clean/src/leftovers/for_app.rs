@@ -57,6 +57,8 @@ struct Hit {
     canon: String,
     modified_ms: i64,
     in_program_files: bool,
+    /// The folder is named exactly like the app (not just roughly).
+    exact: bool,
     /// Evidence from where it is and what it is called; its contents are judged from the summary.
     found: Vec<Evidence>,
 }
@@ -132,7 +134,7 @@ fn name_hits(app: &AppRow, places: &Places, claims: &dyn ClaimCheck, recorded: O
                         found.push(Evidence::InInstallFolder);
                     }
                     found.extend(depth_evidence(level));
-                    out.push(Hit { in_program_files: places.in_program_files(&c), modified_ms: modified_ms(&md), canon: c, path: path.clone(), found });
+                    out.push(Hit { exact: matched == NameMatch::Exact, in_program_files: places.in_program_files(&c), modified_ms: modified_ms(&md), canon: c, path: path.clone(), found });
                 }
                 if level < MAX_DEPTH {
                     stack.push((path, level + 1, Some(name)));
@@ -160,7 +162,7 @@ fn install_hit(app: &AppRow, places: &Places) -> Option<Hit> {
         found.push(Evidence::ExactAppName);
     }
     found.extend(depth_evidence(level_below_root(places, &c)));
-    Some(Hit { in_program_files: places.in_program_files(&c), modified_ms: modified_ms(&md), canon: c, path, found })
+    Some(Hit { exact: false, in_program_files: places.in_program_files(&c), modified_ms: modified_ms(&md), canon: c, path, found })
 }
 
 /// Every row loses the points when another listed app has this app's publisher (compared with
@@ -218,6 +220,10 @@ fn shortcut_rows(
     for (file, target) in files.into_iter().zip(targets) {
         let stem = file.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
         let target = target.map(|t| expand_env(&t, &env_var)).map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
+        // A shortcut that can't be read may well work: never listed, even when named like the app.
+        if target.is_none() {
+            continue;
+        }
         let target_canon = target.as_deref().map(|t| canon(Path::new(t)));
         let points_in = matches!((&target_canon, folder), (Some(t), Some(f)) if is_inside(t, f));
         let exact = match_name(&stem, &app.name) == NameMatch::Exact;
@@ -283,6 +289,9 @@ pub(crate) fn for_app_with(
     });
     let mut seen = HashSet::new();
     found.retain(|h| seen.insert(h.canon.clone()));
+    // A rough outer folder gives way to an exact one inside it (`Acme Editor Suite\Acme Editor`).
+    let exact: Vec<String> = found.iter().filter(|h| h.exact).map(|h| h.canon.clone()).collect();
+    found.retain(|h| h.exact || !exact.iter().any(|e| is_inside(e, &h.canon)));
     let outer: Vec<String> = found.iter().map(|h| h.canon.clone()).collect();
     found.retain(|h| !outer.iter().any(|o| *o != h.canon && is_inside(&h.canon, o)));
     hits.extend(found);

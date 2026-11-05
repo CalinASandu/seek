@@ -21,7 +21,7 @@ use std::thread::JoinHandle;
 
 use serde::Serialize;
 
-use super::{is_guid, parse_app_id, FoundApp, UninstallCommand};
+use super::{is_guid, is_never_run, parse_app_id, FoundApp, UninstallCommand};
 use crate::claims::{self, is_abs};
 use crate::model::AppRow;
 
@@ -115,9 +115,15 @@ pub fn launch_request(cmd: &UninstallCommand, windows_dir: &str) -> Result<Launc
             Ok(LaunchRequest { program: format!(r"{}\System32\msiexec.exe", windows_dir.trim_end_matches('\\')), args: format!("/x{guid}") })
         }
         // Checked again here: whatever built the command, only an absolute `.exe` is run.
-        UninstallCommand::Exe { path, args } if is_abs(path) && path.to_ascii_lowercase().ends_with(".exe") => Ok(LaunchRequest { program: path.clone(), args: args.clone() }),
+        UninstallCommand::Exe { path, args } if is_local_exe(path) => Ok(LaunchRequest { program: path.clone(), args: args.clone() }),
         UninstallCommand::Exe { .. } => Err(NO_COMMAND.to_string()),
     }
+}
+
+/// An absolute `.exe` on a drive letter: not a network share (`\\server\...`), not a device or
+/// verbatim spelling (`\\?\`, `\\.\`), and not a shell or script host the parser never runs.
+fn is_local_exe(path: &str) -> bool {
+    is_abs(path) && !path.starts_with(r"\\") && path.to_ascii_lowercase().ends_with(".exe") && !is_never_run(path)
 }
 
 /// A started program that can be waited for.

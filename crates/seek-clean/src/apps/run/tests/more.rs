@@ -58,3 +58,21 @@ fn an_exe_path_must_be_absolute_and_end_in_exe() {
     let ok = UninstallCommand::Exe { path: r"C:\x\U.EXE".into(), args: String::new() };
     assert!(launch_request(&ok, r"C:\Windows").is_ok());
 }
+
+#[test]
+fn network_device_verbatim_and_shell_programs_are_not_run() {
+    for path in [
+        r"\server\share\unins000.exe",
+        r"\?\C:\x\unins000.exe",
+        r"\.\C:\x\unins000.exe",
+        r"\?\UNC\server\share\x.exe",
+        r"C:\Windows\System32\cmd.exe",
+        r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+        r"C:\x\wscript.exe",
+        r"C:\x\mshta.exe",
+        r"C:\x\CMD.EXE",
+    ] {
+        let cmd = UninstallCommand::Exe { path: path.into(), args: String::new() };
+        assert!(launch_request(&cmd, r"C:\Windows").is_err(), "{path}");
+    }
+}

@@ -69,11 +69,12 @@ export function UninstallSheet({ app, protectedPaths, onReview, onUninstalled, o
       .uninstallState(app.id)
       .then((s) => {
         if (stopped) return;
+        // Only one still in progress is picked up. A finished or unresolved one is over: the app is
+        // listed again (or still), so the sheet offers Uninstall.
         if (s === "running") {
           setStarted(true);
           setStep("running");
-        } else if (s === "finished") showLeft();
-        else setStep("unresolved");
+        }
       })
       .catch(() => {});
     return () => {

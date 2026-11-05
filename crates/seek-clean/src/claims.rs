@@ -660,6 +660,35 @@ pub fn add_shortcut_if_there(
     }
 }
 
+/// Program Files spellings that name the same place: the 64-bit and x86 expansions of each.
+const PROGRAM_FILES_GROUPS: [&[&str]; 2] = [
+    &["ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"],
+    &["CommonProgramFiles", "CommonProgramW6432", "CommonProgramFiles(x86)"],
+];
+
+/// Whether a shortcut's target should be taken as still there. It is, unless it can be shown
+/// missing: a target on a drive that isn't a readable fixed one (`readable`) is taken as there,
+/// and so is a Program Files target that exists under the other (64-bit or x86) expansion.
+pub(crate) fn target_looks_present(
+    target: &str,
+    env: &dyn Fn(&str) -> Option<String>,
+    readable: &dyn Fn(&str) -> bool,
+    exists: &dyn Fn(&str) -> bool,
+) -> bool {
+    let Some(path) = command_paths(target, env).into_iter().next() else { return true };
+    if !readable(&path) || exists(&path) {
+        return true;
+    }
+    let low = path.to_lowercase();
+    PROGRAM_FILES_GROUPS.iter().any(|group| {
+        let roots: Vec<String> = group.iter().filter_map(|v| env(v)).map(|r| r.trim_end_matches('\\').to_string()).collect();
+        roots.iter().filter(|r| is_inside(&low, &r.to_lowercase())).any(|from| {
+            let rest = &path[from.len()..];
+            roots.iter().filter(|to| !to.eq_ignore_ascii_case(from)).any(|to| exists(&format!("{to}{rest}")))
+        })
+    })
+}
+
 pub fn add_process(parts: &mut ClaimParts, image: &str) {
     let who = format!("A running program ({image})");
     let Some(exe) = clean(image) else { return };
@@ -767,7 +796,7 @@ mod real {
 
     use windows::core::{Interface, PCWSTR, PWSTR};
     use windows::Win32::Foundation::{CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_NO_MORE_ITEMS, ERROR_PATH_NOT_FOUND, ERROR_SUCCESS};
-    use windows::Win32::Storage::FileSystem::{GetDriveTypeW, GetLogicalDrives, WIN32_FIND_DATAW};
+    use windows::Win32::Storage::FileSystem::{GetDriveTypeW, GetLogicalDrives, GetVolumeInformationW, WIN32_FIND_DATAW};
     use windows::Win32::System::Com::{
         CoCreateInstance, CoInitializeEx, CoUninitialize, IPersistFile, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, STGM_READ,
     };
@@ -1171,8 +1200,18 @@ mod real {
     /// Whether a shortcut's target is still there. A drive that may stall is not asked: its
     /// shortcuts are taken as working.
     fn target_exists(target: &str) -> bool {
-        let first = command_paths(target, &env).into_iter().next();
-        first.is_none_or(|p| !is_fixed_local(&p) || Path::new(&p).exists())
+        target_looks_present(target, &env, &drive_readable, &|p| Path::new(p).exists())
+    }
+
+    /// A fixed local drive whose volume can be read. A locked (BitLocker) or failing one can't be
+    /// asked about its files.
+    fn drive_readable(path: &str) -> bool {
+        if !is_fixed_local(path) {
+            return false;
+        }
+        let root: String = path.chars().take(2).collect::<String>() + "\\";
+        // SAFETY: a NUL-terminated root path; every optional out-parameter is left out.
+        unsafe { GetVolumeInformationW(PCWSTR(wide(&root).as_ptr()), None, None, None, None, None) }.is_ok()
     }
 
     /// The raw target of each shortcut (`None` for one that can't be opened), in order. Opens
