@@ -3,4 +3,7 @@
 
 #![cfg(windows)]
 
+pub mod model;
+pub mod paths;
+pub mod protect;
 pub mod recycle;

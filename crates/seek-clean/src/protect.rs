@@ -1,0 +1,338 @@
+//! Protected places (safety rule 8). One table, in one place. See the spec's table:
+//! `docs/superpowers/specs/2026-11-04-seek-cleanup-design.md`.
+
+use std::path::Path;
+
+use windows::core::GUID;
+use windows::Win32::System::Com::CoTaskMemFree;
+use windows::Win32::UI::Shell::{
+    SHGetKnownFolderPath, FOLDERID_LocalAppData, FOLDERID_LocalAppDataLow, FOLDERID_ProgramData,
+    FOLDERID_ProgramFiles, FOLDERID_ProgramFilesX86, FOLDERID_Profile, FOLDERID_RoamingAppData,
+    FOLDERID_UserProfiles, FOLDERID_Windows, KF_FLAG_DEFAULT,
+};
+
+use crate::model::{Lock, Why};
+use crate::paths::{canon, is_inside};
+
+fn known(id: &GUID) -> Option<String> {
+    // SAFETY: the returned buffer is owned by us and freed with CoTaskMemFree right after copying.
+    unsafe {
+        let p = SHGetKnownFolderPath(id, KF_FLAG_DEFAULT, None).ok()?;
+        let s = p.to_string().ok();
+        CoTaskMemFree(Some(p.0 as *const _));
+        s.map(|s| canon(Path::new(&s)))
+    }
+}
+
+/// The system's special folders, in `canon` form. Empty entries match nothing.
+#[derive(Clone, Debug)]
+pub struct Places {
+    windows: String,
+    program_files: Vec<String>,
+    users_root: String,
+    profile: String,
+    program_data: String,
+    app_data: Vec<String>,
+}
+
+impl Places {
+    /// Asks Windows for every folder, so nothing depends on a drive letter or a language.
+    pub fn from_system() -> Places {
+        let windows = known(&FOLDERID_Windows)
+            .or_else(|| std::env::var("SystemRoot").ok().map(|s| canon(Path::new(&s))))
+            .unwrap_or_default();
+        let program_files = [&FOLDERID_ProgramFiles, &FOLDERID_ProgramFilesX86]
+            .into_iter()
+            .filter_map(known)
+            .collect();
+        let app_data = [&FOLDERID_LocalAppData, &FOLDERID_RoamingAppData, &FOLDERID_LocalAppDataLow]
+            .into_iter()
+            .filter_map(known)
+            .collect();
+        Places {
+            windows,
+            program_files,
+            users_root: known(&FOLDERID_UserProfiles).unwrap_or_default(),
+            profile: known(&FOLDERID_Profile).unwrap_or_default(),
+            program_data: known(&FOLDERID_ProgramData).unwrap_or_default(),
+            app_data,
+        }
+    }
+
+    /// Fixed places for tests. Paths are put through `canon`.
+    pub fn for_tests(
+        windows: &str,
+        program_files: &[&str],
+        users_root: &str,
+        profile: &str,
+        program_data: &str,
+        app_data: &[&str],
+    ) -> Places {
+        let c = |s: &str| canon(Path::new(s));
+        Places {
+            windows: c(windows),
+            program_files: program_files.iter().map(|s| c(s)).collect(),
+            users_root: c(users_root),
+            profile: c(profile),
+            program_data: c(program_data),
+            app_data: app_data.iter().map(|s| c(s)).collect(),
+        }
+    }
+}
+
+/// Why `canon_path` can't be removed for this purpose, if it can't. `canon_path` must be in
+/// `canon` form. `Lock::NoRecycleBin`, `CloudPlaceholder` and `LinkedPc` are not decided here.
+pub fn lock_for(
+    places: &Places,
+    canon_path: &str,
+    why: Why,
+    user_protected: &[String],
+) -> Option<Lock> {
+    let dup = why == Why::Duplicate;
+    if is_system(places, canon_path) {
+        return Some(Lock::SystemFolder);
+    }
+    if is_other_user(places, canon_path) {
+        return Some(Lock::OtherUser);
+    }
+    if dup && places.program_files.iter().any(|p| is_inside(canon_path, p)) {
+        return Some(Lock::ProgramFiles);
+    }
+    // ProgramData: duplicates are locked, leftovers are never listed (so locked here as a
+    // second line of defence). Only Seek's own stale files (`StaleData`) may be touched.
+    if why != Why::StaleData && is_inside(canon_path, &places.program_data) {
+        return Some(Lock::AppData);
+    }
+    if dup && places.app_data.iter().any(|p| is_inside(canon_path, p)) {
+        return Some(Lock::AppData);
+    }
+    if dup && in_tool_folder(canon_path) {
+        return Some(Lock::ToolFolder);
+    }
+    if user_protected.iter().any(|p| is_inside(canon_path, &canon(Path::new(p)))) {
+        return Some(Lock::Protected);
+    }
+    None
+}
+
+/// Leftover scans never list these at all.
+pub fn never_listed(places: &Places, canon_path: &str) -> bool {
+    is_system(places, canon_path)
+        || is_other_user(places, canon_path)
+        || is_inside(canon_path, &places.program_data)
+}
+
+fn is_drive_root(p: &str) -> bool {
+    p.len() == 2 && p.as_bytes()[1] == b':'
+}
+
+/// Windows folder, `$Recycle.Bin` and `System Volume Information` at a drive root, drive roots.
+fn is_system(places: &Places, p: &str) -> bool {
+    if is_drive_root(p) || is_inside(p, &places.windows) {
+        return true;
+    }
+    let b = p.as_bytes();
+    if b.len() > 2 && b[1] == b':' {
+        let first = p.split('\\').nth(1).unwrap_or("");
+        return first == "$recycle.bin" || first == "system volume information";
+    }
+    false
+}
+
+/// Under the users folder but not under your own profile. The users folder itself counts.
+fn is_other_user(places: &Places, p: &str) -> bool {
+    is_inside(p, &places.users_root) && !is_inside(p, &places.profile)
+}
+
+/// Strictly inside one of the tool folders (the last segment is the item itself).
+fn in_tool_folder(p: &str) -> bool {
+    let mut segs: Vec<&str> = p.split('\\').collect();
+    segs.pop();
+    segs.iter().any(|s| matches!(*s, ".git" | "node_modules" | "target" | ".venv"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn places() -> Places {
+        Places::for_tests(
+            r"C:\Windows",
+            &[r"C:\Program Files", r"C:\Program Files (x86)"],
+            r"C:\Users",
+            r"C:\Users\me",
+            r"C:\ProgramData",
+            &[
+                r"C:\Users\me\AppData\Local",
+                r"C:\Users\me\AppData\Roaming",
+                r"C:\Users\me\AppData\LocalLow",
+            ],
+        )
+    }
+
+    fn lock(p: &str, why: Why) -> Option<Lock> {
+        lock_p(p, why, &[])
+    }
+
+    fn lock_p(p: &str, why: Why, prot: &[String]) -> Option<Lock> {
+        lock_for(&places(), &canon(Path::new(p)), why, prot)
+    }
+
+    fn hidden(p: &str) -> bool {
+        never_listed(&places(), &canon(Path::new(p)))
+    }
+
+    #[test]
+    fn spellings_of_windows_all_lock() {
+        for p in [
+            r"c:\WINDOWS\system32\x",
+            r"C:\Users\me\..\..\Windows\x",
+            r"\\?\C:\Windows\x",
+            r"C:\Windows\",
+        ] {
+            assert_eq!(lock(p, Why::Duplicate), Some(Lock::SystemFolder), "{p}");
+            assert_eq!(lock(p, Why::Leftover), Some(Lock::SystemFolder), "{p}");
+            assert!(hidden(p), "{p}");
+        }
+    }
+
+    #[test]
+    fn recycle_bin_and_volume_information_and_drive_roots() {
+        for p in [
+            r"C:\$Recycle.Bin\S-1-5\x",
+            r"d:\System Volume Information\x",
+            r"D:\$RECYCLE.BIN",
+            r"C:\",
+            r"E:",
+        ] {
+            assert_eq!(lock(p, Why::Duplicate), Some(Lock::SystemFolder), "{p}");
+            assert_eq!(lock(p, Why::Leftover), Some(Lock::SystemFolder), "{p}");
+            assert!(hidden(p), "{p}");
+        }
+        assert_eq!(lock(r"D:\Photos\a.jpg", Why::Duplicate), None);
+        assert!(!hidden(r"D:\Photos"));
+    }
+
+    #[test]
+    fn a_lookalike_folder_is_not_program_files() {
+        assert_eq!(lock(r"C:\Program Files Extra\x", Why::Duplicate), None);
+        assert_eq!(lock(r"C:\Windows Old\x", Why::Duplicate), None);
+        assert_eq!(lock(r"C:\Users\me2\x", Why::Duplicate), Some(Lock::OtherUser));
+    }
+
+    #[test]
+    fn program_files_locks_duplicates_but_not_leftovers() {
+        for pf in [r"C:\Program Files", r"C:\Program Files (x86)"] {
+            let dup = format!(r"{pf}\App\a.bin");
+            let app = format!(r"{pf}\App");
+            assert_eq!(lock(&dup, Why::Duplicate), Some(Lock::ProgramFiles));
+            assert_eq!(lock(&app, Why::Leftover), None);
+            assert_eq!(lock(&app, Why::Uninstall), None);
+            assert!(!hidden(&app));
+        }
+    }
+
+    #[test]
+    fn inside_a_tool_folder_locks_at_any_depth() {
+        for p in [
+            r"D:\code\proj\.git\objects\ab\cd",
+            r"D:\code\proj\node_modules\left-pad\a\b\c\x.js",
+            r"D:\code\proj\Target\debug\x.exe",
+            r"D:\code\.venv\Lib\x.py",
+        ] {
+            assert_eq!(lock(p, Why::Duplicate), Some(Lock::ToolFolder), "{p}");
+        }
+        assert_eq!(lock(r"D:\code\target", Why::Duplicate), None, "a file called target");
+        assert_eq!(lock(r"D:\code\targets\x", Why::Duplicate), None);
+        assert_eq!(lock(r"D:\code\my.git\x", Why::Duplicate), None);
+    }
+
+    #[test]
+    fn user_protected_folder_locks_everything_inside_it() {
+        let prot = vec![r"D:\Keep".to_string(), r"E:\Thesis\final.docx".to_string()];
+        for why in [Why::Duplicate, Why::Leftover, Why::Uninstall, Why::StaleData] {
+            assert_eq!(lock_p(r"d:\keep\a\b.txt", why, &prot), Some(Lock::Protected));
+            assert_eq!(lock_p(r"D:\KEEP", why, &prot), Some(Lock::Protected));
+            assert_eq!(lock_p(r"E:\Thesis\final.docx", why, &prot), Some(Lock::Protected));
+            assert_eq!(lock_p(r"D:\Keeper\a.txt", why, &prot), None);
+            assert_eq!(lock_p(r"E:\Thesis\other.docx", why, &prot), None);
+        }
+        // A protected Program Files app is locked for leftovers too.
+        let pf = vec![r"C:\Program Files\App".to_string()];
+        assert_eq!(lock_p(r"C:\Program Files\App", Why::Leftover, &pf), Some(Lock::Protected));
+        // Protected entries are compared in canonical form.
+        let odd = vec![r"d:/keep/../Keep2/".to_string()];
+        assert_eq!(lock_p(r"D:\Keep2\x", Why::Duplicate, &odd), Some(Lock::Protected));
+    }
+
+    #[test]
+    fn other_users_profile_locks_and_your_own_does_not() {
+        assert_eq!(lock(r"C:\Users\bob\Documents\a.txt", Why::Duplicate), Some(Lock::OtherUser));
+        assert_eq!(lock(r"C:\Users\Public\a.txt", Why::Duplicate), Some(Lock::OtherUser));
+        assert_eq!(lock(r"C:\Users\bob", Why::Leftover), Some(Lock::OtherUser));
+        assert_eq!(lock(r"C:\Users", Why::Leftover), Some(Lock::OtherUser));
+        assert!(hidden(r"C:\Users\bob\AppData\Local\Thing"));
+        assert!(hidden(r"C:\Users"));
+        assert_eq!(lock(r"C:\Users\me\Documents\a.txt", Why::Duplicate), None);
+        assert_eq!(lock(r"C:\Users\ME\Documents\a.txt", Why::Duplicate), None);
+        assert!(!hidden(r"C:\Users\me\Documents\Thing"));
+    }
+
+    #[test]
+    fn app_data_locks_duplicates_and_is_listed_for_leftovers() {
+        for p in [
+            r"C:\Users\me\AppData\Local\App\cache.bin",
+            r"C:\Users\me\AppData\Roaming\App\cfg.json",
+            r"C:\Users\me\AppData\LocalLow\App\x",
+        ] {
+            assert_eq!(lock(p, Why::Duplicate), Some(Lock::AppData), "{p}");
+        }
+        for p in [r"C:\Users\me\AppData\Local\OldApp", r"C:\Users\me\AppData\Roaming\OldApp"] {
+            assert_eq!(lock(p, Why::Leftover), None, "{p}");
+            assert!(!hidden(p), "{p}");
+        }
+        // Your own Documents next to AppData is not AppData.
+        assert_eq!(lock(r"C:\Users\me\AppDataX\a", Why::Duplicate), None);
+    }
+
+    #[test]
+    fn program_data_is_never_listed_apart_from_seeks_stale_files() {
+        assert_eq!(lock(r"C:\ProgramData\Vendor\x.bin", Why::Duplicate), Some(Lock::AppData));
+        assert_eq!(lock(r"C:\ProgramData\Vendor", Why::Leftover), Some(Lock::AppData));
+        assert!(hidden(r"C:\ProgramData\Vendor"));
+        assert!(hidden(r"C:\ProgramData"));
+        assert_eq!(lock(r"C:\ProgramData\Seek\old.json", Why::StaleData), None);
+    }
+
+    #[test]
+    fn drive_root_is_never_listed() {
+        assert!(hidden(r"C:\"));
+        assert!(hidden(r"d:"));
+        assert!(hidden(r"\\?\E:\"));
+        assert!(!hidden(r"D:\x"));
+    }
+
+    #[test]
+    fn real_system_places_agree_with_the_environment() {
+        let places = Places::from_system();
+        let win = std::env::var("SystemRoot").unwrap();
+        let cw = canon(Path::new(&win));
+        assert_eq!(lock_for(&places, &format!(r"{cw}\system32\x"), Why::Duplicate, &[]), Some(Lock::SystemFolder));
+        let pf = canon(Path::new(&std::env::var("ProgramFiles").unwrap()));
+        assert_eq!(lock_for(&places, &format!(r"{pf}\a\b"), Why::Duplicate, &[]), Some(Lock::ProgramFiles));
+        assert_eq!(lock_for(&places, &format!(r"{pf}\a"), Why::Leftover, &[]), None);
+        let profile = canon(Path::new(&std::env::var("USERPROFILE").unwrap()));
+        assert_eq!(lock_for(&places, &format!(r"{profile}\documents\a.txt"), Why::Duplicate, &[]), None);
+        let local = canon(Path::new(&std::env::var("LOCALAPPDATA").unwrap()));
+        assert_eq!(lock_for(&places, &format!(r"{local}\app\a"), Why::Duplicate, &[]), Some(Lock::AppData));
+        let roaming = canon(Path::new(&std::env::var("APPDATA").unwrap()));
+        assert_eq!(lock_for(&places, &format!(r"{roaming}\app\a"), Why::Duplicate, &[]), Some(Lock::AppData));
+        let low = format!(r"{profile}\appdata\locallow\app\a");
+        assert_eq!(lock_for(&places, &low, Why::Duplicate, &[]), Some(Lock::AppData));
+        let pd = canon(Path::new(&std::env::var("ProgramData").unwrap()));
+        assert!(never_listed(&places, &format!(r"{pd}\vendor")));
+        assert!(!never_listed(&places, &format!(r"{local}\oldapp")));
+        let users = canon(Path::new(profile.rsplit_once('\\').unwrap().0));
+        assert!(never_listed(&places, &format!(r"{users}\someone-else\x")));
+    }
+}
