@@ -4,6 +4,7 @@ import { useApi } from "../api/context";
 import type { PairingCode, PcInfo, Peers } from "../api/types";
 import { errText, hubLinkError, spacedCode } from "../lib/pcs";
 import { Dialog } from "./Dialog";
+import { Segmented, type SegmentedItem } from "./Segmented";
 
 interface Props {
   peers: Peers | null;
@@ -12,6 +13,12 @@ interface Props {
 }
 
 type Tab = "show" | "enter" | "hub";
+
+const TABS: SegmentedItem<Tab>[] = [
+  { id: "show", label: "Show a code" },
+  { id: "enter", label: "Enter a code" },
+  { id: "hub", label: "Hub" },
+];
 
 export function LinkPcDialog({ peers, onClose, onLinked }: Props) {
   const [tab, setTab] = useState<Tab>("show");
@@ -54,24 +61,16 @@ export function LinkPcDialog({ peers, onClose, onLinked }: Props) {
         </div>
       ) : (
         <>
-          <div className="segmented link-tabs" role="tablist" aria-label="How to link">
-            <button role="tab" aria-selected={tab === "show"} className={tab === "show" ? "is-on" : ""} onClick={() => setTab("show")}>
-              Show a code
-            </button>
-            <button role="tab" aria-selected={tab === "enter"} className={tab === "enter" ? "is-on" : ""} onClick={() => setTab("enter")}>
-              Enter a code
-            </button>
-            <button role="tab" aria-selected={tab === "hub"} className={tab === "hub" ? "is-on" : ""} onClick={() => setTab("hub")}>
-              Hub
-            </button>
+          <Segmented items={TABS} value={tab} onChange={setTab} label="How to link" kind="tab" className="is-block link-switch" />
+          <div className="link-body">
+            {tab === "show" ? (
+              <ShowCode />
+            ) : tab === "enter" ? (
+              <EnterCode onLinked={done} />
+            ) : (
+              <HubLink direct={peers?.peers.length ?? 0} onLinked={done} />
+            )}
           </div>
-          {tab === "show" ? (
-            <ShowCode />
-          ) : tab === "enter" ? (
-            <EnterCode onLinked={done} />
-          ) : (
-            <HubLink direct={peers?.peers.length ?? 0} onLinked={done} />
-          )}
         </>
       )}
     </Dialog>
