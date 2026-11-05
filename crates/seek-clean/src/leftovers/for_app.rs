@@ -16,7 +16,7 @@ use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use super::{evidence, kind_of, unix_now_ms, walk, IndexFacts, Kind, Summary};
-use crate::claims::{expand_env, is_fixed_local, link_targets, whole_words_match, words, InstalledNames};
+use crate::claims::{expand_env, link_targets, target_present, whole_words_match, words, InstalledNames};
 use crate::confidence::{is_publisher_name, name_len, names_are_similar, same_publisher, score, Evidence, MAX_DEPTH};
 use crate::facts::{modified_ms, ClaimCheck};
 use crate::model::{AppRow, FolderSource, LeftoverRow};
@@ -211,6 +211,7 @@ fn shortcut_rows(
     recorded: Option<&str>,
     installed: &InstalledNames,
     links: &dyn Fn(&[PathBuf]) -> Vec<Option<String>>,
+    present: &dyn Fn(&str) -> bool,
 ) -> Vec<(i32, LeftoverRow)> {
     let folder = recorded;
     let files = shortcut_files(places);
@@ -227,8 +228,8 @@ fn shortcut_rows(
         let target_canon = target.as_deref().map(|t| canon(Path::new(t)));
         let points_in = matches!((&target_canon, folder), (Some(t), Some(f)) if is_inside(t, f));
         let exact = match_name(&stem, &app.name) == NameMatch::Exact;
-        // A target on a drive that may stall isn't looked at: such a shortcut is taken as working.
-        let works = target.as_deref().is_some_and(|t| !is_fixed_local(t) || Path::new(t).exists());
+        // The claims' own rule, so the list and the claims agree on what a working shortcut is.
+        let works = target.as_deref().is_some_and(present);
         if works || !(points_in || exact) {
             continue;
         }
@@ -276,6 +277,7 @@ pub(crate) fn for_app_with(
     index: &dyn IndexFacts,
     walker: &dyn Fn(&Path) -> Option<Summary>,
     links: &dyn Fn(&[PathBuf]) -> Vec<Option<String>>,
+    present: &dyn Fn(&str) -> bool,
 ) -> Vec<LeftoverRow> {
     let install = install_hit(app, places);
     // "Inside the recorded install folder" only means something when the app recorded it itself.
@@ -325,7 +327,7 @@ pub(crate) fn for_app_with(
             },
         ));
     }
-    scored.extend(shortcut_rows(app, places, recorded.as_deref(), installed, links));
+    scored.extend(shortcut_rows(app, places, recorded.as_deref(), installed, links, present));
     scored.sort_by(|(ta, a), (tb, b)| tb.cmp(ta).then(b.size.cmp(&a.size)).then_with(|| a.path.cmp(&b.path)));
     scored.into_iter().map(|(_, r)| r).collect()
 }
@@ -338,5 +340,5 @@ pub fn for_app(
     installed: &InstalledNames,
     index: &dyn IndexFacts,
 ) -> Vec<LeftoverRow> {
-    for_app_with(app, places, claims, installed, unix_now_ms(), index, &walk, &link_targets)
+    for_app_with(app, places, claims, installed, unix_now_ms(), index, &walk, &link_targets, &target_present)
 }

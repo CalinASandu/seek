@@ -52,7 +52,7 @@ fn after(w: &World, app: &AppRow, claims: &dyn ClaimCheck, links: &Links) -> Vec
 }
 
 fn after_with(w: &World, app: &AppRow, claims: &dyn ClaimCheck, installed: &InstalledNames, links: &Links) -> Vec<LeftoverRow> {
-    for_app_with(app, &w.places, claims, installed, later(), &NoIndex, &walk, links)
+    for_app_with(app, &w.places, claims, installed, later(), &NoIndex, &walk, links, &here)
 }
 
 fn depth_reasons(r: &LeftoverRow) -> usize {
@@ -338,7 +338,7 @@ fn folder_facts_come_from_the_index_first_and_the_walk_fills_the_rest() {
         walked.lock().unwrap().push(p.file_name().unwrap().to_string_lossy().into_owned());
         walk(p)
     };
-    let rows = for_app_with(&a, &w.places, &Claims::default(), &names(), later(), &index, &walker, &unreadable);
+    let rows = for_app_with(&a, &w.places, &Claims::default(), &names(), later(), &index, &walker, &unreadable, &here);
     assert_eq!(rows.len(), 3, "{rows:?}");
     // One question for all the candidates; the walk only for the one the index didn't know.
     assert_eq!(index.asked.lock().unwrap().len(), 1);
@@ -370,4 +370,40 @@ fn a_shortcut_that_cannot_be_read_is_never_listed() {
     let (user_menu, _) = menus(&w);
     put(&user_menu, "Acme Editor.lnk", 1);
     assert!(after(&w, &a, &Claims::default(), &unreadable).is_empty());
+}
+
+fn after_present(w: &World, app: &AppRow, present: &dyn Fn(&str) -> bool, links: &Links) -> Vec<LeftoverRow> {
+    for_app_with(app, &w.places, &Claims::default(), &names(), later(), &NoIndex, &walk, links, present)
+}
+
+#[test]
+fn a_shortcut_that_looks_dead_only_by_the_claims_rule_is_not_listed() {
+    let w = world();
+    let a = app("Acme Editor", "Initech", None, None);
+    let (user_menu, _) = menus(&w);
+    put(&user_menu, "Acme Editor.lnk", 1);
+    let dead = w.base.join("gone").join("editor.exe");
+    let there = |t: &str| crate::claims::target_looks_present(t, &|_| None, &|_| true, &|p| Path::new(p).exists());
+    // The same shortcut is listed when the target is plainly gone ...
+    assert_eq!(after_present(&w, &a, &there, &targets(&[("Acme Editor.lnk", &dead)])).len(), 1);
+    // ... but not when its drive can't be read (a locked drive says nothing about its files) ...
+    let locked = |t: &str| crate::claims::target_looks_present(t, &|_| None, &|_| false, &|p| Path::new(p).exists());
+    assert!(after_present(&w, &a, &locked, &targets(&[("Acme Editor.lnk", &dead)])).is_empty());
+    // ... nor when a Program Files target is there under the other (x86) expansion.
+    let x86 = w.base.join("Program Files (x86)");
+    put(&x86.join("Acme"), "a.exe", 1);
+    let x86_s = x86.to_string_lossy().into_owned();
+    let env = move |n: &str| match n.to_ascii_lowercase().as_str() {
+        "programfiles" => Some(r"C:\Program Files".to_string()),
+        "programfiles(x86)" => Some(x86_s.clone()),
+        _ => None,
+    };
+    let swap = |t: &str| crate::claims::target_looks_present(t, &env, &|_| true, &|p| Path::new(p).exists());
+    let target64 = Path::new(r"C:\Program Files").join("Acme").join("a.exe");
+    assert!(after_present(&w, &a, &swap, &targets(&[("Acme Editor.lnk", &target64)])).is_empty());
+}
+
+/// The claims' rule on this PC's disk, as `for_app` uses it, with every drive readable.
+fn here(target: &str) -> bool {
+    crate::claims::target_looks_present(target, &|_| None, &|_| true, &|p| Path::new(p).exists())
 }

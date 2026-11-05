@@ -574,6 +574,12 @@ pub fn read_uninstall_entry(hive: &str, view: &str, key: &str) -> Option<Uninsta
     real::read_one_entry(hive, view, key)
 }
 
+/// Whether a shortcut's target should be taken as still there, by the rule the claims use: it is,
+/// unless its readable fixed drive shows it missing in both the 64-bit and x86 Program Files spellings.
+pub(crate) fn target_present(target: &str) -> bool {
+    real::target_exists(target)
+}
+
 /// Where each Start Menu shortcut points, as written in the shortcut (`%VAR%` not yet expanded).
 /// `None` for one that can't be opened. Only reads.
 pub(crate) fn link_targets(files: &[std::path::PathBuf]) -> Vec<Option<String>> {
@@ -1199,7 +1205,7 @@ mod real {
 
     /// Whether a shortcut's target is still there. A drive that may stall is not asked: its
     /// shortcuts are taken as working.
-    fn target_exists(target: &str) -> bool {
+    pub(super) fn target_exists(target: &str) -> bool {
         target_looks_present(target, &env, &drive_readable, &|p| Path::new(p).exists())
     }
 
