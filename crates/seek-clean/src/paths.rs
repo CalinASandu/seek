@@ -71,6 +71,8 @@ fn lexical(raw: &str) -> String {
             }
             continue;
         }
+        // An alternate data stream (`dir:x`, `dir::$INDEX_ALLOCATION`) names the same item.
+        let s = s.split(':').next().unwrap_or("");
         let trimmed = s.trim_end_matches(['.', ' ']);
         if trimmed.is_empty() {
             continue;
