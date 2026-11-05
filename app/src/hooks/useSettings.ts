@@ -2,14 +2,14 @@ import { useCallback, useEffect, useState } from "react";
 import { useApi } from "../api/context";
 import type { Settings } from "../api/types";
 
-const DEFAULTS: Settings = { startWithWindows: false, theme: "system", excludeFolders: [] };
+const DEFAULTS: Settings = { startWithWindows: false, theme: "system", excludeFolders: [], protectedPaths: [] };
 
 export function useSettings() {
   const api = useApi();
   const [settings, setLocal] = useState<Settings>(DEFAULTS);
 
   useEffect(() => {
-    api.getSettings().then(setLocal).catch(() => undefined);
+    api.getSettings().then((s) => setLocal({ ...DEFAULTS, ...s, protectedPaths: s.protectedPaths ?? [] })).catch(() => undefined);
   }, [api]);
 
   useEffect(() => {
