@@ -284,6 +284,9 @@ async fn handle(state: Arc<State>, conn: Arc<Conn>, req: Request) -> Response {
         Request::SameSizeFiles { min_size, device_ids, cursor, limit } => {
             same_size_files(state, conn, min_size, device_ids, cursor, limit).await
         }
+        Request::StaleData => tokio::task::spawn_blocking(move || Response::StaleData { files: state.stale_data() })
+            .await
+            .unwrap_or_else(|e| err(format!("listing stale data failed: {e}"))),
         Request::Status => Response::Status(status(&state)),
         Request::Subscribe => Response::Ok,
         Request::StartPairing

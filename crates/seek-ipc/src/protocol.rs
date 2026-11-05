@@ -75,6 +75,17 @@ pub enum Request {
     /// sizes held by two or more files. `cursor` is the largest size still to return (`None` = from the top).
     /// A page is whole size groups, about `limit` files, and always at least one group.
     SameSizeFiles { min_size: u64, device_ids: Vec<DeviceId>, cursor: Option<u64>, limit: u32 },
+    /// Seek's own index and journal files that no known drive owns. Read-only.
+    StaleData,
+}
+
+/// A file in the service's data folder that no known drive owns. `modified` is unix epoch milliseconds.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct StaleFile {
+    pub path: String,
+    pub size: u64,
+    pub modified: i64,
 }
 
 /// The files of one size, see [`Request::SameSizeFiles`].
@@ -111,6 +122,7 @@ pub enum Response {
     SpaceTypes { types: Vec<TypeTotal> },
     /// `next` = the size to pass as `cursor` for the following page; `None` = that was the last page.
     SameSizeFiles { groups: Vec<SizeGroup>, next: Option<u64> },
+    StaleData { files: Vec<StaleFile> },
     Memory { report: MemoryReport },
 }
 
@@ -337,6 +349,15 @@ mod tests {
         let l = Request::SpaceLargest { device_id: uuid::Uuid::nil(), path: r"D:\".into(), limit: 50 };
         assert!(serde_json::to_string(&l).unwrap().starts_with(r#"{"type":"spaceLargest","deviceId":"#));
         assert_eq!(serde_json::to_string(&Response::SpaceFiles { files: vec![] }).unwrap(), r#"{"type":"spaceFiles","files":[]}"#);
+    }
+
+    #[test]
+    fn stale_data_json_shapes() {
+        assert_eq!(serde_json::to_string(&Request::StaleData).unwrap(), r#"{"type":"staleData"}"#);
+        let resp = Response::StaleData { files: vec![StaleFile { path: r"C:\a.seekidx".into(), size: 3, modified: 4 }] };
+        let js = serde_json::to_string(&resp).unwrap();
+        assert_eq!(js, r#"{"type":"staleData","files":[{"path":"C:\\a.seekidx","size":3,"modified":4}]}"#);
+        assert_eq!(serde_json::from_str::<Response>(&js).unwrap(), resp);
     }
 
     #[test]
