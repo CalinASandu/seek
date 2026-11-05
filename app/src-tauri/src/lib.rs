@@ -160,6 +160,7 @@ pub fn run() {
             cleanup::clean_scan_cancel,
             cleanup::clean_scan_state,
             cleanup::clean_leftovers,
+            cleanup::clean_apps,
             cleanup::clean_prepare,
             cleanup::clean_commit,
             cleanup::open_recycle_bin,
