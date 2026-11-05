@@ -15,6 +15,8 @@ export interface DupState {
   totalBytes: number;
   current: string | null;
   error: string | null;
+  /** What the scan left out or couldn't read; kept after it ends. */
+  notice: string | null;
 }
 export interface ListState<T> {
   status: LoadStatus;
@@ -25,7 +27,7 @@ export interface ListState<T> {
 const NONE: ReadonlySet<string> = new Set();
 const NO_PROTECTED: readonly string[] = [];
 const NO_LEAVING: ReadonlyMap<string, number> = new Map();
-const IDLE_DUP: DupState = { status: "idle", groups: [], otherPcs: [], checkedBytes: 0, totalBytes: 0, current: null, error: null };
+const IDLE_DUP: DupState = { status: "idle", groups: [], otherPcs: [], checkedBytes: 0, totalBytes: 0, current: null, error: null, notice: null };
 
 /** How long a row takes to leave (CSS: 200 ms) plus the longest stagger, plus a little. */
 const LEAVE_MS = 200 + 30 * 8 + 80;
@@ -133,7 +135,7 @@ export function createCleanController(api: SeekApi): CleanController {
     if (done) {
       const mine = gen;
       api.cleanScanState().then(
-        (st) => attached && mine === gen && dup.set((cur) => ({ ...cur, otherPcs: st.otherPcs })),
+        (st) => attached && mine === gen && dup.set((cur) => ({ ...cur, otherPcs: st.otherPcs, notice: st.notice ?? null })),
         () => undefined,
       );
     }
@@ -151,8 +153,12 @@ export function createCleanController(api: SeekApi): CleanController {
   function adopt(st: DupScanState) {
     dup.set((cur) => {
       if (!st.running && st.found.length === 0) {
-        // results dropped after a long absence: offer Scan again. A scan that really found nothing stays as it is.
-        if (cur.groups.length > 0) return IDLE_DUP;
+        // results dropped after a long absence: offer Scan again, with no groups, ticks or marks left to hold.
+        // A scan that really found nothing stays as it is.
+        if (cur.groups.length > 0) {
+          fresh.clear();
+          return IDLE_DUP;
+        }
         if (cur.status === "scanning") return { ...cur, status: "done", current: null };
         return cur.status === "cancelling" ? { ...cur, status: "cancelled", current: null } : cur;
       }
@@ -175,6 +181,7 @@ export function createCleanController(api: SeekApi): CleanController {
         totalBytes: st.totalBytes,
         current: st.current,
         error: null,
+        notice: st.notice ?? null,
       };
     });
     if (dup.get().status === "idle") dupTicks.set(NONE);
@@ -296,21 +303,26 @@ export function createCleanController(api: SeekApi): CleanController {
       pending = [];
       dupTicks.set(NONE);
       dup.set({ ...IDLE_DUP, status: "scanning" });
-      api.cleanScanStart(deviceIds).catch((e: unknown) =>
-        dup.set((cur) => ({ ...cur, status: "error", error: errText(e) })),
+      const mine = gen;
+      api.cleanScanStart(deviceIds).then(
+        // the backend knows by now which drives it left out
+        () =>
+          api.cleanScanState().then(
+            (st) => mine === gen && dup.set((cur) => ({ ...cur, notice: st.notice ?? null })),
+            () => undefined,
+          ),
+        (e: unknown) => dup.set((cur) => ({ ...cur, status: "error", error: errText(e) })),
       );
     },
     scanCancel() {
       flush();
       dup.set((cur) => (cur.status === "scanning" ? { ...cur, status: "cancelling", current: null } : cur));
-      // stopping is over when "done" arrives, or when the backend says nothing is running
+      // stopping is over when "done" arrives, or when the backend says nothing is running, or when it can't be asked
+      const stopped = () => dup.set((cur) => (cur.status === "cancelling" ? { ...cur, status: "cancelled" } : cur));
       api
         .cleanScanCancel()
         .then(() => api.cleanScanState())
-        .then(
-          (st) => !st.running && dup.set((cur) => (cur.status === "cancelling" ? { ...cur, status: "cancelled" } : cur)),
-          () => undefined,
-        );
+        .then((st) => !st.running && stopped(), stopped);
     },
 
     loadLeftovers() {

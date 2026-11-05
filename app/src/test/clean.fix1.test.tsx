@@ -177,6 +177,26 @@ describe("Scan cancel", () => {
     await waitFor(() => expect(ctl.dup.get().status).toBe("cancelled"));
   });
 
+  it("does not stay on 'Stopping' when the cancel call itself fails", async () => {
+    const h = held();
+    const api: SeekApi = {
+      ...h.api,
+      cleanScanCancel: async () => {
+        throw new Error("the pipe closed");
+      },
+    };
+    const ctl = createCleanController(api);
+    ctl.attach();
+    await tick();
+    ctl.scanStart([]);
+    ctl.scanCancel();
+    expect(ctl.dup.get().status).toBe("cancelling");
+    await waitFor(() => expect(ctl.dup.get().status).toBe("cancelled"));
+    // and a failed cancel after the scan already ended changes nothing
+    h.emit({ type: "done" });
+    expect(ctl.dup.get().status).toBe("cancelled");
+  });
+
   it("disables Rescan while it is stopping", async () => {
     const h = held();
     const user = await openClean(h.api);

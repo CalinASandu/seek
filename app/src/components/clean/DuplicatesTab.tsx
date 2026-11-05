@@ -29,12 +29,18 @@ export function DuplicatesTab({ ctl, deviceId, deviceName, onReview }: Props) {
   const status = useStore(ctl.dup, (s) => s.status);
   const groups = useStore(ctl.dup, (s) => s.groups);
   const error = useStore(ctl.dup, (s) => s.error);
+  const notice = useStore(ctl.dup, (s) => s.notice);
   const prot = useStore(ctl.protect, (s) => s);
   const shown = useMemo(() => visibleGroups(groups, deviceId, prot), [groups, deviceId, prot]);
 
   return (
     <div className="clean-panel-inner">
       <div className="clean-scroll" ref={(el) => void (ctl.listEl.current = el)}>
+        {notice && status !== "idle" && status !== "error" && (
+          <p className="cl-notice" role="status">
+            {notice}
+          </p>
+        )}
         {status === "idle" ? (
           <Placeholder icon={<ScanSearch size={26} />} title="Find files you have twice">
             Seek compares what's inside your files, not only their names. Scanning reads your drives, so it takes a while, and you
