@@ -103,6 +103,21 @@ impl Places {
         self.program_files.iter().any(|p| is_inside(canon_path, p))
     }
 
+    /// True if `canon_path` (in `canon` form) is the Windows folder or inside it.
+    pub fn in_windows(&self, canon_path: &str) -> bool {
+        is_inside(canon_path, &self.windows)
+    }
+
+    /// True if `canon_path` (in `canon` form) is a Program Files root itself, not a folder in it.
+    pub fn is_program_files_root(&self, canon_path: &str) -> bool {
+        self.program_files.iter().any(|p| p == canon_path.trim_end_matches('\\'))
+    }
+
+    /// True if `canon_path` (in `canon` form) is inside `<ProgramData>\Package Cache`.
+    pub fn in_package_cache(&self, canon_path: &str) -> bool {
+        !self.program_data.is_empty() && is_inside(canon_path, &format!("{}\\package cache", self.program_data.trim_end_matches('\\')))
+    }
+
     /// True if `canon_path` (in `canon` form) is, or contains, any known place: Windows, a
     /// Program Files root, the users folder, your profile, ProgramData or an AppData folder.
     /// A folder like that is never a leftover.

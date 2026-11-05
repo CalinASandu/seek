@@ -143,10 +143,22 @@ impl ClaimParts {
     }
 }
 
-/// The fields of one uninstall entry that can point at a folder.
+/// The fields of one uninstall entry that can point at a folder, and the ones the Apps list shows.
 #[derive(Clone, Debug, Default)]
 pub struct UninstallEntry {
+    /// `"HKLM"` or `"HKCU"`. Empty for an entry built by hand.
+    pub hive: String,
+    /// `"64"` or `"32"`: the registry view the entry was read from.
+    pub view: String,
+    /// The name of the key under `Uninstall`.
     pub key: String,
+    pub display_version: String,
+    /// `EstimatedSize`, in KB, as registered.
+    pub estimated_size_kb: Option<u64>,
+    /// `InstallDate` as registered (`YYYYMMDD`, but anything can be there).
+    pub install_date: String,
+    pub system_component: bool,
+    pub parent_key_name: String,
     pub display_name: String,
     pub publisher: String,
     pub install_location: String,
@@ -356,7 +368,7 @@ pub fn expand_env(s: &str, env: &dyn Fn(&str) -> Option<String>) -> String {
     out
 }
 
-fn is_abs(s: &str) -> bool {
+pub(crate) fn is_abs(s: &str) -> bool {
     let b = s.as_bytes();
     (b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/')) || s.starts_with("\\\\")
 }
@@ -398,7 +410,7 @@ const EXTENSIONS: &[&str] = &[
 /// first is the likely one; later ones are also returned (up to the next argument marker) because
 /// a folder may be called `Booking.com Helper`. Claiming a longer, nonexistent candidate costs
 /// nothing; missing the real folder would.
-fn unquoted_lens(s: &str) -> Vec<usize> {
+pub(crate) fn unquoted_lens(s: &str) -> Vec<usize> {
     let low = s.to_ascii_lowercase(); // same byte length as `s`
     let mut ends: Vec<usize> = Vec::new();
     for ext in EXTENSIONS {
@@ -525,6 +537,29 @@ impl InstalledNames {
             publishers: distinct(parts.publishers.iter().map(String::as_str)),
         }
     }
+}
+
+/// Every entry of the three uninstall lists (both views of HKLM and HKCU), as registered. The
+/// second value names the lists that could not be read. Only reads.
+pub fn read_uninstall_entries() -> (Vec<UninstallEntry>, Vec<String>) {
+    real::read_entries()
+}
+
+/// One uninstall entry by where it lives. `None` if the key is gone or `hive`/`view` is not one
+/// this reader uses.
+pub fn read_uninstall_entry(hive: &str, view: &str, key: &str) -> Option<UninstallEntry> {
+    real::read_one_entry(hive, view, key)
+}
+
+/// The full path of every running program's exe, as Windows reports it (programs of other users
+/// or elevated ones may be missing). Only reads.
+pub fn running_exes() -> Vec<String> {
+    real::read_running_parts()
+        .paths
+        .into_iter()
+        .filter(|c| c.source == "running programs" && c.path.to_ascii_lowercase().ends_with(".exe"))
+        .map(|c| c.path)
+        .collect()
 }
 
 /// Reads the three uninstall lists (the same reader the claims use) for names only. Quick: it
@@ -689,7 +724,7 @@ mod real {
     use windows::Win32::System::ProcessStatus::K32EnumProcesses;
     use windows::Win32::System::Registry::{
         RegCloseKey, RegEnumKeyExW, RegEnumValueW, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE,
-        KEY_READ, KEY_WOW64_32KEY, KEY_WOW64_64KEY, REG_EXPAND_SZ, REG_SAM_FLAGS, REG_SZ, REG_VALUE_TYPE,
+        KEY_READ, KEY_WOW64_32KEY, KEY_WOW64_64KEY, REG_DWORD, REG_EXPAND_SZ, REG_SAM_FLAGS, REG_SZ, REG_VALUE_TYPE,
     };
     use windows::Win32::System::Threading::{
         OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
@@ -857,27 +892,79 @@ mod real {
         }
     }
 
-    fn uninstall(parts: &mut ClaimParts) {
+    fn dword(key: &Key, name: &str) -> Option<u64> {
+        let n = wide(name);
+        let mut kind = REG_VALUE_TYPE(0);
+        let mut buf = [0u8; 4];
+        let mut size = 4u32;
+        // SAFETY: `buf` has `size` bytes.
+        let rc = unsafe { RegQueryValueExW(key.0, PCWSTR(n.as_ptr()), None, Some(&mut kind), Some(buf.as_mut_ptr()), Some(&mut size)) };
+        if rc == ERROR_SUCCESS && kind == REG_DWORD {
+            return Some(u32::from_le_bytes(buf) as u64);
+        }
+        // Some installers write numbers as text.
+        value(key, name).ok().flatten().and_then(|t| t.trim().parse().ok())
+    }
+
+    fn read_entry(name: &str, k: &Key, hive: &str, view: &str, skipped: &mut Skipped) -> UninstallEntry {
+        let mut get = |v: &str| value_or_skip(k, v, skipped);
+        UninstallEntry {
+            hive: hive.to_string(),
+            view: view.to_string(),
+            key: name.to_string(),
+            display_name: get("DisplayName"),
+            publisher: get("Publisher"),
+            display_version: get("DisplayVersion"),
+            install_date: get("InstallDate"),
+            parent_key_name: get("ParentKeyName"),
+            install_location: get("InstallLocation"),
+            display_icon: get("DisplayIcon"),
+            uninstall_string: get("UninstallString"),
+            quiet_uninstall_string: get("QuietUninstallString"),
+            estimated_size_kb: dword(k, "EstimatedSize"),
+            system_component: dword(k, "SystemComponent") == Some(1),
+        }
+    }
+
+    fn view_tag(vn: &str) -> &'static str {
+        if vn == "64-bit" {
+            "64"
+        } else {
+            "32"
+        }
+    }
+
+    fn each_entry(parts: &mut ClaimParts, mut each: impl FnMut(&mut ClaimParts, UninstallEntry)) {
         for (hn, hive) in hives() {
             for (vn, view) in views() {
                 // The 64-bit machine list exists on every Windows install.
                 let required = hn == "HKLM" && vn == "64-bit";
                 let label = format!("the {hn} {vn} uninstall list");
                 for_each_child(parts, (hive, view), &format!(r"{WIN}\Uninstall"), &label, required, |parts, name, k| {
-                    let mut get = |v: &str| value_or_skip(k, v, &mut parts.skipped);
-                    let e = UninstallEntry {
-                        key: name.to_string(),
-                        display_name: get("DisplayName"),
-                        publisher: get("Publisher"),
-                        install_location: get("InstallLocation"),
-                        display_icon: get("DisplayIcon"),
-                        uninstall_string: get("UninstallString"),
-                        quiet_uninstall_string: get("QuietUninstallString"),
-                    };
-                    add_uninstall_entry(parts, &e, &env);
+                    let e = read_entry(name, k, hn, view_tag(vn), &mut parts.skipped);
+                    each(parts, e);
                 });
             }
         }
+    }
+
+    fn uninstall(parts: &mut ClaimParts) {
+        each_entry(parts, |parts, e| add_uninstall_entry(parts, &e, &env));
+    }
+
+    pub(super) fn read_entries() -> (Vec<UninstallEntry>, Vec<String>) {
+        let mut parts = ClaimParts::default();
+        let mut out = Vec::new();
+        each_entry(&mut parts, |_, e| out.push(e));
+        (out, parts.failed)
+    }
+
+    pub(super) fn read_one_entry(hn: &str, vn: &str, key: &str) -> Option<UninstallEntry> {
+        let hive = hives().into_iter().find(|(n, _)| *n == hn)?.1;
+        let view = views().into_iter().find(|(n, _)| view_tag(n) == vn)?.1;
+        let k = open(hive, &format!(r"{WIN}\Uninstall\{key}"), view).ok().flatten()?;
+        let mut skipped = Skipped::default();
+        Some(read_entry(key, &k, hn, vn, &mut skipped))
     }
 
     fn run_keys(parts: &mut ClaimParts) {

@@ -11,8 +11,13 @@ serde = { workspace = true }
 rand = { workspace = true }
 # Duplicate finder: equality is the full BLAKE3 hash of the whole file (named by the spec).
 blake3 = { workspace = true }
+# Installed-app icons are sent to the window as PNG data URLs. 0.18.1 is already in Cargo.lock (tauri).
+png = "0.18"
+# The same icons, base64-encoded; already a workspace dependency.
+base64 = { workspace = true }
 windows = { workspace = true, features = [
     "Win32_Foundation",
+    "Win32_Graphics_Gdi",
     "Win32_Security",
     "Win32_Storage_FileSystem",
     "Win32_System_Com",
@@ -20,6 +25,7 @@ windows = { workspace = true, features = [
     "Win32_System_Ioctl",
     "Win32_System_ProcessStatus",
     "Win32_System_Registry",
+    "Win32_System_Time",
     "Win32_System_Threading",
     "Win32_UI_Shell",
     "Win32_UI_Shell_Common",

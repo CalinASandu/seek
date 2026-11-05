@@ -17,12 +17,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+use seek_clean::apps;
 use seek_clean::claims::{self, LiveClaims};
 use seek_clean::dupes::{self, ScanEvent, SizeBatch, SizeFile, MIN_DUPLICATE_BYTES};
 use seek_clean::engine::Engine;
 use seek_clean::facts::{FileFacts, RealFacts};
 use seek_clean::leftovers;
-use seek_clean::model::{Candidate, CommitResult, DupGroup, Level, LeftoverRow, Outcome, Prepared, Reason, Why};
+use seek_clean::model::{AppRow, Candidate, CommitResult, DupGroup, Level, LeftoverRow, Outcome, Prepared, Reason, Why};
 use seek_clean::paths::canon;
 use seek_clean::protect::Places;
 use seek_clean::recycle::ShellRecycler;
@@ -979,6 +980,15 @@ pub async fn clean_leftovers(clean: Clean<'_>, link: State<'_, Arc<ServiceLink>>
     let rows = merge_leftovers(folders, stale);
     *clean.listed.lock().unwrap_or_else(|e| e.into_inner()) = listed_set(&rows);
     Ok(rows)
+}
+
+/// The installed apps, with their icons. Reading the registry and pulling icons out of exe files
+/// runs on a thread of its own so the window stays alive; icons are cached after the first call.
+#[tauri::command]
+pub async fn clean_apps() -> Result<Vec<AppRow>, String> {
+    tauri::async_runtime::spawn_blocking(apps::try_list)
+        .await
+        .map_err(|e| format!("Listing the installed apps stopped unexpectedly: {e}"))?
 }
 
 #[tauri::command]

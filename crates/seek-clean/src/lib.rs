@@ -3,6 +3,7 @@
 
 #![cfg(windows)]
 
+pub mod apps;
 pub mod claims;
 pub mod confidence;
 pub mod dupes;
