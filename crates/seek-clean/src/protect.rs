@@ -7,8 +7,8 @@ use windows::core::GUID;
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::UI::Shell::{
     SHGetKnownFolderPath, FOLDERID_LocalAppData, FOLDERID_LocalAppDataLow, FOLDERID_ProgramData,
-    FOLDERID_ProgramFiles, FOLDERID_ProgramFilesX86, FOLDERID_Profile, FOLDERID_RoamingAppData,
-    FOLDERID_UserProfiles, FOLDERID_Windows, KF_FLAG_DEFAULT,
+    FOLDERID_CommonPrograms, FOLDERID_Programs, FOLDERID_ProgramFiles, FOLDERID_ProgramFilesX86,
+    FOLDERID_Profile, FOLDERID_RoamingAppData, FOLDERID_UserProfiles, FOLDERID_Windows, KF_FLAG_DEFAULT,
 };
 
 use crate::model::{Lock, Why};
@@ -41,9 +41,43 @@ pub struct Places {
     /// Program Files roots, then the AppData folders, as written (not `canon`): the places a
     /// leftovers scan lists the top-level folders of.
     scan_roots: Vec<PathBuf>,
+    /// The `Programs` folder of the current user's Start Menu, then the all-users one, as written.
+    start_menus: Vec<PathBuf>,
+}
+
+/// The Windows folder as Windows spells it (`C:\Windows`). The uninstall launcher builds the path
+/// of `msiexec.exe` from it, so it never depends on the registry's text.
+pub fn windows_dir() -> Option<String> {
+    known_raw(&FOLDERID_Windows).or_else(|| std::env::var("SystemRoot").ok().filter(|s| !s.is_empty()))
 }
 
 impl Places {
+    /// The two Start Menu `Programs` folders (the user's, then all users'), real capitalization.
+    pub fn start_menu_roots(&self) -> &[PathBuf] {
+        &self.start_menus
+    }
+
+    /// True if `canon_path` (in `canon` form) is inside `<ProgramData>`.
+    pub fn in_program_data(&self, canon_path: &str) -> bool {
+        !self.program_data.is_empty() && is_inside(canon_path, &self.program_data)
+    }
+
+    /// True if `canon_path` (in `canon` form) is strictly inside a Start Menu `Programs` folder.
+    pub fn in_start_menu(&self, canon_path: &str) -> bool {
+        self.start_menus.iter().map(|r| canon(r)).any(|r| canon_path.len() > r.len() && is_inside(canon_path, &r))
+    }
+
+    /// True if `canon_path` (in `canon` form) is a `.lnk` file name inside a Start Menu `Programs`
+    /// folder, at any depth. Whether it is a file is for the caller to know.
+    pub fn is_start_menu_shortcut(&self, canon_path: &str) -> bool {
+        canon_path.ends_with(".lnk") && self.in_start_menu(canon_path)
+    }
+
+    /// True if `canon_path` (in `canon` form) is, holds, or is inside a Start Menu `Programs` folder.
+    fn touches_start_menu(&self, canon_path: &str) -> bool {
+        self.start_menus.iter().map(|r| canon(r)).any(|r| is_inside(&r, canon_path) || is_inside(canon_path, &r))
+    }
+
     /// The folders whose top-level folders are leftover candidates: Program Files and its x86
     /// twin, then Local, Roaming and LocalLow AppData. Real capitalization.
     pub fn scan_roots(&self) -> &[PathBuf] {
@@ -71,8 +105,10 @@ impl Places {
             .filter_map(known_raw)
             .map(PathBuf::from)
             .collect();
+        let start_menus = [&FOLDERID_Programs, &FOLDERID_CommonPrograms].into_iter().filter_map(known_raw).map(PathBuf::from).collect();
         let places = Places {
             scan_roots,
+            start_menus,
             windows,
             program_files,
             users_root: known(&FOLDERID_UserProfiles).unwrap_or_default(),
@@ -122,14 +158,20 @@ impl Places {
     /// folders (Desktop, Downloads and the like). Other folders in the profile, where tools such
     /// as miniconda or scoop live, are not.
     pub fn is_profile_or_known_folder(&self, canon_path: &str) -> bool {
-        const KNOWN: [&str; 13] = [
+        const KNOWN: [&str; 20] = [
             "desktop", "documents", "downloads", "pictures", "music", "videos", "favorites", "links", "saved games", "contacts",
-            "searches", "onedrive", "appdata",
+            "searches", "appdata", "dropbox", "google drive", "icloud drive", "iclouddrive", "box", "creative cloud files",
+            "3d objects", "source",
         ];
+        // `OneDrive - Contoso` and `OneDrive - Personal` are sync roots too, and so are
+        // `Dropbox (Personal)` style names.
+        const KNOWN_PREFIXES: [&str; 2] = ["onedrive", "dropbox"];
         let profile = self.profile.trim_end_matches('\\');
         !profile.is_empty()
             && (canon_path == profile
-                || canon_path.rsplit_once('\\').is_some_and(|(parent, name)| parent == profile && KNOWN.contains(&name)))
+                || canon_path.rsplit_once('\\').is_some_and(|(parent, name)| {
+                    parent == profile && (KNOWN.contains(&name) || KNOWN_PREFIXES.iter().any(|p| name.starts_with(p)))
+                }))
     }
 
     /// True if `canon_path` (in `canon` form) is inside `<ProgramData>\Package Cache`.
@@ -164,7 +206,17 @@ impl Places {
         app_data: &[&str],
     ) -> Places {
         let c = |s: &str| canon(Path::new(s));
+        // Where Windows keeps the Start Menu under a profile and under ProgramData.
+        let menu = |base: &str, tail: &str| (!base.is_empty()).then(|| Path::new(base).join(tail));
+        let start_menus = [
+            menu(profile, r"AppData\Roaming\Microsoft\Windows\Start Menu\Programs"),
+            menu(program_data, r"Microsoft\Windows\Start Menu\Programs"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
         Places {
+            start_menus,
             scan_roots: program_files.iter().chain(app_data).map(PathBuf::from).collect(),
             windows: c(windows),
             program_files: program_files.iter().map(|s| c(s)).collect(),
@@ -201,7 +253,9 @@ pub fn lock_for(
     }
     // ProgramData: duplicates are locked, leftovers are never listed (so locked here as a
     // second line of defence). Only Seek's own stale files (`StaleData`) may be touched.
-    if why != Why::StaleData && is_inside(canon_path, &places.program_data) {
+    // The one exception: a Start Menu shortcut an uninstall left (all users' shortcuts live there).
+    let start_menu_link = why == Why::Uninstall && places.is_start_menu_shortcut(canon_path);
+    if why != Why::StaleData && !start_menu_link && is_inside(canon_path, &places.program_data) {
         return Some(Lock::AppData);
     }
     if dup && places.app_data.iter().any(|p| is_inside(canon_path, p)) {
@@ -226,6 +280,26 @@ pub fn candidate_lock(places: &Places, canon_path: &str, why: Why) -> Option<Loc
         Why::Duplicate | Why::Uninstall => true,
     };
     (!ok).then_some(Lock::UnsupportedPath)
+}
+
+/// The extra rules for what an uninstall may have left (`Why::Uninstall`). `is_dir` is what the
+/// path is on disk.
+/// - A folder may be anywhere an app can live, but never the user's profile or one of its
+///   well-known folders, ProgramData, the package cache, or a Start Menu `Programs` folder or
+///   anything above or inside it.
+/// - A file must be a `.lnk` in or below a Start Menu `Programs` folder. Anything else is
+///   `UnsupportedPath`.
+pub fn uninstall_lock(places: &Places, canon_path: &str, is_dir: bool) -> Option<Lock> {
+    if !is_dir {
+        return (!places.is_start_menu_shortcut(canon_path)).then_some(Lock::UnsupportedPath);
+    }
+    if never_listed(places, canon_path) {
+        return Some(Lock::UnsupportedPath);
+    }
+    if places.is_profile_or_known_folder(canon_path) || places.in_package_cache(canon_path) || places.touches_start_menu(canon_path) {
+        return Some(Lock::SystemFolder);
+    }
+    None
 }
 
 /// True if `p` (in `canon` form) is a direct child of one of the leftover scan roots.
@@ -497,6 +571,53 @@ mod tests {
         assert!(hidden(r"C:\ProgramData\Vendor"));
         assert!(hidden(r"C:\ProgramData"));
         assert_eq!(lock(r"C:\ProgramData\Seek\old.json", Why::StaleData), None);
+    }
+
+    #[test]
+    fn the_profiles_well_known_folders_match_by_name_and_sync_roots_by_prefix() {
+        let p = places();
+        let known = |s: &str| p.is_profile_or_known_folder(&canon(Path::new(s)));
+        for name in [
+            "Documents", "Desktop", "OneDrive", "OneDrive - Contoso", "OneDrive - Personal", "ONEDRIVE for Business", "Dropbox",
+            "Dropbox (Personal)", "Google Drive", "iCloudDrive", "iCloud Drive", "Box", "Creative Cloud Files", "3D Objects", "source",
+        ] {
+            assert!(known(&format!(r"C:\Users\me\{name}")), "{name}");
+        }
+        assert!(known(r"C:\Users\me"), "the profile itself");
+        // Only a direct child of the profile, and only those names.
+        assert!(!known(r"C:\Users\me\source\repos"));
+        assert!(!known(r"C:\Users\me\Documents\Thing"));
+        assert!(!known(r"C:\Users\me\Boxes"));
+        assert!(!known(r"C:\Users\me\Sources"));
+        assert!(!known(r"C:\Users\me\MyOneDrive"));
+        assert!(!known(r"C:\Users\me\miniconda3"));
+        assert!(!known(r"C:\Users\other\Documents"));
+    }
+
+    #[test]
+    fn uninstall_folders_and_shortcuts_have_their_own_rules() {
+        let p = places();
+        let menu = r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs";
+        let user_menu = r"C:\Users\me\AppData\Roaming\Microsoft\Windows\Start Menu\Programs";
+        let c = |s: &str| canon(Path::new(s));
+        // Shortcuts: a .lnk in or below either Programs folder, and nothing else.
+        for ok in [format!(r"{menu}\Acme.lnk"), format!(r"{menu}\Acme\Acme.LNK"), format!(r"{user_menu}\A\B\c.lnk")] {
+            assert_eq!(uninstall_lock(&p, &c(&ok), false), None, "{ok}");
+            assert_eq!(lock_for(&p, &c(&ok), Why::Uninstall, &[]), None, "{ok}: ProgramData's rule gives way for a shortcut");
+        }
+        for bad in [format!(r"{menu}\Acme.exe"), format!(r"{menu}.lnk"), r"C:\Users\me\Documents\a.lnk".to_string(), r"C:\ProgramData\a.lnk".to_string()] {
+            assert_eq!(uninstall_lock(&p, &c(&bad), false), Some(Lock::UnsupportedPath), "{bad}");
+        }
+        // Only an uninstall's shortcut gets past ProgramData.
+        assert_eq!(lock_for(&p, &c(&format!(r"{menu}\Acme.lnk")), Why::Leftover, &[]), Some(Lock::AppData));
+        assert_eq!(lock_for(&p, &c(r"C:\ProgramData\Vendor\a.lnk"), Why::Uninstall, &[]), Some(Lock::AppData));
+        // Folders: the user's own, the Start Menu and what holds it, and ProgramData are out.
+        for bad in [r"C:\Users\me\Documents", r"C:\Users\me\OneDrive - Contoso", menu, user_menu, r"C:\Users\me\AppData\Roaming\Microsoft\Windows", r"C:\ProgramData\Package Cache\x"] {
+            assert!(uninstall_lock(&p, &c(bad), true).is_some() || lock_for(&p, &c(bad), Why::Uninstall, &[]).is_some(), "{bad}");
+        }
+        for ok in [r"D:\Apps\Acme", r"C:\Program Files\Acme", r"C:\Users\me\AppData\Local\Acme", r"C:\Users\me\miniconda3"] {
+            assert_eq!(uninstall_lock(&p, &c(ok), true), None, "{ok}");
+        }
     }
 
     #[test]

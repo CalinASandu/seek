@@ -20,7 +20,8 @@ interface Props {
   onClose: () => void;
 }
 
-const POLL_MS = 800;
+/** How often the sheet asks how the uninstaller is doing, while it is open. */
+const POLL_MS = 1000;
 
 /** Three steps in one sheet: before, the app's own uninstaller running, and the leftovers Seek can move afterwards. */
 export function UninstallSheet({ app, protectedPaths, onReview, onUninstalled, onClose }: Props) {
@@ -82,13 +83,16 @@ export function UninstallSheet({ app, protectedPaths, onReview, onUninstalled, o
   }, [step, started, api, app.id]);
 
   const start = async () => {
+    setProblem(null);
     setStep("running");
     try {
       await api.uninstallStart(app.id);
       if (live.current) setStarted(true);
     } catch (e) {
+      // It never started (no permission, no such app, another uninstaller running): say why and stay at the start.
+      if (!live.current) return;
       setProblem(errText(e));
-      setStep("unresolved");
+      setStep("before");
     }
   };
 
@@ -111,7 +115,7 @@ export function UninstallSheet({ app, protectedPaths, onReview, onUninstalled, o
 
   const review = () =>
     onReview({
-      request: folderRequest(pickedRows, "uninstall"),
+      request: folderRequest(pickedRows, "uninstall", app.id),
       picked: null,
       contents: contentsOf(pickedRows),
       after: (moved) => {
@@ -190,6 +194,7 @@ export function UninstallSheet({ app, protectedPaths, onReview, onUninstalled, o
               </p>
             )}
             {app.note && <p className="un-warn is-soft">{app.note}</p>}
+            {problem && <p className="review-warn">{problem}</p>}
             <p className="dialog-lead un-after">Afterwards Seek lists the leftovers it finds. You choose what moves to the Recycle Bin.</p>
           </>
         )}

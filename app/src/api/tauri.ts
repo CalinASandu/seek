@@ -38,9 +38,10 @@ export function createTauriApi(): SeekApi {
     spaceTree: (deviceId, path, depth) => invoke("space_tree", { deviceId, path, depth }),
     spaceLargest: (deviceId, path, limit) => invoke("space_largest", { deviceId, path, limit }),
     spaceTypes: (deviceId, path) => invoke("space_types", { deviceId, path }),
-    // Decimator. Rust has clean_scan_start / _cancel / _state, clean_prepare, clean_commit and open_recycle_bin.
-    // The rest (leftovers, apps, history, put back, uninstall) arrive in later tasks; until then each of those
-    // rejects ("command not found"), which the view shows as a plain error. Nothing here runs at load.
+    // Decimator. Rust has clean_scan_start / _cancel / _state, clean_leftovers, clean_apps, clean_prepare,
+    // clean_commit, uninstall_start / _state / _leftovers and open_recycle_bin. History and put back arrive in a
+    // later task; until then those reject ("command not found"), which the view shows as a plain error.
+    // Nothing here runs at load. Each argument is the camelCase of the Rust parameter (app_id is appId).
     cleanScanStart: (deviceIds) => invoke("clean_scan_start", { deviceIds }),
     cleanScanCancel: () => invoke("clean_scan_cancel"),
     cleanScanState: () => invoke("clean_scan_state"),

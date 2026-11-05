@@ -104,7 +104,7 @@ pub fn score(ev: &[Evidence]) -> (i32, Level, Vec<Reason>) {
 // ---- names -------------------------------------------------------------------------------------
 
 /// Letters and digits in the words: the length that the 4-letter rule counts.
-fn name_len(w: &[String]) -> usize {
+pub(crate) fn name_len(w: &[String]) -> usize {
     w.iter().map(|s| s.chars().count()).sum()
 }
 

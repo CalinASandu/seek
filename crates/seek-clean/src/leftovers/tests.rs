@@ -421,3 +421,5 @@ fn index_facts_are_used_and_the_walk_runs_only_for_none() {
     assert!(!out.rows.iter().any(|r| r.path.ends_with("Online")));
     assert_eq!(out.left_out, 1);
 }
+
+mod for_app;

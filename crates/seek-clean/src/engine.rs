@@ -13,7 +13,7 @@ use crate::model::{
     ReviewItem, Why,
 };
 use crate::paths::{canon, is_inside, real_location, target_location};
-use crate::protect::{candidate_lock, lock_for, Places};
+use crate::protect::{candidate_lock, lock_for, uninstall_lock, Places};
 use crate::reasons::*;
 use support::{in_system_store, inside_any, new_token, run_admin, spellings};
 
@@ -166,6 +166,14 @@ impl Engine {
                         &ctx,
                     );
                 }
+                Candidate::Shortcut {
+                    path,
+                    level,
+                    reasons,
+                } => {
+                    let s = seed(path, Why::Uninstall, Shape::File, None, level, reasons);
+                    self.add(&mut built, s, &ctx);
+                }
                 Candidate::StaleFile { path } => {
                     let s = seed(path, Why::StaleData, Shape::File, None, None, vec![]);
                     self.add(&mut built, s, &ctx);
@@ -300,8 +308,16 @@ impl Engine {
         if lock.is_none() {
             lock = candidate_lock(&self.places, c, why);
         }
+        // What an uninstall left: a folder that is not the user's own, or a Start Menu shortcut.
+        // Under both spellings, so a junction can't carry a shortcut out of the Start Menu.
+        if lock.is_none() && why == Why::Uninstall {
+            lock = spell.iter().find_map(|s| uninstall_lock(&self.places, s, st.is_dir));
+        }
         let pf = |s: &&str| self.places.in_program_files(s);
-        let admin = why == Why::StaleData || (why == Why::Leftover && spell.iter().any(pf));
+        // Program Files, and the all-users Start Menu in ProgramData, can't be changed without admin.
+        let admin = why == Why::StaleData
+            || (matches!(why, Why::Leftover | Why::Uninstall) && spell.iter().any(pf))
+            || (why == Why::Uninstall && spell.iter().any(|s| self.places.in_program_data(s)));
         if lock.is_none() && st.cloud {
             lock = Some(Lock::CloudPlaceholder);
         }
