@@ -22,7 +22,7 @@ use std::thread::JoinHandle;
 use serde::Serialize;
 
 use super::{is_guid, parse_app_id, FoundApp, UninstallCommand};
-use crate::claims;
+use crate::claims::{self, is_abs};
 use crate::model::AppRow;
 
 /// How often the registry entry is read again once the process has ended.
@@ -34,6 +34,7 @@ pub const NOT_LISTED: &str = "Seek can't find that app in the list of installed 
 pub const NO_COMMAND: &str = "Seek can't start this app's uninstaller.";
 pub const ALREADY_RUNNING: &str = "An uninstaller is already running. Wait for it to finish first.";
 pub const NO_PERMISSION: &str = "Windows didn't get permission to run the uninstaller.";
+pub const STILL_LISTED: &str = "Windows still lists this app as installed. Seek lists what's left once it's gone.";
 pub const NOT_STARTED: &str = "Seek hasn't started an uninstaller for that app.";
 
 // ---- the phase ------------------------------------------------------------------------------------
@@ -113,7 +114,8 @@ pub fn launch_request(cmd: &UninstallCommand, windows_dir: &str) -> Result<Launc
             }
             Ok(LaunchRequest { program: format!(r"{}\System32\msiexec.exe", windows_dir.trim_end_matches('\\')), args: format!("/x{guid}") })
         }
-        UninstallCommand::Exe { path, args } if !path.trim().is_empty() => Ok(LaunchRequest { program: path.clone(), args: args.clone() }),
+        // Checked again here: whatever built the command, only an absolute `.exe` is run.
+        UninstallCommand::Exe { path, args } if is_abs(path) && path.to_ascii_lowercase().ends_with(".exe") => Ok(LaunchRequest { program: path.clone(), args: args.clone() }),
         UninstallCommand::Exe { .. } => Err(NO_COMMAND.to_string()),
     }
 }
@@ -218,7 +220,15 @@ impl Uninstalls {
         let cmd = found.command.clone().ok_or(NO_COMMAND)?;
         {
             let mut g = self.lock();
-            if g.launching || g.slots.values().any(|s| !s.ended.load(Ordering::SeqCst)) {
+            // Running by the watch, not by our process: a temp-copy uninstaller ends the process
+            // at once and goes on, and a reopened sheet must not start the same app twice.
+            let now = (self.clock)();
+            let entry_present = &self.entry_present;
+            let busy = g.slots.iter_mut().any(|(id, s)| {
+                let ended = s.ended.load(Ordering::SeqCst);
+                s.watch.phase(ended, now, &mut || entry_present(id)) == UninstallPhase::Running
+            });
+            if g.launching || busy {
                 return Err(ALREADY_RUNNING.to_string());
             }
             g.launching = true;
@@ -252,6 +262,17 @@ impl Uninstalls {
         Ok(slot.watch.phase(ended, now, &mut || (self.entry_present)(app_id)))
     }
 
+    /// The app to list leftovers for, only once Windows no longer lists it: while its registry
+    /// entry is there it is still installed (or its uninstaller has not finished), and what it
+    /// "left" would be what it is using.
+    pub fn leftovers_for(&self, app_id: &str) -> Result<AppRow, String> {
+        let app = self.app(app_id).ok_or(NOT_STARTED)?;
+        if (self.entry_present)(app_id) {
+            return Err(STILL_LISTED.to_string());
+        }
+        Ok(app)
+    }
+
     /// The app as it was listed when its uninstaller was started (the registry no longer has it
     /// once the uninstaller is done).
     pub fn app(&self, app_id: &str) -> Option<AppRow> {
@@ -282,7 +303,7 @@ use windows::core::{HSTRING, PCWSTR};
 use windows::Win32::Foundation::{CloseHandle, ERROR_CANCELLED, ERROR_ELEVATION_REQUIRED, HANDLE};
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE};
 use windows::Win32::System::Threading::{WaitForSingleObject, INFINITE};
-use windows::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
+use windows::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
 /// A process handle that is closed exactly once, when this is dropped.
@@ -343,6 +364,17 @@ pub fn run_uninstaller(cmd: &UninstallCommand) -> Result<UninstallHandle, String
     .map_err(|_| "Seek couldn't start the uninstaller.".to_string())?
 }
 
+/// What `ShellExecuteExW` is asked for: keep the process handle, show no Windows error box (Seek
+/// says what went wrong itself), and don't return before the start has been dealt with.
+pub const LAUNCH_MASK: u32 = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_FLAG_NO_UI | SEE_MASK_NOASYNC;
+
+/// The folder the program is in, which is where it is started: uninstallers look for their own files
+/// next to themselves. `None` for a bare name.
+pub fn launch_dir(program: &str) -> Option<String> {
+    let parent = std::path::Path::new(program).parent()?.to_str()?;
+    (!parent.is_empty()).then(|| parent.to_string())
+}
+
 struct ExecError(windows::core::Error);
 
 impl ExecError {
@@ -362,12 +394,14 @@ fn execute(req: &LaunchRequest, verb: Option<&str>) -> Result<UninstallHandle, E
     let file = HSTRING::from(req.program.as_str());
     let args = HSTRING::from(req.args.as_str());
     let verb = verb.map(HSTRING::from);
+    let dir = launch_dir(&req.program).map(|d| HSTRING::from(d.as_str()));
     let mut info = SHELLEXECUTEINFOW {
         cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
-        fMask: SEE_MASK_NOCLOSEPROCESS,
+        fMask: LAUNCH_MASK,
         lpVerb: verb.as_ref().map_or(PCWSTR::null(), |v| PCWSTR(v.as_ptr())),
         lpFile: PCWSTR(file.as_ptr()),
         lpParameters: if req.args.is_empty() { PCWSTR::null() } else { PCWSTR(args.as_ptr()) },
+        lpDirectory: dir.as_ref().map_or(PCWSTR::null(), |d| PCWSTR(d.as_ptr())),
         nShow: SW_SHOWNORMAL.0,
         ..Default::default()
     };

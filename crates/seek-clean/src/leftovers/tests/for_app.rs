@@ -48,7 +48,11 @@ fn unreadable(files: &[PathBuf]) -> Vec<Option<String>> {
 }
 
 fn after(w: &World, app: &AppRow, claims: &dyn ClaimCheck, links: &Links) -> Vec<LeftoverRow> {
-    for_app_with(app, &w.places, claims, &names(), later(), &NoIndex, &walk, links)
+    after_with(w, app, claims, &names(), links)
+}
+
+fn after_with(w: &World, app: &AppRow, claims: &dyn ClaimCheck, installed: &InstalledNames, links: &Links) -> Vec<LeftoverRow> {
+    for_app_with(app, &w.places, claims, installed, later(), &NoIndex, &walk, links)
 }
 
 fn depth_reasons(r: &LeftoverRow) -> usize {
@@ -97,8 +101,8 @@ fn leftovers_after_uninstall_include_the_install_folder_and_shortcuts_and_nothin
     let elsewhere = w.base.join("elsewhere.exe");
     std::fs::write(&elsewhere, b"x").unwrap();
     let links = targets(&[
-        ("Acme Editor.lnk", &install.join("editor.exe")),
-        ("Manual.lnk", &install.join("docs").join("manual.pdf")),
+        ("Acme Editor.lnk", &install.join("gone.exe")),
+        ("Manual.lnk", &install.join("docs").join("gone.pdf")),
         ("Unrelated.lnk", &elsewhere),
     ]);
     let rows = after(&w, &a, &Claims::default(), &links);
@@ -176,25 +180,108 @@ fn roughly_means_one_name_holds_the_other_as_whole_words() {
     assert_eq!(match_name("Acme", "Acme Editor"), NameMatch::None, "four letters never match");
     assert_eq!(match_name("Acme Edit", "Acme Editor"), NameMatch::None, "half a word is no match");
     assert_eq!(match_name("acme-editor", "Acme Editor"), NameMatch::Exact);
-    assert_eq!(match_name("Acme Editor", "Acme Editor (x64)"), NameMatch::Exact, "a build word is ignored");
+    assert_eq!(match_name("Acme Editor", "Acme Editor (x64)"), NameMatch::Rough, "a match that needed build words trimmed is rough");
+    assert_eq!(match_name("Python", "Python 3.12.4 (64-bit)"), NameMatch::Rough);
     assert_eq!(match_name("Anything", ""), NameMatch::None);
     assert_eq!(match_name("", "Acme Editor"), NameMatch::None);
 }
 
 #[test]
-fn a_folder_under_the_publishers_folder_is_found_and_the_publishers_folder_is_not() {
+fn a_folder_under_the_publishers_folder_needs_its_own_name_match_and_the_publishers_folder_is_never_a_row() {
     let w = world();
-    put(&w.local.join("Contoso").join("Whatever"), "a.txt", 5);
-    put(&w.local.join("Contoso").join("Other"), "a.txt", 5);
-    put(&w.local.join("Fabrikam").join("Whatever"), "a.txt", 5);
-    let a = app("Widget Maker", "Contoso Software", None, None);
+    // Adobe/Premiere Pro matches; Adobe/CameraRaw is another Adobe product's and does not.
+    put(&w.local.join("Adobe").join("Premiere Pro"), "a.txt", 5);
+    put(&w.local.join("Adobe").join("CameraRaw"), "a.txt", 5);
+    let a = app("Premiere Pro", "Adobe Systems", None, None);
     let rows = after(&w, &a, &Claims::default(), &unreadable);
-    let r = find(&rows, "Whatever");
-    assert!(r.path.contains("Contoso"));
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let r = find(&rows, "Premiere Pro");
     assert!(has_reason(r, "publisher"), "{r:?}");
+    assert!(has_reason(r, "exactly"));
     assert_eq!(depth_reasons(r), 1);
-    assert_eq!(rows.len(), 2, "{rows:?}");
-    assert!(!listed(&rows, &w.local.join("Contoso")), "the publisher's own folder may hold other apps");
+    assert!(!listed(&rows, &w.local.join("Adobe")), "the publisher's own folder may hold other apps");
+}
+
+#[test]
+fn google_chrome_is_found_under_google_and_google_is_not() {
+    let w = world();
+    put(&w.local.join("Google").join("Chrome"), "a.txt", 5);
+    put(&w.local.join("Google").join("Drive"), "a.txt", 5);
+    let a = app("Google Chrome", "Google LLC", None, None);
+    let rows = after(&w, &a, &Claims::default(), &unreadable);
+    assert!(listed(&rows, &w.local.join("Google").join("Chrome")), "{rows:?}");
+    assert!(!listed(&rows, &w.local.join("Google")), "{rows:?}");
+    assert_eq!(rows.len(), 1, "{rows:?}");
+}
+
+#[test]
+fn a_microsoft_apps_leftovers_never_reach_shared_microsoft_folders() {
+    let w = world();
+    for n in ["Protect", "Credentials", "Vault", "SystemCertificates", "Templates", "Signatures", "Edge"] {
+        put(&w.local.join("Microsoft").join(n), "a.txt", 5);
+    }
+    put(&w.local.join("Microsoft").join("Windows").join("PowerShell"), "a.txt", 5);
+    put(&w.pf.join("Microsoft").join("EdgeCore"), "a.exe", 5);
+    put(&w.pf.join("PowerShell 7"), "a.exe", 5);
+    put(&w.local.join("WindowsPowerShell"), "a.txt", 5);
+    for (name, publisher) in [("Microsoft Edge", "Microsoft Corporation"), ("PowerShell 7-x64", "Microsoft Corporation"), ("Microsoft Corporation Thing", "Microsoft Corporation")] {
+        let rows = after(&w, &app(name, publisher, None, None), &Claims::default(), &unreadable);
+        for r in &rows {
+            let p = r.path.to_lowercase();
+            assert!(!p.contains("microsoft") && !p.contains("windowspowershell"), "{name}: {}", r.path);
+        }
+    }
+}
+
+#[test]
+fn every_row_is_less_likely_while_the_publisher_still_has_an_app() {
+    let w = world();
+    put(&w.local.join("Adobe").join("Premiere Pro"), "a.txt", 5);
+    let a = app("Premiere Pro", "Adobe Systems", None, None);
+    let alone = after(&w, &a, &Claims::default(), &unreadable);
+    let installed = InstalledNames { apps: vec!["Photoshop".into()], publishers: vec!["Adobe Systems Incorporated".into(), "Adobe Inc.".into()] };
+    let with = after_with(&w, &a, &Claims::default(), &installed, &unreadable);
+    assert!(has_reason(&with[0], "publisher still has an app"), "{:?}", with[0]);
+    assert_eq!(total(&alone[0]) - total(&with[0]), 4);
+    // Shortcuts too.
+    let (user_menu, _) = menus(&w);
+    put(&user_menu, "Premiere Pro.lnk", 1);
+    let dead = w.base.join("gone.exe");
+    let rows = after_with(&w, &a, &Claims::default(), &installed, &targets(&[("Premiere Pro.lnk", &dead)]));
+    let lnk = rows.iter().find(|r| r.path.ends_with(".lnk")).unwrap();
+    assert!(has_reason(lnk, "publisher still has an app"));
+    // A different publisher doesn't count.
+    let other = InstalledNames { apps: vec![], publishers: vec!["Contoso".into()] };
+    assert!(!has_reason(&after_with(&w, &a, &Claims::default(), &other, &unreadable)[0], "publisher still has an app"));
+}
+
+#[test]
+fn a_shortcut_to_something_that_still_works_is_not_listed_whatever_its_name_or_place() {
+    let w = world();
+    let install = w.base.join("apps").join("Acme Editor");
+    put(&install, "editor.exe", 5);
+    let a = app("Acme Editor", "Initech", Some(&install), Some(FolderSource::InstallLocation));
+    let (user_menu, _) = menus(&w);
+    put(&user_menu, "Acme Editor.lnk", 1);
+    put(&user_menu, "Acme Help.lnk", 1);
+    let rows = after(&w, &a, &Claims::default(), &targets(&[("Acme Editor.lnk", &install.join("editor.exe")), ("Acme Help.lnk", &install.join("editor.exe"))]));
+    assert!(rows.iter().all(|r| !r.path.ends_with(".lnk")), "{rows:?}");
+}
+
+#[test]
+fn a_guessed_folder_gives_no_install_folder_points_to_a_shortcut() {
+    let w = world();
+    let guessed = w.base.join("apps").join("Initech Tools");
+    put(&guessed, "a.exe", 5);
+    let a = app("Acme Editor", "Initech", Some(&guessed), Some(FolderSource::Icon));
+    let (user_menu, _) = menus(&w);
+    put(&user_menu, "Acme Editor.lnk", 1);
+    put(&user_menu, "Other Thing.lnk", 1);
+    let dead = guessed.join("gone.exe");
+    let rows = after(&w, &a, &Claims::default(), &targets(&[("Acme Editor.lnk", &dead), ("Other Thing.lnk", &dead)]));
+    assert_eq!(rows.len(), 1, "a guessed folder alone lists nothing: {rows:?}");
+    assert!(!has_reason(&rows[0], "install folder"), "{:?}", rows[0]);
+    assert!(has_reason(&rows[0], "exactly"));
 }
 
 #[test]

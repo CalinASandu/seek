@@ -133,6 +133,14 @@ fn without_company_words(w: Vec<String>) -> Vec<String> {
     w.into_iter().filter(|s| !COMPANY_WORDS.contains(&s.as_str())).collect()
 }
 
+/// True if two publisher names are the same company once suffixes such as `Inc.` or `LLC` are
+/// dropped from both (`Google` and `Google LLC`), or one is the leading words of the other
+/// (`Adobe` and `Adobe Systems Incorporated`). Four letters or fewer never match, as for folders.
+pub fn same_publisher(a: &str, b: &str) -> bool {
+    let (a, b) = (without_company_words(words(a)), without_company_words(words(b)));
+    name_len(&a) > 4 && name_len(&b) > 4 && (a == b || a.starts_with(&b) || b.starts_with(&a))
+}
+
 /// True if the folder is named after this publisher: the same words once company suffixes are
 /// dropped from both (`Google` and `Google LLC`; `NVIDIA` and `NVIDIA Corporation`), or the
 /// folder is the leading words of a longer publisher name. 4 letters or fewer never match.

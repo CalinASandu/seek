@@ -180,3 +180,32 @@ fn leftover_rules_are_unchanged_by_uninstall_ones() {
     let as_leftover = Candidate::Folder { path: mine, why: Why::Leftover, level: None, reasons: vec![] };
     assert!(lock_of(&env, as_leftover).is_some());
 }
+
+#[test]
+fn an_uninstall_path_inside_a_shared_folder_is_locked_claimed() {
+    // Roaming\Microsoft\Protect (DPAPI keys), Local\Microsoft\Edge, Program Files\Microsoft\EdgeCore,
+    // PowerShell's folders: shared with Windows and other apps, so no uninstall may offer them.
+    let env = Env::new(false);
+    for rel in [
+        "users/me/appdata/Microsoft/Protect",
+        "users/me/appdata/Microsoft/Credentials",
+        "users/me/appdata/Microsoft/Edge/User Data",
+        "users/me/appdata/Microsoft/Windows/PowerShell",
+        "users/me/appdata/WindowsPowerShell",
+        "pf/Microsoft/EdgeCore",
+        "pf/Common Files/Acme",
+    ] {
+        let p = folder_with_data(&env, rel);
+        assert_eq!(lock_of(&env, uninstall_folder(p.clone())), Some(Lock::SharedFolder), "{rel}");
+    }
+    let p = folder_with_data(&env, "pf/Microsoft/EdgeCore");
+    let prep = env.engine.prepare(vec![uninstall_folder(p.clone())], &[]);
+    let r = env.engine.commit(&prep.token, &[0], &[]).unwrap();
+    assert!(left(&r, 0).contains("Inside a folder Windows and other apps share, so Seek doesn't remove anything in it."), "{r:?}");
+    assert!(p.exists() && env.rec.calls().is_empty());
+    // Per-user install folders under Local\Programs and ordinary names are still fine.
+    for rel in ["users/me/appdata/Programs/Acme", "users/me/appdata/Acme", "pf/Acme"] {
+        let p = folder_with_data(&env, rel);
+        assert_eq!(lock_of(&env, uninstall_folder(p)), None, "{rel}");
+    }
+}

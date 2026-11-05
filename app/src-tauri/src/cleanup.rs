@@ -784,14 +784,17 @@ pub struct Core {
     pub engine: Engine,
     pub places: Places,
     pub facts: Arc<dyn FileFacts>,
+    /// The engine's claims, kept so a listing can make them read again.
+    pub claims: Option<Arc<LiveClaims>>,
 }
 
 impl Core {
     fn real(places: Places) -> Core {
         let facts: Arc<dyn FileFacts> = Arc::new(RealFacts);
+        let claims = Arc::new(LiveClaims::new());
         // No elevator until Task 14: Program Files leftovers are left with the admin reason.
-        let engine = Engine::new(places.clone(), Arc::new(ShellRecycler), None, facts.clone(), Arc::new(LiveClaims::new()));
-        Core { engine, places, facts }
+        let engine = Engine::new(places.clone(), Arc::new(ShellRecycler), None, facts.clone(), claims.clone());
+        Core { engine, places, facts, claims: Some(claims) }
     }
 }
 
@@ -1114,15 +1117,22 @@ pub fn uninstall_state(clean: Clean<'_>, app_id: String) -> Result<UninstallPhas
 #[tauri::command]
 pub async fn uninstall_leftovers(clean: Clean<'_>, link: State<'_, Arc<ServiceLink>>, app_id: String) -> Result<Vec<LeftoverRow>, String> {
     let core = clean.core()?;
-    let app = clean.uninstalls.app(&app_id).ok_or(apps::NOT_STARTED)?;
+    let state: Arc<CleanState> = (*clean).clone();
     let own_link: Arc<ServiceLink> = (*link).clone();
+    let id = app_id.clone();
     let rows = tauri::async_runtime::spawn_blocking(move || {
+        // Refused while Windows still lists the app: nothing is "left" of something still installed.
+        let app = state.uninstalls.leftovers_for(&id)?;
+        // The engine's own claims are read afresh too, so the review that follows agrees with this list.
+        if let Some(c) = &core.claims {
+            c.refresh();
+        }
         let claims = LiveClaims::new();
         let installed = claims::read_installed_names();
-        leftovers::for_app(&app, &core.places, &claims, &installed, &ServiceIndex(own_link))
+        Ok::<_, String>(leftovers::for_app(&app, &core.places, &claims, &installed, &ServiceIndex(own_link)))
     })
     .await
-    .map_err(|e| format!("Looking for what was left behind stopped unexpectedly: {e}"))?;
+    .map_err(|e| format!("Looking for what was left behind stopped unexpectedly: {e}"))??;
     clean.uninstall_listed.lock().unwrap_or_else(|e| e.into_inner()).insert(app_id, listed_set(&rows));
     Ok(rows)
 }

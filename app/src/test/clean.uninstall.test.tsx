@@ -56,23 +56,33 @@ describe("the uninstall sheet", () => {
 
   it("a failed start shows the message and goes back to the first step", async () => {
     const text = "Windows didn't get permission to run the uninstaller.";
-    const uninstallState = vi.fn(async (): Promise<UninstallState> => "running");
+    // the first question, when the sheet opens, finds nothing started; it is never asked again
+    const uninstallState = vi.fn(async (): Promise<UninstallState> => {
+      throw new Error("Seek hasn't started an uninstaller for that app.");
+    });
     const user = await openApps({ ...makeApi(), uninstallStart: () => Promise.reject(new Error(text)), uninstallState });
     await openSheet(user, /^Audacity/);
     await user.click(await screen.findByRole("button", { name: "Uninstall" }));
     const dialog = await screen.findByRole("dialog", { name: "Uninstall Audacity?" });
     await waitFor(() => expect(dialog).toHaveTextContent(text));
     expect(within(dialog).getByRole("button", { name: "Uninstall" })).toBeInTheDocument();
-    expect(uninstallState).not.toHaveBeenCalled();
+    expect(uninstallState).toHaveBeenCalledTimes(1);
   });
 
   it("asks once a second while it is open, and stops when it is closed", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
-    const uninstallState = vi.fn(async (): Promise<UninstallState> => "running");
+    let first = true;
+    const uninstallState = vi.fn(async (): Promise<UninstallState> => {
+      if (first) {
+        first = false;
+        throw new Error("Seek hasn't started an uninstaller for that app.");
+      }
+      return "running";
+    });
     const user = await openApps({ ...makeApi(), uninstallState }, (ms) => vi.advanceTimersByTime(ms));
     await openSheet(user, /^Audacity/);
     await user.click(await screen.findByRole("button", { name: "Uninstall" }));
-    await waitFor(() => expect(uninstallState).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(uninstallState).toHaveBeenCalledTimes(2));
     await act(async () => {
       await vi.advanceTimersByTimeAsync(3000);
     });
@@ -104,5 +114,67 @@ describe("the uninstall sheet", () => {
     await waitFor(() => expect(cleanPrepare).toHaveBeenCalledTimes(1));
     const req = cleanPrepare.mock.calls[0]![0];
     expect(req).toMatchObject({ kind: "folders", why: "uninstall", appId: "app-audacity" });
+  });
+});
+
+describe("the uninstall sheet, round 2", () => {
+  it("a failed check is retried, and after three in a row shows the error with Try again", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    let calls = 0;
+    const uninstallState = vi.fn(async (): Promise<UninstallState> => {
+      calls++;
+      // Not started yet for the resume check, then three failures.
+      if (calls === 1) throw new Error("Seek hasn't started an uninstaller for that app.");
+      if (calls <= 4) throw new Error("The service is busy.");
+      return "running";
+    });
+    const user = await openApps({ ...makeApi(), uninstallState }, (ms) => vi.advanceTimersByTime(ms));
+    await openSheet(user, /^Audacity/);
+    await user.click(await screen.findByRole("button", { name: "Uninstall" }));
+    expect(screen.queryByRole("button", { name: "It's finished" })).toBeNull();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(4000);
+    });
+    const dialog = await screen.findByRole("dialog");
+    await waitFor(() => expect(dialog).toHaveTextContent("The service is busy."));
+    expect(screen.queryByRole("button", { name: "It's finished" })).toBeNull();
+    await user.click(within(dialog).getByRole("button", { name: "Try again" }));
+    await waitFor(() => expect(calls).toBeGreaterThanOrEqual(5));
+    await waitFor(() => expect(within(screen.getByRole("dialog")).queryByRole("button", { name: "Try again" })).toBeNull());
+  });
+
+  it("opens at the right step for an uninstall already in progress", async () => {
+    const running = vi.fn(async (): Promise<UninstallState> => "running");
+    const uninstallStart = vi.fn(async () => {});
+    const user = await openApps({ ...makeApi(), uninstallState: running, uninstallStart });
+    await openSheet(user, /^Audacity/);
+    expect(await screen.findByText(/Windows is running the uninstaller/)).toBeInTheDocument();
+    expect(uninstallStart).not.toHaveBeenCalled();
+    await user.keyboard("{Escape}");
+  });
+
+  it("opens at what's left when the uninstall already finished", async () => {
+    const user = await openApps({ ...makeApi(), uninstallState: async () => "finished" });
+    await openSheet(user, /^Audacity/);
+    expect(await screen.findByRole("dialog", { name: "Audacity: what's left" })).toBeInTheDocument();
+  });
+
+  it("shows why what's left can't be listed yet, with Look again", async () => {
+    const base = makeApi();
+    const text = "Windows still lists this app as installed. Seek lists what's left once it's gone.";
+    let n = 0;
+    const uninstallLeftovers = vi.fn(async (id: string) => {
+      if (n++ === 0) throw new Error(text);
+      return base.uninstallLeftovers(id);
+    });
+    const user = await openApps({ ...base, uninstallLeftovers });
+    await openSheet(user, /^Legacy Backup Suite/);
+    await user.click(await screen.findByRole("button", { name: "Uninstall" }));
+    await user.click(await screen.findByRole("button", { name: "It's finished" }));
+    const dialog = await screen.findByRole("dialog");
+    await waitFor(() => expect(dialog).toHaveTextContent(text));
+    await user.click(within(dialog).getByRole("button", { name: "Look again" }));
+    expect(await screen.findByRole("list", { name: "Left behind" })).toBeInTheDocument();
+    expect(uninstallLeftovers).toHaveBeenCalledTimes(2);
   });
 });

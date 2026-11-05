@@ -40,6 +40,8 @@ pub enum Lock {
     ReparsePoint,
     /// A folder an app owns, found when the engine looked (at review or at removal).
     Claimed,
+    /// Inside a folder Windows and other apps share (Microsoft, Common Files...). Never removed by an uninstall.
+    SharedFolder,
 }
 
 /// How sure Seek is that a leftover folder is dead.
@@ -227,6 +229,7 @@ mod tests {
     fn lock_and_level_serialize_as_camel_case_strings() {
         assert_eq!(serde_json::to_string(&Lock::NoRecycleBin).unwrap(), "\"noRecycleBin\"");
         assert_eq!(serde_json::to_string(&Lock::BinFull).unwrap(), "\"binFull\"");
+        assert_eq!(serde_json::to_string(&Lock::SharedFolder).unwrap(), "\"sharedFolder\"");
         assert_eq!(serde_json::to_string(&Lock::PathTooLong).unwrap(), "\"pathTooLong\"");
         assert_eq!(serde_json::to_string(&Level::ProbablyInUse).unwrap(), "\"probablyInUse\"");
         assert_eq!(serde_json::to_string(&Why::StaleData).unwrap(), "\"staleData\"");

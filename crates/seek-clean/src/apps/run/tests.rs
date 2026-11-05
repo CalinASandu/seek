@@ -197,9 +197,9 @@ fn the_state_is_kept_per_app() {
     w.uninstalls.join_waiter(ID);
     let other = r"HKLM64\{OTHER}";
     assert_eq!(w.uninstalls.state(other), Err(NOT_STARTED.to_string()));
+    w.present.store(false, Ordering::SeqCst);
     w.uninstalls.start(&launcher, Some(found(other, exe(r"C:\x\b.exe", "")))).unwrap();
     w.uninstalls.join_waiter(other);
-    w.present.store(false, Ordering::SeqCst);
     assert_eq!(w.uninstalls.state(other), Ok(UninstallPhase::Finished));
     assert_eq!(w.uninstalls.app(ID).unwrap().id, ID);
 }
@@ -226,6 +226,7 @@ fn a_second_start_is_refused_while_one_is_running() {
     assert_eq!(launcher.asked.lock().unwrap().len(), 1);
     release.send(()).unwrap();
     w.uninstalls.join_waiter(ID);
+    w.present.store(false, Ordering::SeqCst);
     w.uninstalls.start(&launcher, Some(found(other, exe(r"C:\x\b.exe", "")))).unwrap();
     assert_eq!(launcher.asked.lock().unwrap().len(), 2);
 }
@@ -299,3 +300,5 @@ fn a_malformed_app_id_has_no_registry_entry() {
     assert!(!entry_present("not an id"));
     assert!(!entry_present(r"HKLM64\a\b"));
 }
+
+mod more;
