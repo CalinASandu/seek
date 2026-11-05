@@ -3,8 +3,10 @@
 //! This is the Task 1 spike: it records exactly what the progress sink reports, so later tasks
 //! can decide what counts as proof that an item reached the bin.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+
+use crate::facts::Recycler;
 
 use windows::core::{implement, Interface, BOOL, HRESULT, PCSTR, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{HWND, PROPERTYKEY};
@@ -45,6 +47,10 @@ pub struct RecycleReport {
     pub posts: Vec<PostRecord>,
     /// The error `DeleteItem`/`PerformOperations` returned, if any.
     pub perform_error: Option<String>,
+    /// The raw HRESULT of `perform_error`.
+    pub perform_hr: Option<i32>,
+    /// The sink refused an item in `PreDeleteItem` because Windows did not say it would recycle it.
+    pub refused_no_recycle: bool,
     /// `GetAnyOperationsAborted`.
     pub aborted: bool,
 }
@@ -69,7 +75,12 @@ struct Sink {
     rec: Arc<Mutex<Rec>>,
     /// Probe mode: refuse the item right after `PreDeleteItem` is recorded, so nothing is deleted.
     abort_after_pre: bool,
+    /// Refuse any item whose `PreDeleteItem` flags lack `TSF_DELETE_RECYCLE_IF_POSSIBLE`.
+    require_recycle_bit: bool,
 }
+
+/// `TSF_DELETE_RECYCLE_IF_POSSIBLE`: Windows intends to recycle, not delete for good.
+const TSF_DELETE_RECYCLE_IF_POSSIBLE: u32 = 0x80;
 
 fn pwstr_to_string(p: PWSTR) -> Option<String> {
     if p.is_null() {
@@ -113,10 +124,17 @@ impl IFileOperationProgressSink_Impl for Sink_Impl {
         Ok(())
     }
     fn PreDeleteItem(&self, dwflags: u32, _psiitem: windows::core::Ref<IShellItem>) -> windows::core::Result<()> {
+        let refuse = self.abort_after_pre
+            || (self.require_recycle_bit && dwflags & TSF_DELETE_RECYCLE_IF_POSSIBLE == 0);
         if let Ok(mut g) = self.rec.lock() {
             g.report.pre_flags.push(dwflags);
+            if self.require_recycle_bit && dwflags & TSF_DELETE_RECYCLE_IF_POSSIBLE == 0 {
+                g.report.refused_no_recycle = true;
+            }
+        } else {
+            return Err(windows::Win32::Foundation::E_ABORT.into());
         }
-        if self.abort_after_pre {
+        if refuse {
             return Err(windows::Win32::Foundation::E_ABORT.into());
         }
         Ok(())
@@ -189,11 +207,78 @@ fn wide(p: &Path) -> Vec<u16> {
 /// the item may then have been permanently deleted. NOTE: the file may already be gone when this
 /// returns `Err` for a missing location; callers must treat that as "possibly destroyed".
 pub fn recycle_one(path: &Path) -> Result<RecycleReport, String> {
+    if !is_plain_absolute(path) {
+        return Err(format!(
+            "Seek only recycles files given by a full drive path, not {}",
+            path.display()
+        ));
+    }
     let report = run(path, false, 0, true)?;
     match report.bin_location() {
         Some(loc) if loc.to_ascii_lowercase().contains("$recycle.bin") => Ok(report),
         Some(loc) => Err(format!("Windows reported a location outside the Recycle Bin: {loc}")),
         None => Err("Windows reported no Recycle Bin location for the item".into()),
+    }
+}
+
+/// True for `X:\...` or `X:/...` only. Relative paths, UNC and `\\?\` paths, `::{CLSID}` shell
+/// names and `shell:` names are all refused before Windows gets to resolve them.
+fn is_plain_absolute(path: &Path) -> bool {
+    let s = path.to_string_lossy();
+    let b = s.as_bytes();
+    b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/')
+}
+
+/// The real recycler: one `IFileOperation` per path, in order.
+pub struct ShellRecycler;
+
+impl Recycler for ShellRecycler {
+    fn recycle(&self, paths: &[PathBuf]) -> Vec<Result<String, String>> {
+        recycle_in_order(paths, |p| {
+            let report = recycle_one(p)?;
+            report
+                .bin_location()
+                .map(str::to_string)
+                .ok_or_else(|| "Windows reported no Recycle Bin location for the item".to_string())
+        })
+    }
+}
+
+/// Runs `one` for each path in order and stops at the first failure: every later path is an
+/// `Err` that says it was not attempted.
+fn recycle_in_order(
+    paths: &[PathBuf],
+    mut one: impl FnMut(&Path) -> Result<String, String>,
+) -> Vec<Result<String, String>> {
+    let mut out = Vec::with_capacity(paths.len());
+    let mut stopped = false;
+    for p in paths {
+        if stopped {
+            out.push(Err("Not attempted, because an earlier item could not be confirmed in the Recycle Bin".to_string()));
+            continue;
+        }
+        let r = one(p);
+        stopped = r.is_err();
+        out.push(r);
+    }
+    out
+}
+
+/// A plain sentence for why one item did not reach the bin.
+fn failure_text(path: &Path, hr: i32) -> String {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string());
+    match hr as u32 {
+        // ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION, COPYENGINE_E_SHARING_VIOLATION_SRC
+        // (0x80270027 is what a file held open with no sharing really gives, seen on this PC).
+        0x8007_0020 | 0x8007_0021 | 0x8027_0027 => {
+            format!("{name} is in use by another program, so it was left in place.")
+        }
+        // E_ACCESSDENIED, COPYENGINE_E_ACCESS_DENIED_SRC
+        0x8007_0005 | 0x8027_0021 => format!("Windows denied access to {name}, so it was left in place."),
+        h => format!("Windows could not move {name} to the Recycle Bin (error 0x{h:08X})."),
     }
 }
 
@@ -204,10 +289,12 @@ pub fn probe_pre_delete(path: &Path) -> Result<RecycleReport, String> {
     run(path, true, 0, false)
 }
 
-/// Spike only: runs the same recycle with `extra_flags` added to the operation flags and never
-/// turns a missing location or a failed operation into an error, so tests can see what the sink
-/// reports when Windows permanently deletes. The deleted file is gone for good. Never use this
-/// outside tests on files the test created.
+/// Spike only (cargo feature `spike`, so production code cannot reach it): runs the same recycle
+/// with `extra_flags` added to the operation flags and never turns a missing location or a failed
+/// operation into an error, so tests can see what the sink reports when Windows permanently
+/// deletes. The deleted file is gone for good. Never use this outside tests on files the test
+/// created.
+#[cfg(feature = "spike")]
 pub fn observe_recycle(path: &Path, extra_flags: u32) -> Result<RecycleReport, String> {
     run(path, false, extra_flags, false)
 }
@@ -227,7 +314,12 @@ fn run(path: &Path, abort_after_pre: bool, extra_flags: u32, strict: bool) -> Re
                 FOFX_RECYCLEONDELETE | FOF_NO_UI | FOFX_EARLYFAILURE | FILEOPERATION_FLAGS(extra_flags),
             )
                 .map_err(|e| format!("cannot set flags: {e}"))?;
-            let sink: IFileOperationProgressSink = Sink { rec: rec.clone(), abort_after_pre }.into();
+            let sink: IFileOperationProgressSink = Sink {
+                rec: rec.clone(),
+                abort_after_pre,
+                require_recycle_bit: strict,
+            }
+            .into();
             let cookie = op.Advise(&sink).map_err(|e| format!("cannot attach sink: {e}"))?;
             let result = op
                 .DeleteItem(&item, None::<&IFileOperationProgressSink>)
@@ -236,9 +328,18 @@ fn run(path: &Path, abort_after_pre: bool, extra_flags: u32, strict: bool) -> Re
             let _ = op.Unadvise(cookie);
             let mut g = rec.lock().map_err(|_| "sink poisoned".to_string())?;
             g.report.perform_error = result.as_ref().err().map(|e| e.to_string());
+            g.report.perform_hr = result.as_ref().err().map(|e| e.code().0);
             g.report.aborted = aborted;
             if strict {
-                result.map_err(|e| format!("recycle failed: {e}"))?;
+                if g.report.refused_no_recycle {
+                    return Err(format!(
+                        "Windows would delete {} for good instead of recycling it, so it was left in place.",
+                        path.display()
+                    ));
+                }
+                if let Err(e) = &result {
+                    return Err(failure_text(&path, e.code().0));
+                }
                 if aborted {
                     return Err("Windows aborted the operation".into());
                 }
@@ -247,7 +348,7 @@ fn run(path: &Path, abort_after_pre: bool, extra_flags: u32, strict: bool) -> Re
         let report = rec.lock().map_err(|_| "sink poisoned".to_string())?.report.clone();
         if strict {
             if let Some(p) = report.posts.iter().find(|p| p.hr_delete < 0) {
-                return Err(format!("PostDeleteItem reported failure, hrDelete = 0x{:08X}", p.hr_delete as u32));
+                return Err(failure_text(&path, p.hr_delete));
             }
         }
         Ok(report)
@@ -366,8 +467,56 @@ pub fn restore(bin_path: &str, original: &Path) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::matches_original;
-    use std::path::Path;
+    use super::{failure_text, is_plain_absolute, matches_original, recycle_in_order, recycle_one};
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn recycle_one_refuses_odd_paths_before_resolving_them() {
+        for bad in [
+            "relative.txt",
+            r"..\x.txt",
+            r"C:x.txt",
+            r"\\server\share\f.txt",
+            r"\\?\C:\f.txt",
+            r"\\localhost\C$\f.txt",
+            "::{645FF040-5081-101B-9F08-00AA002F954E}",
+            "shell:RecycleBinFolder",
+            "",
+        ] {
+            assert!(!is_plain_absolute(Path::new(bad)), "{bad}");
+            assert!(recycle_one(Path::new(bad)).is_err(), "{bad}");
+        }
+        assert!(is_plain_absolute(Path::new(r"C:\a\b.txt")));
+        assert!(is_plain_absolute(Path::new("d:/a/b.txt")));
+    }
+
+    #[test]
+    fn a_batch_stops_at_the_first_failure_and_marks_the_rest() {
+        let paths: Vec<PathBuf> = ["a", "b", "c", "d"].iter().map(PathBuf::from).collect();
+        let mut seen = Vec::new();
+        let out = recycle_in_order(&paths, |p| {
+            seen.push(p.to_path_buf());
+            if p == Path::new("b") {
+                Err("b failed".into())
+            } else {
+                Ok(format!("bin-{}", p.display()))
+            }
+        });
+        assert_eq!(seen, vec![PathBuf::from("a"), PathBuf::from("b")], "c and d never attempted");
+        assert_eq!(out.len(), 4);
+        assert_eq!(out[0], Ok("bin-a".to_string()));
+        assert_eq!(out[1], Err("b failed".to_string()));
+        assert!(out[2].as_ref().unwrap_err().contains("Not attempted"));
+        assert!(out[3].is_err());
+    }
+
+    #[test]
+    fn failure_text_names_the_file_and_says_in_use() {
+        let t = failure_text(Path::new(r"C:\x\locked.bin"), 0x8007_0020_u32 as i32);
+        assert!(t.contains("locked.bin") && t.contains("in use"), "{t}");
+        let t = failure_text(Path::new(r"C:\x\locked.bin"), 0x8027_0027_u32 as i32);
+        assert!(t.contains("in use"), "{t}");
+    }
 
     const BIN: &str = r"C:\$Recycle.Bin\S-1\$RAB12CD.txt";
 

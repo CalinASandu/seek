@@ -1,11 +1,16 @@
 //! Real Recycle Bin spike tests. Run on purpose only:
-//! `cargo test -p seek-clean --test recycle_real -- --ignored --nocapture`
+//! `cargo test -p seek-clean --test recycle_real --features spike -- --ignored --nocapture`
 //! They only ever touch temp files the test itself created, on a fixed drive.
 
 #![cfg(windows)]
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+use seek_clean::engine::Engine;
+use seek_clean::facts::{ClaimCheck, FileFacts, RealFacts, Recycler};
+use seek_clean::model::{Candidate, Lock};
+use seek_clean::protect::Places;
 use seek_clean::recycle::{probe_pre_delete, recycle_one, restore};
 use windows::core::PCWSTR;
 use windows::Win32::Storage::FileSystem::{
@@ -238,11 +243,131 @@ fn real_strict_recycle_one_refuses_when_no_location() {
     if file.exists() {
         std::fs::remove_file(&file).unwrap();
     }
-    if let Ok(r) = result {
-        let loc = r.bin_location().expect("Ok must carry a location").to_string();
-        assert!(loc.to_ascii_lowercase().contains("$recycle.bin"));
-        println!("STRICT: it really was recycled to {loc}; leaving it for the shell to restore is not possible, remove by hand");
+    // Windows destroys this file without naming a bin location, so the strict API must say Err.
+    let err = result.expect_err("no bin location was reported, recycle_one must be an Err");
+    assert!(!err.is_empty());
+}
+
+/// Holds `file` open with no sharing, so nothing else can open, move or delete it.
+fn hold_exclusively(file: &Path) -> std::fs::File {
+    use std::os::windows::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .share_mode(0)
+        .open(file)
+        .expect("open with no sharing")
+}
+
+#[test]
+#[ignore]
+fn real_locked_file_stays_with_a_reason() {
+    let _wd = Watchdog::start("locked file");
+    let dir = fixed_temp_dir();
+    let file = dir.path().join("seek-locked.txt");
+    std::fs::write(&file, b"seek locked file").unwrap();
+    let held = hold_exclusively(&file);
+
+    let result = recycle_one(&file);
+    println!("LOCKED: result = {result:?}");
+    let still_there = file.exists();
+    drop(held);
+    let content = std::fs::read(&file).ok();
+    if file.exists() {
+        std::fs::remove_file(&file).unwrap();
     }
+
+    let err = result.expect_err("a file held open with no sharing must not be reported as recycled");
+    assert!(still_there, "the locked file vanished");
+    assert_eq!(content.as_deref(), Some(&b"seek locked file"[..]), "contents changed");
+    assert!(err.contains("seek-locked.txt"), "reason does not name the file: {err}");
+    assert!(err.contains("in use"), "reason is not a plain 'in use' sentence: {err}");
+    assert!(err.ends_with('.') && !err.contains("0x"), "reason is not a plain sentence: {err}");
+}
+
+#[test]
+#[ignore]
+fn real_read_only_file_outcome() {
+    let _wd = Watchdog::start("read-only file");
+    let dir = fixed_temp_dir();
+    let file = dir.path().join("seek-readonly.txt");
+    std::fs::write(&file, b"seek read only").unwrap();
+    let mut perms = std::fs::metadata(&file).unwrap().permissions();
+    perms.set_readonly(true);
+    std::fs::set_permissions(&file, perms).unwrap();
+
+    let result = recycle_one(&file);
+    println!("READONLY: result = {result:?}, original exists = {}", file.exists());
+    let exists = file.exists();
+    match &result {
+        Ok(report) => {
+            let loc = report.bin_location().expect("Ok carries a location").to_string();
+            println!("READONLY OUTCOME: recycled to {loc}");
+            assert!(!exists, "reported recycled but the original is still there");
+            if let Err(e) = restore(&loc, &file) {
+                println!("READONLY: RESTORE FAILED, remove from the bin by hand: {e}");
+            }
+        }
+        Err(e) => {
+            println!("READONLY OUTCOME: refused with: {e}");
+            assert!(exists, "refused but the original is gone");
+        }
+    }
+    if file.exists() {
+        let mut p = std::fs::metadata(&file).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        p.set_readonly(false);
+        std::fs::set_permissions(&file, p).unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), b"seek read only", "contents changed");
+        std::fs::remove_file(&file).unwrap();
+    }
+}
+
+struct CountingRecycler(std::sync::atomic::AtomicUsize);
+impl Recycler for CountingRecycler {
+    fn recycle(&self, paths: &[PathBuf]) -> Vec<Result<String, String>> {
+        self.0.fetch_add(paths.len(), std::sync::atomic::Ordering::SeqCst);
+        paths.iter().map(|_| Err("should never be called".to_string())).collect()
+    }
+}
+
+struct NoClaims;
+impl ClaimCheck for NoClaims {
+    fn is_claimed(&self, _folder: &Path) -> Option<String> {
+        None
+    }
+}
+
+#[test]
+#[ignore]
+fn real_oversized_sparse_file_is_refused_before_the_recycler() {
+    let _wd = Watchdog::start("oversized end to end");
+    let dir = fixed_temp_dir();
+    let file = make_sparse_oversized(dir.path());
+    let size = std::fs::metadata(&file).unwrap().len();
+
+    // Fake protected places elsewhere, so only the recycle pre-checks can refuse this file.
+    let fake = tempfile::tempdir().unwrap();
+    let f = |s: &str| fake.path().join(s).to_string_lossy().into_owned();
+    let places = Places::for_tests(&f("win"), &[&f("pf")], &f("users"), &f("users/me"), &f("pd"), &[&f("ad")]);
+    let recycler = Arc::new(CountingRecycler(Default::default()));
+    let engine = Engine::new(places, recycler.clone(), None, Arc::new(RealFacts), Arc::new(NoClaims));
+
+    let blocked = RealFacts.recycle_block(&file, size);
+    let prepared = engine.prepare(vec![Candidate::Duplicates { copies: vec![file.clone()] }], &[]);
+    let lock = prepared.items.first().map(|i| i.lock);
+    let committed = engine.commit(&prepared.token, &[0], &[]);
+    let calls = recycler.0.load(std::sync::atomic::Ordering::SeqCst);
+    let still_there = file.exists();
+    if still_there {
+        std::fs::remove_file(&file).unwrap();
+    }
+
+    println!("E2E: recycle_block = {blocked:?}, lock = {lock:?}, commit ok = {}, recycler calls = {calls}", committed.is_ok());
+    assert_eq!(blocked, Some(Lock::NoRecycleBin));
+    assert_eq!(lock, Some(Some(Lock::NoRecycleBin)), "the review must show the item locked");
+    assert_eq!(calls, 0, "the oversized file reached the recycler");
+    assert!(still_there, "the oversized file was removed");
 }
 
 #[test]
