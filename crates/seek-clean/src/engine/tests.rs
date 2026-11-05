@@ -61,7 +61,7 @@ impl Recycler for FakeRecycler {
                     .unwrap()
                     .path();
                 std::fs::remove_file(first).unwrap();
-                out.push(Err("half done".to_string()));
+                out.push(Err(crate::recycle::failure_text(p, 0x8027_0000_u32 as i32)));
                 break;
             }
             if *self.destroy_at.lock().unwrap() == Some(n) {
@@ -70,7 +70,7 @@ impl Recycler for FakeRecycler {
                 break;
             }
             if self.refuse.lock().unwrap().contains(p) {
-                out.push(Err("in use".to_string()));
+                out.push(Err(crate::recycle::failure_text(p, 0x8027_0027_u32 as i32)));
                 continue;
             }
             remove(p);
@@ -662,6 +662,33 @@ fn an_item_that_fails_but_stays_does_not_stop_the_run() {
     assert!(left(&r, 1).contains("in use"));
     assert!(env.p("left/b").exists());
     assert_eq!(env.rec.calls().len(), 3, "one path per call");
+}
+
+#[test]
+fn an_in_use_file_reads_as_one_clean_sentence() {
+    let env = Env::new(false);
+    let prep = env.engine.prepare(vec![env.folder("left/b")], &[]);
+    env.rec.refuse.lock().unwrap().insert(env.p("left/b"));
+    let r = env.engine.commit(&prep.token, &[0], &[]).unwrap();
+    let text = left(&r, 0);
+    assert!(text.contains("b is in use by another program"), "{text}");
+    assert_eq!(text.matches("left in place").count(), 1, "doubled clause: {text}");
+    assert!(env.p("left/b").exists());
+}
+
+#[test]
+fn a_partly_removed_folder_never_claims_to_be_left_in_place() {
+    let env = Env::new(false);
+    let prep = env.engine.prepare(vec![env.folder("left/a")], &[]);
+    *env.rec.partial_at.lock().unwrap() = Some(1);
+    let r = env.engine.commit(&prep.token, &[0], &[]).unwrap();
+    let stopped = r.stopped_early.clone().expect("the run stops");
+    let item = left(&r, 0);
+    for text in [&item, &stopped] {
+        assert!(!text.contains("left in place"), "claims it was left: {text}");
+    }
+    assert!(stopped.contains("0x80270000"), "the cause is still shown: {stopped}");
+    assert!(item.contains("deleted for good"), "{item}");
 }
 
 fn leftover(p: &Path) -> Candidate {

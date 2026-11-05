@@ -22,7 +22,7 @@ pub(crate) fn lock_reason(l: Lock) -> &'static str {
         Lock::OtherUser => "This belongs to another user, so it was left in place.",
         Lock::AppData => "This is in an app data folder, so it was left in place.",
         Lock::ToolFolder => "This is inside a tool folder (.git, node_modules and the like), so it was left in place.",
-        Lock::NoRecycleBin => "This drive has no Recycle Bin that can hold it, so it was left in place.",
+        Lock::NoRecycleBin => "Windows might delete this for good instead of recycling it: there is no Recycle Bin that can hold it here (the drive, its format, a Windows setting or policy, or a full bin). If the Recycle Bin is full, empty it first. It was left in place.",
         Lock::CloudPlaceholder => "This is an online-only cloud file, so it was left in place.",
         Lock::Protected => "You marked this, or something inside it, as always protected, so it was left in place.",
         Lock::LinkedPc => "This is on a linked PC. Seek only removes files on this PC, so it was left in place.",
