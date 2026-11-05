@@ -276,45 +276,50 @@ pub(crate) struct Policies {
     pub(crate) recycle_bin_size: PolicyValue,
 }
 
-/// True when settings, policies and the bin's current size forbid recycling this batch. An
-/// absent `NukeOnDelete` is Windows' default (off). Anything that cannot be read, a zero
-/// capacity, or a policy that needs the volume size when that was unreadable, blocks. The bin's
-/// current size counts: what is already in it uses up the capacity.
+/// Why settings, policies and the bin's size forbid recycling this batch. `NoRecycleBin` for a
+/// setting, a policy, an unreadable or zero capacity, or a batch that alone exceeds the capacity.
+/// `BinFull` when the batch fits but what is already in the bin leaves no room, or the bin's
+/// size is unknown. An absent `NukeOnDelete` is Windows' default (off).
 pub(crate) fn capacity_block(
     s: &BinSettings,
     p: &Policies,
     volume_total: Option<u64>,
     bin_used: Option<u64>,
     batch_bytes: u64,
-) -> bool {
+) -> Option<Lock> {
     if s.nuke_on_delete.unwrap_or(0) != 0 {
-        return true;
+        return Some(Lock::NoRecycleBin);
     }
     match p.no_recycle_files {
         PolicyValue::Absent | PolicyValue::Value(0) => {}
-        PolicyValue::Value(_) | PolicyValue::Unreadable => return true,
+        PolicyValue::Value(_) | PolicyValue::Unreadable => return Some(Lock::NoRecycleBin),
     }
     let Some(mb) = s.max_capacity_mb else {
-        return true;
+        return Some(Lock::NoRecycleBin);
     };
     let mut capacity = u128::from(mb) * BYTES_PER_CAPACITY_UNIT;
     match p.recycle_bin_size {
         PolicyValue::Absent => {}
-        PolicyValue::Unreadable => return true,
+        PolicyValue::Unreadable => return Some(Lock::NoRecycleBin),
         PolicyValue::Value(percent) => {
             let Some(total) = volume_total else {
-                return true;
+                return Some(Lock::NoRecycleBin);
             };
             capacity = capacity.min(u128::from(total) * u128::from(percent) / 100);
         }
     }
     if capacity == 0 {
-        return true;
+        return Some(Lock::NoRecycleBin);
+    }
+    // The batch alone must fit; if it does, what is already in the bin must leave room for it.
+    let limit = capacity * CAPACITY_MARGIN_PERCENT;
+    if u128::from(batch_bytes) * 100 > limit {
+        return Some(Lock::NoRecycleBin);
     }
     let Some(used) = bin_used else {
-        return true;
+        return Some(Lock::BinFull);
     };
-    (u128::from(used) + u128::from(batch_bytes)) * 100 > capacity * CAPACITY_MARGIN_PERCENT
+    ((u128::from(used) + u128::from(batch_bytes)) * 100 > limit).then_some(Lock::BinFull)
 }
 
 /// True when the item (or anything inside it) has a path the bin cannot store. `top_units` is the
@@ -365,20 +370,20 @@ pub(crate) struct Inputs {
 /// The pre-checks of the spec, as a pure function. The first failing one names the lock.
 pub(crate) fn decide(i: &Inputs) -> Option<Lock> {
     if path_too_long(i.top_units, i.name_units, i.inner_suffix) {
-        return Some(Lock::UnsupportedPath);
+        return Some(Lock::PathTooLong);
     }
     if is_cloud(i.attrs) {
         return Some(Lock::CloudPlaceholder);
     }
-    if !drive_allows(i.drive)
-        || !i.same_root
-        || !i.volume_root_ok
-        || !i.fs_ok
-        || capacity_block(&i.settings, &i.policies, i.volume_total, i.bin_used, i.batch_bytes)
-    {
+    // A subst drive, a junction to another volume or a folder-mounted volume: the written path is
+    // not a place Seek can reason about.
+    if !i.same_root || !i.volume_root_ok {
+        return Some(Lock::UnsupportedPath);
+    }
+    if !drive_allows(i.drive) || !i.fs_ok {
         return Some(Lock::NoRecycleBin);
     }
-    None
+    capacity_block(&i.settings, &i.policies, i.volume_total, i.bin_used, i.batch_bytes)
 }
 
 /// The volume GUID inside a `\\?\Volume{guid}\` name, without braces.
@@ -615,6 +620,9 @@ mod tests {
     }
 
     const NO: Option<Lock> = Some(Lock::NoRecycleBin);
+    const FULL: Option<Lock> = Some(Lock::BinFull);
+    const LONG: Option<Lock> = Some(Lock::PathTooLong);
+    const ODD: Option<Lock> = Some(Lock::UnsupportedPath);
 
     #[test]
     fn an_ordinary_item_is_allowed() {
@@ -664,9 +672,9 @@ mod tests {
             ..with_settings(Some(1000), 100 * MB)
         };
         assert_eq!(decide(&used(Some(800 * MB))), None); // 900 MB in all, exactly the margin
-        assert_eq!(decide(&used(Some(800 * MB + 1))), NO);
-        assert_eq!(decide(&used(Some(5000 * MB))), NO);
-        assert_eq!(decide(&used(None)), NO, "a failed bin query blocks");
+        assert_eq!(decide(&used(Some(800 * MB + 1))), FULL);
+        assert_eq!(decide(&used(Some(5000 * MB))), FULL);
+        assert_eq!(decide(&used(None)), FULL, "a failed bin query blocks");
     }
 
     #[test]
@@ -678,10 +686,10 @@ mod tests {
             ..ok_inputs()
         };
         assert_eq!(decide(&long(MAX_ORIGINAL_PATH_UNITS, 10, None)), None);
-        assert_eq!(decide(&long(MAX_ORIGINAL_PATH_UNITS + 1, 10, None)), Some(Lock::UnsupportedPath));
+        assert_eq!(decide(&long(MAX_ORIGINAL_PATH_UNITS + 1, 10, None)), LONG);
         // A file with a long name: the bin prefix counts.
         assert_eq!(decide(&long(100, 179, None)), None);
-        assert_eq!(decide(&long(100, 180, None)), Some(Lock::UnsupportedPath));
+        assert_eq!(decide(&long(100, 180, None)), LONG);
     }
 
     #[test]
@@ -696,6 +704,12 @@ mod tests {
         // The plain case the review found: a short folder with a 241-unit inner path.
         assert!(inner(40, 10, 241));
         assert!(!path_too_long(40, 10, None));
+        // Through `decide`: an inner path too long for the bin is its own lock.
+        let i = Inputs {
+            inner_suffix: Some(241),
+            ..ok_inputs()
+        };
+        assert_eq!(decide(&i), LONG);
     }
 
     #[test]
@@ -715,12 +729,12 @@ mod tests {
             volume_root_ok: false,
             ..ok_inputs()
         };
-        assert_eq!(decide(&i), NO);
+        assert_eq!(decide(&i), ODD);
         let i = Inputs {
             same_root: false,
             ..ok_inputs()
         };
-        assert_eq!(decide(&i), NO);
+        assert_eq!(decide(&i), ODD);
         assert!(same_drive(r"X:\a\b", r"x:\other\b"));
         assert!(!same_drive(r"X:\a", r"d:\a"));
         assert!(!same_drive(r"\\server\share", r"c:\a"));
