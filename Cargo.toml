@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/seek-core", "crates/seek-scan", "crates/seek-ipc", "crates/seek-service", "crates/seek-cli", "crates/seek-sync", "crates/seek-hub", "app/src-tauri"]
+members = ["crates/seek-core", "crates/seek-scan", "crates/seek-ipc", "crates/seek-service", "crates/seek-cli", "crates/seek-sync", "crates/seek-hub", "crates/seek-clean", "app/src-tauri"]
 
 [workspace.package]
 version = "0.1.0"
@@ -14,6 +14,9 @@ seek-scan = { path = "crates/seek-scan" }
 seek-ipc = { path = "crates/seek-ipc" }
 seek-sync = { path = "crates/seek-sync" }
 seek-hub = { path = "crates/seek-hub" }
+seek-clean = { path = "crates/seek-clean" }
+windows = "0.62"
+blake3 = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4", "serde"] }

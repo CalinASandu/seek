@@ -3578,6 +3578,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "seek-clean"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+ "windows",
+ "windows-core",
+]
+
+[[package]]
 name = "seek-cli"
 version = "0.1.0"
 dependencies = [
