@@ -17,7 +17,8 @@ use tokio::net::windows::named_pipe::NamedPipeServer;
 
 const ENTRIES: u64 = 1000;
 
-fn entries() -> Vec<RawEntry> {
+/// `size_mod` > 0 makes file sizes repeat: size = id % size_mod (instead of every size being unique).
+fn entries_sized(size_mod: u64) -> Vec<RawEntry> {
     (1..=ENTRIES)
         .map(|id| {
             let dir = id <= 10;
@@ -29,7 +30,11 @@ fn entries() -> Vec<RawEntry> {
                 } else {
                     format!("file{id}.txt")
                 },
-                size: if dir { 0 } else { id },
+                size: match (dir, size_mod) {
+                    (true, _) => 0,
+                    (false, 0) => id,
+                    (false, m) => id % m,
+                },
                 modified: 1_700_000_000_000,
                 created: 1_700_000_000_000,
                 attrs: if dir { ATTR_DIRECTORY } else { 0 },
@@ -67,6 +72,8 @@ struct Fake {
     /// Every client is this non-elevated user unless `elevated`; `profiles` = (SID, folder).
     elevated: Mutex<bool>,
     profiles: Mutex<Vec<(String, String)>>,
+    /// See `entries_sized`.
+    size_mod: Mutex<u64>,
 }
 
 const ME: &str = "S-1-5-21-me";
@@ -83,7 +90,7 @@ impl VolumeSource for Fake {
         *self.scans.lock().unwrap() += 1;
         progress(ENTRIES);
         Ok(ScanResult {
-            index: DeviceIndex::from_raw(0, entries()),
+            index: DeviceIndex::from_raw(0, entries_sized(*self.size_mod.lock().unwrap())),
             checkpoint: None,
             skipped: 0,
         })
@@ -1018,6 +1025,205 @@ async fn space_view_hides_other_users_folders() {
     let root = node(space_tree(&mut admin, id, "T:\\", 1).await);
     assert!(root.children.iter().any(|n| n.name == "folder2"));
     assert!(!root.children.iter().any(|n| n.kind == seek_core::SpaceKind::Hidden));
+
+    let _ = svc.stop.send(true);
+    svc.task.await.unwrap().unwrap();
+}
+
+async fn same_size(
+    c: &mut Client,
+    device_ids: &[seek_core::DeviceId],
+    min_size: u64,
+    cursor: Option<u64>,
+    limit: u32,
+) -> (Vec<seek_ipc::SizeGroup>, Option<u64>) {
+    match c
+        .request(Request::SameSizeFiles { min_size, device_ids: device_ids.to_vec(), cursor, limit })
+        .await
+        .unwrap()
+    {
+        Response::SameSizeFiles { groups, next } => (groups, next),
+        other => panic!("expected SameSizeFiles, got {other:?}"),
+    }
+}
+
+/// Every page of a query, following `next`; also checks each page against the paging rules.
+async fn same_size_all(
+    c: &mut Client,
+    ids: &[seek_core::DeviceId],
+    min_size: u64,
+    limit: u32,
+) -> Vec<seek_ipc::SizeGroup> {
+    let (mut all, mut cursor) = (Vec::new(), None);
+    for _ in 0..2000 {
+        let (groups, next) = same_size(c, ids, min_size, cursor, limit).await;
+        assert!(!groups.is_empty(), "a page always holds a group");
+        let files: usize = groups.iter().map(|g| g.files.len()).sum();
+        assert!(files <= limit.max(1) as usize || groups.len() == 1, "{files} files > limit {limit}");
+        if let (Some(n), Some(last)) = (next, groups.last()) {
+            assert!(n < last.size, "the cursor moves down");
+        }
+        all.extend(groups);
+        match next {
+            Some(n) => cursor = Some(n),
+            None => return all,
+        }
+    }
+    panic!("paging never finished");
+}
+
+fn file_number(row: &seek_core::ResultRow) -> u64 {
+    row.name.trim_start_matches("file").trim_end_matches(".txt").parse().unwrap()
+}
+
+// With size_mod 100, file ids s, s+100, … share size s: sizes 1..=10 hold 9 files (ids 1..=10 are
+// folders), sizes 11..=99 hold 10. Size 0 (ids 100, 200, …) is left out by min_size 1.
+const SAME_SIZE_FILES: usize = 10 * 9 + 89 * 10;
+
+#[tokio::test(flavor = "multi_thread")]
+async fn same_size_files_pages_through_every_group() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = Arc::new(Fake::default());
+    *fake.size_mod.lock().unwrap() = 100;
+    fake.vols.lock().unwrap().push(volume());
+    let svc = start(dir.path(), fake.clone()).await;
+    let mut c = connect(&svc.pipe).await;
+    wait_for(&mut c, "device scanned", scanned_online).await;
+    let id = device_id(&mut c).await;
+
+    let all = same_size_all(&mut c, &[id], 1, 25).await;
+    let sizes: Vec<u64> = all.iter().map(|g| g.size).collect();
+    assert_eq!(sizes, (1..=99).rev().collect::<Vec<u64>>());
+    assert_eq!(all.iter().map(|g| g.files.len()).sum::<usize>(), SAME_SIZE_FILES);
+    for g in &all {
+        assert_eq!(g.files.len(), if g.size <= 10 { 9 } else { 10 }, "size {}", g.size);
+        assert!(g.files.iter().all(|f| f.size == g.size && !f.is_dir && f.device_id == id));
+        let nums: Vec<u64> = g.files.iter().map(file_number).collect();
+        assert!(nums.windows(2).all(|w| w[0] < w[1]), "rows in order: {nums:?}");
+    }
+    assert_eq!(all[0].files[0].full_path, r"T:\folder10\file99.txt");
+
+    // a group alone can be bigger than the limit: one group per page then
+    let one = same_size_all(&mut c, &[id], 1, 1).await;
+    assert_eq!(one, all);
+    let (page, next) = same_size(&mut c, &[id], 1, Some(50), 0).await;
+    assert_eq!((page.len(), page[0].size, next), (1, 50, Some(49)));
+    let (page, next) = same_size(&mut c, &[id], 1, Some(1), 1000).await;
+    assert_eq!((page.len(), page[0].size, next), (1, 1, None));
+    // the minimum is inclusive, and a page past the end is empty
+    let (page, next) = same_size(&mut c, &[id], 99, None, 1000).await;
+    assert_eq!((page.len(), next), (1, None));
+    assert_eq!(same_size(&mut c, &[id], 100, None, 1000).await, (vec![], None));
+    assert_eq!(same_size(&mut c, &[id], 1, Some(0), 10).await, (vec![], None));
+
+    let _ = svc.stop.send(true);
+    svc.task.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn same_size_files_survives_an_idle_unload_between_pages() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = Arc::new(Fake::default());
+    *fake.size_mod.lock().unwrap() = 100;
+    fake.vols.lock().unwrap().push(volume());
+    let svc = start_idle(dir.path(), fake.clone(), Some(Duration::from_millis(1))).await;
+    let mut c = connect(&svc.pipe).await;
+    wait_for(&mut c, "device scanned", scanned_online).await;
+    let id = device_id(&mut c).await;
+
+    let (first, next) = same_size(&mut c, &[id], 1, None, 25).await;
+    let next = next.expect("more pages");
+
+    // wait until the index is gone (a stored search disappears with it)
+    let (search_id, _) = total(search(&mut c, "file").await);
+    let mut gone = false;
+    for _ in 0..240 {
+        if let Response::Error { .. } = c.request(Request::FetchRows { search_id, offset: 0, limit: 1 }).await.unwrap() {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(gone, "the index was never unloaded");
+
+    let (second, _) = same_size(&mut c, &[id], 1, Some(next), 25).await;
+    assert_eq!(second[0].size, next);
+    assert!(second[0].size < first.last().unwrap().size);
+    let all = same_size_all(&mut c, &[id], 1, 25).await;
+    assert_eq!(all.len(), 99);
+
+    let _ = svc.stop.send(true);
+    svc.task.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn same_size_files_hides_other_users_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = Arc::new(Fake::default());
+    *fake.size_mod.lock().unwrap() = 100;
+    fake.vols.lock().unwrap().push(volume());
+    *fake.profiles.lock().unwrap() = vec![(ME.into(), r"T:\folder1".into()), ("S-1-5-21-bob".into(), r"T:\FOLDER2\".into())];
+    let svc = start(dir.path(), fake.clone()).await;
+    let mut c = connect(&svc.pipe).await;
+    wait_for(&mut c, "device scanned", scanned_online).await;
+    let id = device_id(&mut c).await;
+
+    // folder2 holds every file whose id ends in 1, so the sizes ending in 1 vanish entirely
+    let all = same_size_all(&mut c, &[id], 1, 1000).await;
+    assert_eq!(all.len(), 99 - 10);
+    assert!(all.iter().all(|g| g.size % 10 != 1));
+    assert!(all.iter().flat_map(|g| &g.files).all(|f| !f.folder.to_lowercase().ends_with("folder2")));
+
+    *fake.elevated.lock().unwrap() = true;
+    let mut admin = connect(&svc.pipe).await;
+    let all = same_size_all(&mut admin, &[id], 1, 1000).await;
+    assert_eq!(all.len(), 99);
+    assert_eq!(all.iter().map(|g| g.files.len()).sum::<usize>(), SAME_SIZE_FILES);
+
+    let _ = svc.stop.send(true);
+    svc.task.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn same_size_counts_across_two_drives() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = Arc::new(Fake::default());
+    let mut second = volume();
+    second.mount_point = "U:\\".into();
+    second.label = "OTHERSTICK".into();
+    second.identity = DeviceIdentity::Volume { serial: 0xBEEF, filesystem: "exFAT".into() };
+    fake.vols.lock().unwrap().extend([volume(), second]);
+    let svc = start(dir.path(), fake.clone()).await;
+    let mut c = connect(&svc.pipe).await;
+    wait_for(&mut c, "both scanned", |ds| {
+        ds.len() == 2 && ds.iter().all(|d| d.state == DeviceState::Online && d.entry_count == ENTRIES)
+    })
+    .await;
+    let Response::Devices { devices } = c.request(Request::ListDevices).await.unwrap() else { panic!() };
+    let mut ids: Vec<_> = devices.iter().map(|d| d.id).collect();
+    ids.sort();
+
+    // every size is unique inside a drive, so only the two drives together make groups
+    assert_eq!(same_size(&mut c, &ids[..1], 1, None, 100).await, (vec![], None));
+    assert_eq!(same_size(&mut c, &ids[1..], 1, None, 100).await, (vec![], None));
+    let all = same_size_all(&mut c, &ids, 1, 100).await;
+    assert_eq!(all.len(), 990);
+    assert_eq!(all[0].size, 1000);
+    assert_eq!(all.last().unwrap().size, 11);
+    for g in &all {
+        assert_eq!(g.files.len(), 2);
+        assert_eq!((g.files[0].device_id, g.files[1].device_id), (ids[0], ids[1]), "ordered by device");
+        assert!(g.files.iter().all(|f| f.size == g.size));
+    }
+
+    // no drives chosen means no groups; unknown ids are skipped
+    assert_eq!(same_size(&mut c, &[], 1, None, 100).await, (vec![], None));
+    assert_eq!(same_size(&mut c, &[uuid::Uuid::new_v4()], 1, None, 100).await, (vec![], None));
+    let with_unknown = [ids[0], uuid::Uuid::new_v4(), ids[1]];
+    let (page, next) = same_size(&mut c, &with_unknown, 996, None, 100).await;
+    assert_eq!((page.len(), next), (5, None));
+    let (page, next) = same_size(&mut c, &ids, 1, None, 10).await;
+    assert_eq!((page.len(), next), (5, Some(995)));
 
     let _ = svc.stop.send(true);
     svc.task.await.unwrap().unwrap();
