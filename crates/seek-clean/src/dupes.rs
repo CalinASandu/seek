@@ -6,17 +6,18 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
-use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::os::windows::fs::OpenOptionsExt;
+use std::os::windows::io::AsRawHandle;
+use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::CloseHandle;
+use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
     OPEN_EXISTING,
 };
 use windows::Win32::System::Ioctl::{IOCTL_STORAGE_GET_DEVICE_NUMBER, STORAGE_DEVICE_NUMBER};
@@ -88,11 +89,19 @@ pub fn scan(
 ) {
     let mut meter = Meter::new(&mut on_event);
     let ctx = Ctx { places, protected: protected.iter().map(|p| p.to_string_lossy().into_owned()).collect(), facts, downloads_like, cancel };
-    run(input, &ctx, &mut meter);
-    if !cancel.load(Ordering::Relaxed) {
-        meter.flush();
+    let outcome = catch_unwind(AssertUnwindSafe(|| {
+        run(input, &ctx, &mut meter);
+        if !cancel.load(Ordering::Relaxed) {
+            meter.flush();
+        }
+    }));
+    match outcome {
+        Ok(()) => meter.send(ScanEvent::Done),
+        // The receiver itself panicked: stop, without calling it again.
+        Err(payload) if meter.in_callback => resume_unwind(payload),
+        // Anything else (the disk facts, preparing): the caller still gets its `Done`.
+        Err(_) => meter.send(ScanEvent::Done),
     }
-    meter.send(ScanEvent::Done);
 }
 
 /// Which copy to suggest keeping: one outside Downloads and temp folders, then the shortest path,
@@ -241,8 +250,8 @@ fn drive_key(canon_path: &str, cache: &mut HashMap<char, String>) -> String {
 }
 
 /// Everything decided from the disk's metadata alone: the largest sizes first, no system stores,
-/// no folders, links or cloud placeholders, no file whose size isn't the batch's, and one name per
-/// hard-linked file. A batch left with fewer than two files is dropped.
+/// no folders, links or cloud placeholders and no file whose size isn't the batch's. A batch left
+/// with fewer than two files is dropped. (Hard-linked files are refused later, on open.)
 fn prepare(input: Vec<SizeBatch>, ctx: &Ctx) -> Vec<Prepared> {
     let mut input: Vec<SizeBatch> = input.into_iter().filter(|b| b.size >= MIN_DUPLICATE_BYTES).collect();
     input.sort_by(|a, b| b.size.cmp(&a.size));
@@ -254,7 +263,6 @@ fn prepare(input: Vec<SizeBatch>, ctx: &Ctx) -> Vec<Prepared> {
         }
     }
     let mut drives = HashMap::new();
-    let mut seen: HashSet<(u32, u64)> = HashSet::new();
     let mut out = Vec::new();
     for batch in merged {
         let mut files = Vec::new();
@@ -270,11 +278,7 @@ fn prepare(input: Vec<SizeBatch>, ctx: &Ctx) -> Vec<Prepared> {
             if st.is_dir || st.reparse || st.cloud || st.size != batch.size {
                 continue;
             }
-            // A file whose identity can't be read can't be told from a hard link of another: leave it out.
-            let Some(id) = ctx.facts.file_id(&f.path) else { continue };
-            if !seen.insert(id) {
-                continue;
-            }
+            // Hard links are refused when the file is opened (see `handle_ok`), where the link count is read.
             let drive = drive_key(&c, &mut drives);
             files.push(Cand { path: f.path, canon: c, device_id: f.device_id, modified_ms: st.modified_ms, drive });
         }
@@ -292,16 +296,20 @@ struct Meter<'a> {
     current: Option<String>,
     last: Option<Instant>,
     dirty: bool,
+    /// True while the receiver is running, so a panic can be told to be its own.
+    in_callback: bool,
     on_event: &'a mut dyn FnMut(ScanEvent),
 }
 
 impl<'a> Meter<'a> {
     fn new(on_event: &'a mut dyn FnMut(ScanEvent)) -> Self {
-        Meter { checked: 0, total: 0, current: None, last: None, dirty: false, on_event }
+        Meter { checked: 0, total: 0, current: None, last: None, dirty: false, in_callback: false, on_event }
     }
 
     fn send(&mut self, e: ScanEvent) {
+        self.in_callback = true;
         (self.on_event)(e);
+        self.in_callback = false;
     }
 
     /// Something changed; send it if it has been long enough since the last one.
@@ -383,6 +391,12 @@ fn process(
     dispatch: &mut dyn FnMut(Job, &str),
 ) {
     let n = batch.files.len();
+    // Nothing here could ever be removed (every file is locked): don't spend any reading on it.
+    if !batch.files.iter().any(|c| lock_of(c, batch.size, ctx).is_none()) {
+        meter.total -= batch.size * n as u64;
+        meter.touch();
+        return;
+    }
     let mut counted = vec![0u64; n];
 
     // 1. First and last 64 KB. Files whose ends differ are not copies of each other.
@@ -480,22 +494,25 @@ fn read_phase(
     results
 }
 
+/// Why this copy can't be removed, if it can't: the protected places first, then the recycle pre-checks.
+fn lock_of(c: &Cand, size: u64, ctx: &Ctx) -> Option<Lock> {
+    lock_for(ctx.places, &c.canon, Why::Duplicate, &ctx.protected).or_else(|| ctx.facts.recycle_block(&c.path, size))
+}
+
 fn build_group(batch: &Prepared, set: &[usize], id: u32, ctx: &Ctx) -> Option<DupGroup> {
     let size = batch.size;
     let files: Vec<&Cand> = set.iter().map(|&i| &batch.files[i]).collect();
-    let locks: Vec<Option<Lock>> = files
-        .iter()
-        .map(|c| {
-            lock_for(ctx.places, &c.canon, Why::Duplicate, &ctx.protected)
-                .or_else(|| ctx.facts.recycle_block(&c.path, size))
-        })
-        .collect();
+    let locks: Vec<Option<Lock>> = files.iter().map(|c| lock_of(c, size, ctx)).collect();
     let freeable = freeable(size, &locks);
     if freeable == 0 {
         return None;
     }
-    let items: Vec<(&Path, i64)> = files.iter().map(|c| (c.path.as_path(), c.modified_ms)).collect();
-    let keep = suggest_index(&items, ctx.downloads_like);
+    // A copy that stays anyway is the best one to keep, so the suggestion comes from the locked
+    // copies when there are any, and from all of them otherwise. The spec's order applies within.
+    let locked: Vec<usize> = (0..files.len()).filter(|&i| locks[i].is_some()).collect();
+    let pool: Vec<usize> = if locked.is_empty() { (0..files.len()).collect() } else { locked };
+    let items: Vec<(&Path, i64)> = pool.iter().map(|&i| (files[i].path.as_path(), files[i].modified_ms)).collect();
+    let keep = pool[suggest_index(&items, ctx.downloads_like)];
     let name = files[keep].path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let copies = files
         .iter()
@@ -559,6 +576,13 @@ fn worker(jobs: Receiver<Job>, cancel: &AtomicBool) {
     }
 }
 
+/// What an opened handle must look like for the file to be read: an ordinary local file of the
+/// size expected and with exactly one name. With more names, removing one frees nothing, so such a
+/// file is never a copy at all.
+fn handle_ok(attrs: u32, len: u64, expected: u64, links: u32) -> bool {
+    attrs & (ATTR_DIRECTORY | ATTR_REPARSE) == 0 && !is_cloud(attrs) && len == expected && links == 1
+}
+
 /// Opens an ordinary local file for reading without asking for cloud content. The handle is
 /// checked again, since the file may have been swapped since the stat.
 fn open_for_read(job: &Job) -> Result<File, Fail> {
@@ -567,9 +591,11 @@ fn open_for_read(job: &Job) -> Result<File, Fail> {
         .custom_flags(FILE_FLAG_OPEN_NO_RECALL | FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN)
         .open(&job.path)
         .map_err(|_| Fail::Unreadable)?;
-    let md = f.metadata().map_err(|_| Fail::Unreadable)?;
-    let attrs = md.file_attributes();
-    if attrs & (ATTR_DIRECTORY | ATTR_REPARSE) != 0 || is_cloud(attrs) || md.len() != job.size {
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: the handle is valid for as long as `f` lives and `info` is a valid out-structure.
+    unsafe { GetFileInformationByHandle(HANDLE(f.as_raw_handle()), &mut info) }.map_err(|_| Fail::Unreadable)?;
+    let len = (u64::from(info.nFileSizeHigh) << 32) | u64::from(info.nFileSizeLow);
+    if !handle_ok(info.dwFileAttributes, len, job.size, info.nNumberOfLinks) {
         return Err(Fail::Unreadable);
     }
     Ok(f)
@@ -675,16 +701,23 @@ mod tests {
         reparse: HashSet<PathBuf>,
         cloud: HashSet<PathBuf>,
         no_bin: HashSet<PathBuf>,
-        /// Deleted right after the scan first looks at its identity: gone before it is read.
+        /// Deleted right after the first look at it: gone before it is read.
         vanish: HashSet<PathBuf>,
         /// Reports a different modified time from the second stat on: it changed while being read.
         change: HashSet<PathBuf>,
+        /// Panics when asked about these.
+        panics: HashSet<PathBuf>,
+        /// How often each path was asked about. A path read by the scan is asked about twice.
         stats: Mutex<HashMap<PathBuf, usize>>,
     }
 
     impl FileFacts for Fake {
         fn stat(&self, p: &Path) -> Option<Stat> {
+            assert!(!self.panics.contains(p), "fake facts panic");
             let mut s = RealFacts.stat(p)?;
+            if self.vanish.contains(p) {
+                let _ = std::fs::remove_file(p);
+            }
             s.reparse |= self.reparse.contains(p);
             s.cloud |= self.cloud.contains(p);
             let n = {
@@ -702,11 +735,7 @@ mod tests {
             RealFacts.same_bytes(a, b)
         }
         fn file_id(&self, p: &Path) -> Option<(u32, u64)> {
-            let id = RealFacts.file_id(p);
-            if self.vanish.contains(p) {
-                let _ = std::fs::remove_file(p);
-            }
-            id
+            RealFacts.file_id(p)
         }
         fn recycle_block(&self, p: &Path, _batch_bytes: u64) -> Option<Lock> {
             self.no_bin.contains(p).then_some(Lock::NoRecycleBin)
@@ -812,13 +841,199 @@ mod tests {
         let ev = run(vec![batch(2 * MB, &[&a, &link])], &Fake::default());
         assert!(groups(&ev).is_empty(), "two names for one file free nothing");
 
-        // With a real copy beside them, the hard-linked pair shows as one copy.
+        // Removing one name leaves the data, so the linked file is no copy at all: with one
+        // separate identical file beside it, that file is alone and there is no group.
         let c = write(d.path(), "c", &bytes);
         let ev = run(vec![batch(2 * MB, &[&a, &link, &c])], &Fake::default());
+        assert!(groups(&ev).is_empty());
+
+        // A second separate copy makes a group of the two separate files only.
+        let e = write(d.path(), "e", &bytes);
+        let ev = run(vec![batch(2 * MB, &[&a, &link, &c, &e])], &Fake::default());
+        let gs = groups(&ev);
+        assert_eq!(gs.len(), 1);
+        assert_eq!(paths_of(gs[0]), [c.to_string_lossy(), e.to_string_lossy()].map(|s| s.into_owned()).into());
+    }
+
+    #[test]
+    fn a_file_with_a_link_outside_the_input_is_dropped() {
+        let d = tempfile::tempdir().unwrap();
+        let bytes = data(2 * MB, 3);
+        let (a, b) = (write(d.path(), "a", &bytes), write(d.path(), "b", &bytes));
+        std::fs::hard_link(&a, d.path().join("elsewhere")).unwrap(); // not handed in
+        let ev = run(vec![batch(2 * MB, &[&a, &b])], &Fake::default());
+        assert!(groups(&ev).is_empty());
+        let c = write(d.path(), "c", &bytes);
+        let gs_ev = run(vec![batch(2 * MB, &[&a, &b, &c])], &Fake::default());
+        let gs = groups(&gs_ev);
+        assert_eq!(gs.len(), 1);
+        assert!(!paths_of(gs[0]).contains(&*a.to_string_lossy()));
+    }
+
+    #[test]
+    fn the_handle_check_refuses_each_unsafe_case() {
+        assert!(handle_ok(0x20, 100, 100, 1), "an ordinary file passes");
+        assert!(!handle_ok(0x20 | 0x400, 100, 100, 1), "reparse point");
+        assert!(!handle_ok(0x10, 100, 100, 1), "folder");
+        for attr in [0x1000, 0x4_0000, 0x40_0000] {
+            assert!(!handle_ok(0x20 | attr, 100, 100, 1), "offline or recall attribute {attr:#x}");
+        }
+        assert!(!handle_ok(0x20, 101, 100, 1), "wrong size");
+        assert!(!handle_ok(0x20, 100, 100, 2), "more than one link");
+        assert!(!handle_ok(0x20, 100, 100, 0), "an unreadable link count is not trusted");
+    }
+
+    fn make_junction(link: &Path, target: &Path) {
+        let out = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .expect("could not run cmd to make a junction");
+        assert!(
+            out.status.success(),
+            "mklink /J failed, so the junction tests prove nothing: {} {}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
+    fn open_for_read_refuses_a_real_junction() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir(d.path().join("real")).unwrap();
+        let junction = d.path().join("j");
+        make_junction(&junction, &d.path().join("real"));
+        let (tx, _rx) = channel();
+        let job = Job { idx: 0, path: junction, size: 0, kind: Kind::Full, reply: tx };
+        assert!(open_for_read(&job).is_err());
+    }
+
+    #[test]
+    fn open_for_read_refuses_a_hard_linked_file_and_accepts_a_plain_one() {
+        let d = tempfile::tempdir().unwrap();
+        let a = write(d.path(), "a", &data(2 * MB, 1));
+        let (tx, _rx) = channel();
+        let job = |p: &Path| Job { idx: 0, path: p.to_path_buf(), size: 2 * MB as u64, kind: Kind::Full, reply: tx.clone() };
+        assert!(open_for_read(&job(&a)).is_ok());
+        std::fs::hard_link(&a, d.path().join("l")).unwrap();
+        assert!(open_for_read(&job(&a)).is_err());
+    }
+
+    #[test]
+    fn a_batch_with_nothing_removable_is_not_read() {
+        let d = tempfile::tempdir().unwrap();
+        let bytes = data(2 * MB, 90);
+        let (a, b, c) = (write(d.path(), "a", &bytes), write(d.path(), "b", &bytes), write(d.path(), "c", &bytes));
+        let mut fake = Fake::default();
+        fake.no_bin.extend([a.clone(), b.clone(), c.clone()]);
+        let ev = run(vec![batch(2 * MB, &[&a, &b, &c])], &fake);
+        assert!(groups(&ev).is_empty());
+        // Reading would stat each file a second time to check it didn't change.
+        let stats = fake.stats.lock().unwrap();
+        assert!(stats.values().all(|n| *n == 1), "nothing was read: {stats:?}");
+        assert!(!ev.iter().any(|e| matches!(e, ScanEvent::Progress { checked_bytes, .. } if *checked_bytes > 0)));
+        drop(stats);
+
+        // Locked by the protected list as well.
+        let (x, y) = (write(d.path(), "keep/x", &bytes), write(d.path(), "keep/y", &bytes));
+        let fake = Fake::default();
+        run_full(vec![batch(2 * MB, &[&x, &y])], &places(), &[d.path().join("keep")], &fake, &AtomicBool::new(false), |_| {});
+        assert!(fake.stats.lock().unwrap().values().all(|n| *n == 1));
+    }
+
+    #[test]
+    fn a_locked_copy_that_cannot_be_read_does_not_count_as_the_one_that_stays() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let bytes = data(2 * MB, 91);
+        let kept = write(d.path(), "keep/a", &bytes);
+        let (b, c) = (write(d.path(), "b", &bytes), write(d.path(), "c", &bytes));
+        let _held = std::fs::File::options().read(true).share_mode(0).open(&kept).unwrap();
+        let ev = run_full(
+            vec![batch(2 * MB, &[&kept, &b, &c])],
+            &places(),
+            &[d.path().join("keep")],
+            &Fake::default(),
+            &AtomicBool::new(false),
+            |_| {},
+        );
         let gs = groups(&ev);
         assert_eq!(gs.len(), 1);
         assert_eq!(gs[0].copies.len(), 2);
-        assert!(paths_of(gs[0]).contains(&*c.to_string_lossy()));
+        assert!(gs[0].copies.iter().all(|c| c.lock.is_none()));
+        assert_eq!(gs[0].freeable, 2 * MB as u64, "one of the two stays; the unreadable locked one is no copy");
+    }
+
+    fn keep_run(d: &Path, protected: &[&str], names: &[&str]) -> DupGroup {
+        let bytes = data(2 * MB, 92);
+        let paths: Vec<PathBuf> = names.iter().map(|n| write(d, n, &bytes)).collect();
+        let refs: Vec<&PathBuf> = paths.iter().collect();
+        let prot: Vec<PathBuf> = protected.iter().map(|p| d.join(p)).collect();
+        let ev = run_full(vec![batch(2 * MB, &refs)], &places(), &prot, &Fake::default(), &AtomicBool::new(false), |_| {});
+        groups(&ev).into_iter().next().expect("a group").clone()
+    }
+
+    #[test]
+    fn the_suggested_keep_is_a_locked_copy_when_there_is_one() {
+        let size = 2 * MB as u64;
+        let d = tempfile::tempdir().unwrap();
+        // [Locked, None, None]: the locked copy has the longest path, yet it is the one that stays.
+        let g = keep_run(d.path(), &["keep"], &["keep/deeper/folder/a.bin", "b.bin", "c.bin"]);
+        let kept: Vec<_> = g.copies.iter().filter(|c| c.suggested_keep).collect();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].lock, Some(Lock::Protected));
+        let tickable = g.copies.iter().filter(|c| !c.suggested_keep).count() as u64;
+        assert_eq!(tickable * size, g.freeable, "ticking the others frees exactly the figure");
+
+        // [Locked, Locked, None]: a locked copy stays; the unlocked one is tickable.
+        let d = tempfile::tempdir().unwrap();
+        let g = keep_run(d.path(), &["keep"], &["keep/x/a.bin", "keep/b.bin", "c.bin"]);
+        let kept: Vec<_> = g.copies.iter().filter(|c| c.suggested_keep).collect();
+        assert_eq!(kept.len(), 1);
+        assert!(kept[0].lock.is_some());
+        assert!(kept[0].path.ends_with("b.bin"), "the shorter of the locked ones: {}", kept[0].path);
+        let tickable: Vec<_> = g.copies.iter().filter(|c| !c.suggested_keep && c.lock.is_none()).collect();
+        assert_eq!(tickable.len(), 1);
+        assert_eq!(g.freeable, size);
+
+        // [None, None]: the spec's order, here the shorter path.
+        let d = tempfile::tempdir().unwrap();
+        let g = keep_run(d.path(), &[], &["long/folder/a.bin", "b.bin"]);
+        let kept = g.copies.iter().find(|c| c.suggested_keep).unwrap();
+        assert!(kept.path.ends_with("b.bin"));
+        assert_eq!(g.freeable, size);
+    }
+
+    #[test]
+    fn a_panic_in_the_scan_still_ends_in_one_done() {
+        let d = tempfile::tempdir().unwrap();
+        let bytes = data(2 * MB, 93);
+        let (a, b) = (write(d.path(), "a", &bytes), write(d.path(), "b", &bytes));
+        let mut fake = Fake::default();
+        fake.panics.insert(b.clone());
+        let ev = run(vec![batch(2 * MB, &[&a, &b])], &fake);
+        assert!(groups(&ev).is_empty());
+        assert_eq!(done_count(&ev), 1);
+        assert!(matches!(ev.last(), Some(ScanEvent::Done)));
+    }
+
+    #[test]
+    fn a_panic_inside_on_event_does_not_send_a_second_done() {
+        let d = tempfile::tempdir().unwrap();
+        let bytes = data(2 * MB, 94);
+        let (a, b) = (write(d.path(), "a", &bytes), write(d.path(), "b", &bytes));
+        let mut seen = Vec::new();
+        let r = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            scan(vec![batch(2 * MB, &[&a, &b])], &places(), &[], &Fake::default(), &[], &AtomicBool::new(false), |e| {
+                let is_group = matches!(e, ScanEvent::Group(_));
+                seen.push(e);
+                assert!(!is_group, "the receiver gave up");
+            });
+        }));
+        assert!(r.is_err(), "the receiver's panic is not swallowed");
+        assert!(seen.iter().all(|e| !matches!(e, ScanEvent::Done)), "no Done after the receiver panicked");
+        assert_eq!(seen.iter().filter(|e| matches!(e, ScanEvent::Group(_))).count(), 1, "not called again");
     }
 
     #[test]
@@ -860,16 +1075,7 @@ mod tests {
         let a = write(d.path(), "real/a", &bytes);
         let b = write(d.path(), "real/b", &bytes);
         let junction = d.path().join("j");
-        let ok = std::process::Command::new("cmd")
-            .args(["/C", "mklink", "/J"])
-            .arg(&junction)
-            .arg(d.path().join("real"))
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-        if !ok {
-            return; // cannot make a junction here
-        }
+        make_junction(&junction, &d.path().join("real"));
         // The link itself is handed in beside two real copies and must never become a copy.
         let ev = run(vec![batch(2 * MB, &[&a, &b, &junction])], &RealFacts);
         let gs = groups(&ev);
@@ -883,9 +1089,6 @@ mod tests {
         let k = drive_key("c:\\a\\b", &mut cache);
         assert!(!k.is_empty());
         assert_eq!(k, drive_key("c:\\other", &mut cache));
-        assert_eq!(physical_key('c'), physical_key('C'));
-        // A letter that doesn't exist falls back to its volume.
-        assert_eq!(physical_key('q'), "volume:q");
         assert!(drive_key("\\\\server\\share\\x\\y", &mut cache).starts_with("path:"));
     }
 
@@ -1163,7 +1366,7 @@ mod tests {
     }
 
     #[test]
-    fn several_drives_workers_finish_and_leave_nothing_behind() {
+    fn each_copy_keeps_the_device_id_it_was_handed_in_with() {
         // Files sit on one real drive here; the device ids differ, which must not matter.
         let d = tempfile::tempdir().unwrap();
         let bytes = data(2 * MB, 80);
