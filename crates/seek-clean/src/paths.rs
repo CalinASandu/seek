@@ -24,6 +24,13 @@ pub fn canon(p: &Path) -> String {
     expanded.to_lowercase()
 }
 
+/// Like `canon` but never touches the disk: 8.3 short names stay as written. For callers that
+/// must not wait on a drive that may be gone.
+pub fn canon_lexical(p: &Path) -> String {
+    let raw = p.to_string_lossy().replace('/', "\\");
+    lexical(&strip_verbatim(&raw)).to_lowercase()
+}
+
 /// True if `child` is `parent` or lies under it, compared by whole segments. Both must already
 /// be in `canon` form. `c:\program files extra` is not inside `c:\program files`.
 pub fn is_inside(child: &str, parent: &str) -> bool {

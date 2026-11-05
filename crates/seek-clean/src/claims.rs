@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::facts::ClaimCheck;
-use crate::paths::{canon, is_inside};
+use crate::paths::{canon, canon_lexical, is_inside};
 
 /// Folders that belong to Windows or are shared by everything, matched on the folder's own name,
 /// case-insensitively. One table, with its own tests. No third-party vendor belongs here: an
@@ -32,6 +32,17 @@ pub const ALWAYS_CLAIMED: &[&str] = &[
     "Temp",
     "Seek-dev",
     "Seek",
+    ".IdentityService",
+    "VirtualStore",
+    "PlaceholderTileLogoFolder",
+    "PeerDistRepub",
+    "ToastNotificationManagerCompat",
+    "Windows Kits",
+    "Windows Sidebar",
+    "Windows Multimedia Platform",
+    "Uninstall Information",
+    "wsl",
+    "ASP.NET",
     // The Seek window's own data folder (the Tauri identifier), and the one an older build used.
     "com.calinsandrei.seek",
     "dev.seek.app",
@@ -83,6 +94,16 @@ pub struct NameClaim {
     pub source: &'static str,
 }
 
+/// A program's own name (the file name of its exe without `.exe`). Apps keep their data in a
+/// folder of that name whatever their registered display name says.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProgramName {
+    /// Lowercase.
+    pub stem: String,
+    pub who: String,
+    pub source: &'static str,
+}
+
 /// Items that could not be read, one count per source. Being refused a process of another user
 /// or an elevated one is normal.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -97,6 +118,7 @@ pub struct Skipped {
 pub struct ClaimParts {
     pub paths: Vec<PathClaim>,
     pub names: Vec<NameClaim>,
+    pub program_names: Vec<ProgramName>,
     /// Places so wide that a claim at or above one of them says nothing about its folders.
     pub broad_roots: Vec<String>,
     /// Sources that could not be listed at all. Any entry claims every folder.
@@ -108,6 +130,7 @@ impl ClaimParts {
     pub(crate) fn merge(mut self, other: ClaimParts) -> ClaimParts {
         self.paths.extend(other.paths);
         self.names.extend(other.names);
+        self.program_names.extend(other.program_names);
         self.broad_roots.extend(other.broad_roots);
         self.failed.extend(other.failed);
         self.skipped.processes += other.skipped.processes;
@@ -139,6 +162,7 @@ struct IndexedPath {
 pub struct SystemClaims {
     paths: Vec<IndexedPath>,
     names: Vec<NameClaim>,
+    program_names: Vec<ProgramName>,
     failed: Vec<String>,
     counts: BTreeMap<&'static str, usize>,
     pub skipped: Skipped,
@@ -146,13 +170,13 @@ pub struct SystemClaims {
 
 impl SystemClaims {
     pub fn from_parts(parts: ClaimParts) -> SystemClaims {
-        let broad_roots: Vec<String> = parts.broad_roots.iter().map(|r| canon(Path::new(r))).collect();
+        let broad_roots: Vec<String> = parts.broad_roots.iter().map(|r| canon_lexical(Path::new(r))).collect();
         let mut counts: BTreeMap<&'static str, usize> = BTreeMap::new();
         let mut paths = Vec::with_capacity(parts.paths.len());
         let mut seen = HashSet::new();
         for c in parts.paths {
             *counts.entry(c.source).or_default() += 1;
-            let canon = canon(Path::new(&c.path));
+            let canon = canon_lexical(Path::new(&c.path));
             if !seen.insert((canon.clone(), c.who.clone())) {
                 continue;
             }
@@ -162,7 +186,10 @@ impl SystemClaims {
         for n in &parts.names {
             *counts.entry(n.source).or_default() += 1;
         }
-        SystemClaims { paths, names: parts.names, failed: parts.failed, counts, skipped: parts.skipped }
+        for n in &parts.program_names {
+            *counts.entry(n.source).or_default() += 1;
+        }
+        SystemClaims { paths, names: parts.names, program_names: parts.program_names, failed: parts.failed, counts, skipped: parts.skipped }
     }
 
     /// Reads this PC: the uninstall lists, services, startup entries, App Paths, Start Menu
@@ -213,6 +240,10 @@ impl ClaimCheck for SystemClaims {
             }
         }
         if let Some(n) = &name {
+            let lower = n.to_lowercase();
+            if let Some(p) = self.program_names.iter().find(|p| p.stem == lower) {
+                return Some(p.who.clone());
+            }
             if let Some(app) = self.names.iter().find(|a| whole_words_match(n, &a.name)) {
                 return Some(format!("The installed app {}", app.name));
             }
@@ -257,15 +288,41 @@ fn is_build_token(token: &str) -> bool {
 /// True if the two names are the same words in the same order, ignoring case and punctuation.
 /// Trailing version and architecture tokens of `app_name` are ignored. Never true for no words.
 pub fn whole_words_match(folder_name: &str, app_name: &str) -> bool {
+    let folder = words(folder_name);
+    if folder.is_empty() {
+        return false;
+    }
+    // The name as registered ("Cubase 13") or without its trailing build words ("Foo (x64)").
+    if words(app_name) == folder {
+        return true;
+    }
     let mut tokens: Vec<&str> = app_name.split_whitespace().collect();
     while tokens.len() > 1 && tokens.last().is_some_and(|t| is_build_token(t)) {
         tokens.pop();
     }
-    let app = words(&tokens.join(" "));
-    !app.is_empty() && app == words(folder_name)
+    words(&tokens.join(" ")) == folder
 }
 
 // ---- values --------------------------------------------------------------------------------------
+
+/// True if there were shortcuts and none of them could be opened (`opened` per link): then the
+/// reader itself is broken, and the source counts as failed rather than as empty.
+pub(crate) fn every_link_failed(opened: &[bool]) -> bool {
+    !opened.is_empty() && opened.iter().all(|o| !o)
+}
+
+/// `GetDriveTypeW`'s answer for a fixed local disk.
+const DRIVE_FIXED: u32 = 3;
+
+/// Whether an 8.3 spelling in `path` may be looked up on the disk: only on a fixed local drive.
+/// `drive_type` gives the drive type of a letter. Anywhere else the path stays as written.
+pub(crate) fn should_expand_short_names(path: &str, drive_type: &mut dyn FnMut(char) -> u32) -> bool {
+    if !path.contains('~') {
+        return false;
+    }
+    let b = path.as_bytes();
+    b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' && drive_type(b[0] as char) == DRIVE_FIXED
+}
 
 /// Replaces `%NAME%` with the value `env` gives. Unknown names and stray `%` stay as they are.
 pub fn expand_env(s: &str, env: &dyn Fn(&str) -> Option<String>) -> String {
@@ -332,25 +389,43 @@ const EXTENSIONS: &[&str] = &[
     ".exe", ".dll", ".bat", ".cmd", ".msi", ".com", ".ico", ".lnk", ".cpl", ".sys", ".scr", ".msc", ".vbs", ".ps1",
 ];
 
-/// Length of the unquoted path at the start of `s`. Such a path may contain spaces, so it ends
-/// after the first file extension followed by nothing, a space, a comma or a quote.
-fn unquoted_len(s: &str) -> usize {
+/// Possible lengths of the unquoted path at the start of `s`. Such a path may contain spaces, so
+/// it can end after any file extension followed by nothing, a space, a comma or a quote. The
+/// first is the likely one; later ones are also returned (up to the next argument marker) because
+/// a folder may be called `Booking.com Helper`. Claiming a longer, nonexistent candidate costs
+/// nothing; missing the real folder would.
+fn unquoted_lens(s: &str) -> Vec<usize> {
     let low = s.to_ascii_lowercase(); // same byte length as `s`
-    let mut best: Option<usize> = None;
+    let mut ends: Vec<usize> = Vec::new();
     for ext in EXTENSIONS {
         for (i, _) in low.match_indices(ext) {
             let end = i + ext.len();
             if matches!(low.as_bytes().get(end), None | Some(b' ' | b',' | b'"' | b'\t')) {
-                best = Some(best.map_or(end, |b| b.min(end)));
-                break;
+                ends.push(end);
             }
         }
     }
-    best.unwrap_or_else(|| {
+    ends.sort_unstable();
+    ends.dedup();
+    let mut out: Vec<usize> = Vec::new();
+    for end in ends {
+        match out.last() {
+            None => out.push(end),
+            Some(&prev) => {
+                let gap = &low[prev..end];
+                // A gap holding an argument, a second path or a quote is not part of a folder name.
+                let argument = gap.contains(" /") || gap.contains(" -") || gap.contains([',', '"']);
+                if !argument && !gap.contains(":\\") && !gap.contains(":/") {
+                    out.push(end);
+                }
+            }
+        }
+    }
+    if out.is_empty() {
         let cut = low.find([',', '"']).unwrap_or(low.len());
-        let cut = [" /", " -"].iter().filter_map(|m| low.find(m)).fold(cut, usize::min);
-        cut
-    })
+        out.push([" /", " -"].iter().filter_map(|m| low.find(m)).fold(cut, usize::min));
+    }
+    out
 }
 
 /// Every absolute path a command line or icon location names, in order: the program, and any
@@ -378,12 +453,18 @@ pub fn command_paths(cmd: &str, env: &dyn Fn(&str) -> Option<String>) -> Vec<Str
             push(clean(&token));
             rest = inner.get(end + 1..).unwrap_or("");
         } else if is_abs(rest) {
-            let n = unquoted_len(rest).max(1);
-            push(clean(strip_icon_index(&rest[..n])));
-            rest = &rest[n..];
+            let lens = unquoted_lens(rest);
+            for &n in &lens {
+                push(clean(strip_icon_index(&rest[..n])));
+            }
+            rest = &rest[lens.last().copied().unwrap_or(0).max(1)..];
         } else {
             let n = rest.find([' ', '\t', ',', '"']).unwrap_or(rest.len()).max(first.len_utf8());
-            rest = &rest[n..];
+            // `/D=C:\Program Files\App`: the path after the `=` is an argument worth reading.
+            match rest[..n].find('=') {
+                Some(eq) if is_abs(&rest[eq + 1..]) => rest = &rest[eq + 1..],
+                _ => rest = &rest[n..],
+            }
         }
     }
     out
@@ -424,19 +505,53 @@ pub fn add_run_entry(parts: &mut ClaimParts, name: &str, command: &str, env: &dy
     push_paths(parts, command_paths(command, env), &format!("The startup entry {name}"), "startup entries");
 }
 
+/// Records the program name of an exe path, unless it is a generic one.
+fn add_program_name(parts: &mut ClaimParts, exe_path: &str, source: &'static str) {
+    let file = exe_path.trim().trim_end_matches(['\\', '/']).rsplit(['\\', '/']).next().unwrap_or("");
+    let Some(stem) = file.len().checked_sub(4).and_then(|i| file.get(..i).filter(|_| file[i..].eq_ignore_ascii_case(".exe"))) else {
+        return;
+    };
+    let lower = stem.to_lowercase();
+    if lower.is_empty() || GENERIC_PROGRAM_NAMES.contains(&lower.as_str()) {
+        return;
+    }
+    parts.program_names.push(ProgramName { stem: lower, who: format!("The program {file}"), source });
+}
+
+/// Exe names too common to say anything about whose data a folder holds.
+const GENERIC_PROGRAM_NAMES: &[&str] = &[
+    "uninstall", "uninst", "unins000", "setup", "install", "update", "updater", "launcher", "helper", "service", "app", "main",
+    "run", "start",
+];
+
 pub fn add_app_path(parts: &mut ClaimParts, exe: &str, default: &str, path: &str, env: &dyn Fn(&str) -> Option<String>) {
     let who = format!("The program {exe}");
-    push_paths(parts, command_paths(default, env), &who, "app paths");
+    let programs = command_paths(default, env);
+    for p in &programs {
+        add_program_name(parts, p, "app paths");
+    }
+    if programs.is_empty() {
+        add_program_name(parts, exe, "app paths");
+    }
+    push_paths(parts, programs, &who, "app paths");
     push_paths(parts, location_paths(path, env), &who, "app paths");
 }
 
 pub fn add_shortcut(parts: &mut ClaimParts, name: &str, target: &str, env: &dyn Fn(&str) -> Option<String>) {
-    push_paths(parts, command_paths(target, env), &format!("The Start Menu shortcut {name}"), "shortcuts");
+    let paths = command_paths(target, env);
+    if let Some(p) = paths.first() {
+        add_program_name(parts, p, "shortcuts");
+    }
+    push_paths(parts, paths, &format!("The Start Menu shortcut {name}"), "shortcuts");
 }
 
 pub fn add_process(parts: &mut ClaimParts, image: &str) {
     let who = format!("A running program ({image})");
-    push_paths(parts, clean(image).into_iter().collect(), &who, "running programs");
+    let Some(exe) = clean(image) else { return };
+    // The program's folder too, so its cache and data next to it count as in use.
+    let folder = exe.rfind(['\\', '/']).and_then(|i| clean(&exe[..i]));
+    add_program_name(parts, &exe, "running programs");
+    push_paths(parts, std::iter::once(exe).chain(folder).collect(), &who, "running programs");
 }
 
 // ---- keeping it fresh ----------------------------------------------------------------------------
@@ -456,16 +571,19 @@ impl Cached {
         Cached { read, max_age, slot: Mutex::new(None) }
     }
 
-    fn current(&self, now: Duration) -> Arc<SystemClaims> {
+    fn current(&self, clock: &dyn Fn() -> Duration) -> Arc<SystemClaims> {
         // A panic elsewhere must not stop folders being checked: the data is only a snapshot.
         let mut slot = self.slot.lock().unwrap_or_else(|e| e.into_inner());
+        // Taken after any wait for the lock, so it is not older than the read that just finished.
+        let now = clock();
         if let Some((at, s)) = slot.as_ref() {
             if now.saturating_sub(*at) < self.max_age {
                 return s.clone();
             }
         }
         let fresh = Arc::new((self.read)());
-        *slot = Some((now, fresh.clone()));
+        // Stamped when the read finished, not when it began: a slow read is not born old.
+        *slot = Some((clock(), fresh.clone()));
         fresh
     }
 }
@@ -513,11 +631,10 @@ impl Default for LiveClaims {
 
 impl ClaimCheck for LiveClaims {
     fn is_claimed(&self, folder: &Path) -> Option<String> {
-        let now = (self.clock)();
         self.installed
-            .current(now)
+            .current(&*self.clock)
             .is_claimed(folder)
-            .or_else(|| self.running.current(now).is_claimed(folder))
+            .or_else(|| self.running.current(&*self.clock).is_claimed(folder))
     }
 }
 
@@ -528,7 +645,7 @@ mod real {
 
     use windows::core::{Interface, PCWSTR, PWSTR};
     use windows::Win32::Foundation::{CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_NO_MORE_ITEMS, ERROR_PATH_NOT_FOUND, ERROR_SUCCESS};
-    use windows::Win32::Storage::FileSystem::{GetLogicalDrives, WIN32_FIND_DATAW};
+    use windows::Win32::Storage::FileSystem::{GetDriveTypeW, GetLogicalDrives, WIN32_FIND_DATAW};
     use windows::Win32::System::Com::{
         CoCreateInstance, CoInitializeEx, CoUninitialize, IPersistFile, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, STGM_READ,
     };
@@ -664,33 +781,55 @@ mod real {
         [("64-bit", KEY_WOW64_64KEY), ("32-bit", KEY_WOW64_32KEY)]
     }
 
+    /// Lists the keys under `base` and calls `each` with every one that opens. A root that cannot
+    /// be opened or listed is recorded as a failed source (a missing one too, if `required`); a
+    /// child that cannot be opened is skipped and counted.
+    fn for_each_child(
+        parts: &mut ClaimParts,
+        (hive, view): (HKEY, REG_SAM_FLAGS),
+        base: &str,
+        label: &str,
+        required: bool,
+        mut each: impl FnMut(&mut ClaimParts, &str, &Key),
+    ) {
+        let root = match open(hive, base, view) {
+            Ok(Some(k)) => k,
+            Ok(None) => {
+                if required {
+                    parts.failed.push(format!("{label} (missing)"));
+                }
+                return;
+            }
+            Err(e) => {
+                parts.failed.push(format!("{label} ({e})"));
+                return;
+            }
+        };
+        let names = match subkeys(&root) {
+            Ok(n) => n,
+            Err(e) => {
+                parts.failed.push(format!("{label} ({e})"));
+                return;
+            }
+        };
+        for name in names {
+            match open(hive, &format!(r"{base}\{name}"), view) {
+                Ok(Some(child)) => each(parts, &name, &child),
+                _ => parts.skipped.registry_values += 1,
+            }
+        }
+    }
+
     fn uninstall(parts: &mut ClaimParts) {
         for (hn, hive) in hives() {
             for (vn, view) in views() {
-                let path = format!(r"{WIN}\Uninstall");
-                let root = match open(hive, &path, view) {
-                    Ok(Some(k)) => k,
-                    Ok(None) => continue,
-                    Err(e) => {
-                        parts.failed.push(format!("the {hn} {vn} uninstall list ({e})"));
-                        continue;
-                    }
-                };
-                let names = match subkeys(&root) {
-                    Ok(n) => n,
-                    Err(e) => {
-                        parts.failed.push(format!("the {hn} {vn} uninstall list ({e})"));
-                        continue;
-                    }
-                };
-                for name in names {
-                    let Ok(Some(k)) = open(hive, &format!(r"{path}\{name}"), view) else {
-                        parts.skipped.registry_values += 1;
-                        continue;
-                    };
-                    let mut get = |v: &str| value_or_skip(&k, v, &mut parts.skipped);
+                // The 64-bit machine list exists on every Windows install.
+                let required = hn == "HKLM" && vn == "64-bit";
+                let label = format!("the {hn} {vn} uninstall list");
+                for_each_child(parts, (hive, view), &format!(r"{WIN}\Uninstall"), &label, required, |parts, name, k| {
+                    let mut get = |v: &str| value_or_skip(k, v, &mut parts.skipped);
                     let e = UninstallEntry {
-                        key: name.clone(),
+                        key: name.to_string(),
                         display_name: get("DisplayName"),
                         install_location: get("InstallLocation"),
                         display_icon: get("DisplayIcon"),
@@ -698,7 +837,7 @@ mod real {
                         quiet_uninstall_string: get("QuietUninstallString"),
                     };
                     add_uninstall_entry(parts, &e, &env);
-                }
+                });
             }
         }
     }
@@ -734,31 +873,12 @@ mod real {
     fn app_paths(parts: &mut ClaimParts) {
         for (hn, hive) in hives() {
             for (vn, view) in views() {
-                let path = format!(r"{WIN}\App Paths");
-                let root = match open(hive, &path, view) {
-                    Ok(Some(k)) => k,
-                    Ok(None) => continue,
-                    Err(e) => {
-                        parts.failed.push(format!("the {hn} {vn} App Paths list ({e})"));
-                        continue;
-                    }
-                };
-                let names = match subkeys(&root) {
-                    Ok(n) => n,
-                    Err(e) => {
-                        parts.failed.push(format!("the {hn} {vn} App Paths list ({e})"));
-                        continue;
-                    }
-                };
-                for name in names {
-                    let Ok(Some(k)) = open(hive, &format!(r"{path}\{name}"), view) else {
-                        parts.skipped.registry_values += 1;
-                        continue;
-                    };
-                    let default = value_or_skip(&k, "", &mut parts.skipped);
-                    let dirs = value_or_skip(&k, "Path", &mut parts.skipped);
-                    add_app_path(parts, &name, &default, &dirs, &env);
-                }
+                let label = format!("the {hn} {vn} App Paths list");
+                for_each_child(parts, (hive, view), &format!(r"{WIN}\App Paths"), &label, false, |parts, name, k| {
+                    let default = value_or_skip(k, "", &mut parts.skipped);
+                    let dirs = value_or_skip(k, "Path", &mut parts.skipped);
+                    add_app_path(parts, name, &default, &dirs, &env);
+                });
             }
         }
     }
@@ -766,32 +886,11 @@ mod real {
     /// Services and drivers keep their image path in the registry; the service manager reads the
     /// same values.
     fn services(parts: &mut ClaimParts) {
-        let root = match open(HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Services", KEY_WOW64_64KEY) {
-            Ok(Some(k)) => k,
-            Ok(None) => {
-                parts.failed.push("the list of services (missing)".into());
-                return;
-            }
-            Err(e) => {
-                parts.failed.push(format!("the list of services ({e})"));
-                return;
-            }
-        };
-        let names = match subkeys(&root) {
-            Ok(n) => n,
-            Err(e) => {
-                parts.failed.push(format!("the list of services ({e})"));
-                return;
-            }
-        };
-        for name in names {
-            let Ok(Some(k)) = open(HKEY_LOCAL_MACHINE, &format!(r"SYSTEM\CurrentControlSet\Services\{name}"), KEY_WOW64_64KEY) else {
-                parts.skipped.registry_values += 1;
-                continue;
-            };
-            let image = value_or_skip(&k, "ImagePath", &mut parts.skipped);
-            add_service(parts, &name, &image, &env);
-        }
+        let hive = (HKEY_LOCAL_MACHINE, KEY_WOW64_64KEY);
+        for_each_child(parts, hive, r"SYSTEM\CurrentControlSet\Services", "the list of services", true, |parts, name, k| {
+            let image = value_or_skip(k, "ImagePath", &mut parts.skipped);
+            add_service(parts, name, &image, &env);
+        });
     }
 
     fn processes(parts: &mut ClaimParts) {
@@ -842,16 +941,22 @@ mod real {
         let rd = match std::fs::read_dir(dir) {
             Ok(r) => r,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(e) if depth > 0 => {
-                let _ = e;
+            Err(_) if depth > 0 => {
                 skipped.shortcuts += 1;
                 return Ok(());
             }
             Err(e) => return Err(e.to_string()),
         };
-        for entry in rd.flatten() {
+        for entry in rd {
+            let Ok(entry) = entry else {
+                skipped.shortcuts += 1;
+                continue;
+            };
             let path = entry.path();
-            let Ok(ft) = entry.file_type() else { continue };
+            let Ok(ft) = entry.file_type() else {
+                skipped.shortcuts += 1;
+                continue;
+            };
             if ft.is_dir() && depth < 8 {
                 shortcut_files(&path, depth + 1, out, skipped)?;
             } else if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("lnk")) {
@@ -907,6 +1012,12 @@ mod real {
         .join();
         match done {
             Ok(Some(found)) => {
+                // Links exist and not one opened: the reader is broken, not the links.
+                let opened: Vec<bool> = found.iter().map(|(_, t)| t.is_some()).collect();
+                if every_link_failed(&opened) {
+                    parts.failed.push("the Start Menu shortcuts (none could be opened)".into());
+                    return;
+                }
                 for (name, target) in found {
                     match target {
                         Some(t) => add_shortcut(parts, &name, &t, &env),
@@ -948,6 +1059,7 @@ mod real {
         app_paths(&mut parts);
         services(&mut parts);
         shortcuts(&mut parts);
+        expand_short_names(&mut parts);
         parts
     }
 
@@ -955,7 +1067,25 @@ mod real {
     pub(super) fn read_running_parts() -> ClaimParts {
         let mut parts = ClaimParts { broad_roots: broad_roots(), ..ClaimParts::default() };
         processes(&mut parts);
+        expand_short_names(&mut parts);
         parts
+    }
+
+    /// Writes `PROGRA~1` spellings out in full, but only on fixed local drives: asking a
+    /// disconnected network or removable drive can take many seconds, with every caller waiting.
+    fn expand_short_names(parts: &mut ClaimParts) {
+        let mut kinds: std::collections::HashMap<char, u32> = std::collections::HashMap::new();
+        let mut kind_of = |letter: char| -> u32 {
+            *kinds.entry(letter.to_ascii_uppercase()).or_insert_with(|| {
+                // SAFETY: a NUL-terminated root path.
+                unsafe { GetDriveTypeW(PCWSTR(wide(&format!("{}:\\", letter.to_ascii_uppercase())).as_ptr())) }
+            })
+        };
+        for c in &mut parts.paths {
+            if should_expand_short_names(&c.path, &mut kind_of) {
+                c.path = canon(Path::new(&c.path));
+            }
+        }
     }
 }
 
