@@ -26,7 +26,7 @@ const POLL_MS = 1000;
 /** Three steps in one sheet: before, the app's own uninstaller running, and the leftovers Seek can move afterwards. */
 export function UninstallSheet({ app, protectedPaths, onReview, onUninstalled, onClose }: Props) {
   const api = useApi();
-  const [step, setStep] = useState<"before" | "running" | "unresolved" | "left">("before");
+  const [step, setStep] = useState<"before" | "running" | "stalled" | "unresolved" | "left">("before");
   const [problem, setProblem] = useState<string | null>(null);
   const [rows, setRows] = useState<LeftoverRow[] | null>(null);
   // the uninstaller has been started, so asking how it is doing makes sense
@@ -41,9 +41,9 @@ export function UninstallSheet({ app, protectedPaths, onReview, onUninstalled, o
     };
   }, []);
 
-  const showLeft = async () => {
-    setStep("left");
-    onUninstalled();
+  const load = async () => {
+    setProblem(null);
+    setRows(null);
     try {
       const r = await api.uninstallLeftovers(app.id);
       if (live.current) setRows(r);
@@ -55,22 +55,57 @@ export function UninstallSheet({ app, protectedPaths, onReview, onUninstalled, o
     }
   };
 
-  // Waits for the uninstaller: the process ended and the registry entry is gone.
+  const showLeft = () => {
+    setStep("left");
+    onUninstalled();
+    void load();
+  };
+
+  // An uninstall already in progress for this app (the sheet was closed and opened again): ask first
+  // and carry on at the right step. An app Seek never started is an error here, and the sheet starts at the beginning.
+  useEffect(() => {
+    let stopped = false;
+    api
+      .uninstallState(app.id)
+      .then((s) => {
+        if (stopped) return;
+        if (s === "running") {
+          setStarted(true);
+          setStep("running");
+        } else if (s === "finished") showLeft();
+        else setStep("unresolved");
+      })
+      .catch(() => {});
+    return () => {
+      stopped = true;
+    };
+    // once per opening
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [api, app.id]);
+
+  // Waits for the uninstaller: the process ended and the registry entry is gone. A failed question is
+  // asked again; three in a row stop the waiting and say so, which is not the same as "unresolved".
   useEffect(() => {
     if (step !== "running" || !started) return;
     let stopped = false;
+    let failures = 0;
     let timer: ReturnType<typeof setTimeout>;
     const poll = async () => {
       try {
         const s = await api.uninstallState(app.id);
         if (stopped) return;
-        if (s === "finished") void showLeft();
+        failures = 0;
+        if (s === "finished") showLeft();
         else if (s === "unresolved") setStep("unresolved");
         else timer = setTimeout(poll, POLL_MS);
       } catch (e) {
         if (stopped) return;
+        if (++failures < 3) {
+          timer = setTimeout(poll, POLL_MS);
+          return;
+        }
         setProblem(errText(e));
-        setStep("unresolved");
+        setStep("stalled");
       }
     };
     void poll();
@@ -145,12 +180,28 @@ export function UninstallSheet({ app, protectedPaths, onReview, onUninstalled, o
           Uninstall
         </button>
       </>
+    ) : step === "stalled" ? (
+      <>
+        <button className="btn" onClick={onClose}>
+          Cancel
+        </button>
+        <button
+          className="btn btn-primary"
+          data-autofocus
+          onClick={() => {
+            setProblem(null);
+            setStep("running");
+          }}
+        >
+          Try again
+        </button>
+      </>
     ) : step === "unresolved" ? (
       <>
         <button className="btn" onClick={onClose}>
           Cancel
         </button>
-        <button className="btn btn-primary" data-autofocus onClick={() => void showLeft()}>
+        <button className="btn btn-primary" data-autofocus onClick={showLeft}>
           It's finished
         </button>
       </>
@@ -160,6 +211,11 @@ export function UninstallSheet({ app, protectedPaths, onReview, onUninstalled, o
         <button className="btn" onClick={onClose}>
           Close
         </button>
+        {problem && rows?.length === 0 && (
+          <button className="btn" onClick={() => void load()}>
+            Look again
+          </button>
+        )}
         <button className="btn btn-primary" disabled={pickedRows.length === 0} onClick={review}>
           Review…
         </button>
@@ -203,6 +259,11 @@ export function UninstallSheet({ app, protectedPaths, onReview, onUninstalled, o
             <div className="spinner" aria-hidden="true" />
             <p className="dialog-lead">Windows is running the uninstaller. Follow its steps if it asks. This sheet carries on when it's done.</p>
           </div>
+        )}
+        {step === "stalled" && (
+          <p className="dialog-lead">
+            {problem} Seek can't tell how {app.name}'s uninstaller is doing. It keeps running.
+          </p>
         )}
         {step === "unresolved" && (
           <p className="dialog-lead">

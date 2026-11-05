@@ -90,6 +90,7 @@ const ENGINE_REASON: Record<Lock, string> = {
   unsupportedPath: "Seek cannot remove this kind of path, so it was left in place.",
   reparsePoint: "This is a link to somewhere else, so it was left in place.",
   claimed: "An app or a running program is using this folder, so it was left in place.",
+  sharedFolder: "Inside a folder Windows and other apps share, so Seek doesn't remove anything in it.",
 };
 const LAST_COPY = "This is the last copy, so it was left in place.";
 
@@ -716,7 +717,7 @@ export function createMockClean(opts: MockCleanOptions): CleanApi {
     async uninstallState(appId): Promise<UninstallState> {
       await delay();
       const u = uninstalls.get(appId);
-      if (!u) return "unresolved";
+      if (!u) throw new Error("Seek hasn't started an uninstaller for that app.");
       const wait = simulate ? 2500 : 0;
       if (Date.now() - u.at < wait) return "running";
       return u.stubborn ? "unresolved" : "finished";

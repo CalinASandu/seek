@@ -13,7 +13,7 @@ use crate::model::{
     ReviewItem, Why,
 };
 use crate::paths::{canon, is_inside, real_location, target_location};
-use crate::protect::{candidate_lock, lock_for, uninstall_lock, Places};
+use crate::protect::{candidate_lock, in_shared_folder, lock_for, uninstall_lock, Places};
 use crate::reasons::*;
 use support::{in_system_store, inside_any, new_token, run_admin, spellings};
 
@@ -312,6 +312,11 @@ impl Engine {
         // Under both spellings, so a junction can't carry a shortcut out of the Start Menu.
         if lock.is_none() && why == Why::Uninstall {
             lock = spell.iter().find_map(|s| uninstall_lock(&self.places, s, st.is_dir));
+        }
+        // Folders shared with Windows and other apps (Roaming\Microsoft\Protect, Microsoft\Edge and the
+        // like): nothing inside them is ever an uninstall's to offer, however it is asked for.
+        if lock.is_none() && why == Why::Uninstall && st.is_dir && spell.iter().any(|s| in_shared_folder(&self.places, s)) {
+            lock = Some(Lock::SharedFolder);
         }
         let pf = |s: &&str| self.places.in_program_files(s);
         // Program Files, and the all-users Start Menu in ProgramData, can't be changed without admin.

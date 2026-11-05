@@ -590,3 +590,25 @@ fn real_read_reports_counts_and_time() {
         println!("unclaimed in %{var}%: {open:?}");
     }
 }
+
+#[test]
+fn a_dead_shortcut_claims_nothing_and_a_working_one_does() {
+    let mut p = parts();
+    add_shortcut_if_there(&mut p, "Dead", r"C:\Program Files\Dead\dead.exe", &env, &|_| false);
+    add_shortcut_if_there(&mut p, "Live", r"C:\Program Files\Live\live.exe", &env, &|_| true);
+    let c = SystemClaims::from_parts(p);
+    assert!(c.is_claimed(Path::new(r"C:\Program Files\Dead")).is_none());
+    assert!(c.is_claimed(Path::new(r"C:\Program Files\Live")).is_some());
+}
+
+#[test]
+fn refresh_makes_the_next_question_read_both_lists_again() {
+    let h = harness();
+    let f = Path::new(r"C:\Users\me\AppData\Local\X");
+    h.live.is_claimed(f);
+    h.live.is_claimed(f);
+    assert_eq!((h.installed_reads.load(Ordering::SeqCst), h.running_reads.load(Ordering::SeqCst)), (1, 1));
+    h.live.refresh();
+    h.live.is_claimed(f);
+    assert_eq!((h.installed_reads.load(Ordering::SeqCst), h.running_reads.load(Ordering::SeqCst)), (2, 2));
+}

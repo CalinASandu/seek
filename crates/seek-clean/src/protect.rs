@@ -7,7 +7,8 @@ use windows::core::GUID;
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::UI::Shell::{
     SHGetKnownFolderPath, FOLDERID_LocalAppData, FOLDERID_LocalAppDataLow, FOLDERID_ProgramData,
-    FOLDERID_CommonPrograms, FOLDERID_Programs, FOLDERID_ProgramFiles, FOLDERID_ProgramFilesX86,
+    FOLDERID_CommonPrograms, FOLDERID_Desktop, FOLDERID_Documents, FOLDERID_Downloads, FOLDERID_Favorites, FOLDERID_Music,
+    FOLDERID_Pictures, FOLDERID_Programs, FOLDERID_SavedGames, FOLDERID_Videos, FOLDERID_ProgramFiles, FOLDERID_ProgramFilesX86,
     FOLDERID_Profile, FOLDERID_RoamingAppData, FOLDERID_UserProfiles, FOLDERID_Windows, KF_FLAG_DEFAULT,
 };
 
@@ -43,6 +44,9 @@ pub struct Places {
     scan_roots: Vec<PathBuf>,
     /// The `Programs` folder of the current user's Start Menu, then the all-users one, as written.
     start_menus: Vec<PathBuf>,
+    /// Where Windows says Desktop, Documents, Downloads, Pictures, Music, Videos, Saved Games and
+    /// Favorites are, which may not be in the profile (`D:\Documents`, a OneDrive move).
+    known_dirs: Vec<String>,
 }
 
 /// The Windows folder as Windows spells it (`C:\Windows`). The uninstall launcher builds the path
@@ -106,9 +110,23 @@ impl Places {
             .map(PathBuf::from)
             .collect();
         let start_menus = [&FOLDERID_Programs, &FOLDERID_CommonPrograms].into_iter().filter_map(known_raw).map(PathBuf::from).collect();
+        let known_dirs = [
+            &FOLDERID_Desktop,
+            &FOLDERID_Documents,
+            &FOLDERID_Downloads,
+            &FOLDERID_Pictures,
+            &FOLDERID_Music,
+            &FOLDERID_Videos,
+            &FOLDERID_SavedGames,
+            &FOLDERID_Favorites,
+        ]
+        .into_iter()
+        .filter_map(known)
+        .collect();
         let places = Places {
             scan_roots,
             start_menus,
+            known_dirs,
             windows,
             program_files,
             users_root: known(&FOLDERID_UserProfiles).unwrap_or_default(),
@@ -166,6 +184,10 @@ impl Places {
         // `OneDrive - Contoso` and `OneDrive - Personal` are sync roots too, and so are
         // `Dropbox (Personal)` style names.
         const KNOWN_PREFIXES: [&str; 2] = ["onedrive", "dropbox"];
+        let at = canon_path.trim_end_matches('\\');
+        if self.known_dirs.iter().any(|k| !k.is_empty() && k.trim_end_matches('\\') == at) {
+            return true;
+        }
         let profile = self.profile.trim_end_matches('\\');
         !profile.is_empty()
             && (canon_path == profile
@@ -188,6 +210,12 @@ impl Places {
             .chain(&self.program_files)
             .chain(&self.app_data)
             .any(|p| !p.is_empty() && is_inside(p, canon_path))
+    }
+
+    /// Tests only: where Windows says the user's known folders are.
+    pub fn with_known_dirs_for_tests(mut self, dirs: &[&str]) -> Places {
+        self.known_dirs = dirs.iter().map(|d| canon(Path::new(d))).collect();
+        self
     }
 
     /// Tests only: one more folder whose top-level folders count as leftover candidates.
@@ -217,6 +245,7 @@ impl Places {
         .collect();
         Places {
             start_menus,
+            known_dirs: Vec::new(),
             scan_roots: program_files.iter().chain(app_data).map(PathBuf::from).collect(),
             windows: c(windows),
             program_files: program_files.iter().map(|s| c(s)).collect(),
@@ -300,6 +329,31 @@ pub fn uninstall_lock(places: &Places, canon_path: &str, is_dir: bool) -> Option
         return Some(Lock::SystemFolder);
     }
     None
+}
+
+/// `Local\Programs\<App>` is where per-user installers put apps, so the `Programs` folder alone
+/// does not make what is in it shared.
+const NOT_SHARED: &str = "programs";
+
+/// True if `canon_path` (in `canon` form) lies below a scan root with any segment named in
+/// `ALWAYS_CLAIMED` (`Microsoft`, `Windows`, `Common Files`, `WindowsPowerShell` and the rest):
+/// such a folder is shared with Windows and other apps, and an uninstall never offers anything
+/// inside it.
+pub fn in_shared_folder(places: &Places, canon_path: &str) -> bool {
+    places.scan_roots.iter().map(|r| canon(r)).filter(|r| canon_path.len() > r.len() && is_inside(canon_path, r)).any(|r| {
+        canon_path[r.len()..]
+            .split('\\')
+            .filter(|s| !s.is_empty() && *s != NOT_SHARED)
+            .any(|seg| crate::claims::ALWAYS_CLAIMED.iter().any(|a| a.eq_ignore_ascii_case(seg)))
+    })
+}
+
+/// True if an uninstall must neither list nor enter this folder: anything `lock_for` or
+/// `uninstall_lock` would lock, or anything inside a shared folder.
+pub fn uninstall_blocked(places: &Places, canon_path: &str) -> bool {
+    lock_for(places, canon_path, Why::Uninstall, &[]).is_some()
+        || uninstall_lock(places, canon_path, true).is_some()
+        || in_shared_folder(places, canon_path)
 }
 
 /// True if `p` (in `canon` form) is a direct child of one of the leftover scan roots.
@@ -592,6 +646,19 @@ mod tests {
         assert!(!known(r"C:\Users\me\MyOneDrive"));
         assert!(!known(r"C:\Users\me\miniconda3"));
         assert!(!known(r"C:\Users\other\Documents"));
+    }
+
+    #[test]
+    fn relocated_known_folders_are_locked_like_the_defaults() {
+        let p = places().with_known_dirs_for_tests(&[r"D:\Documents", r"C:\Users\me\OneDrive - Contoso\Desktop", r"E:\Media\Pictures"]);
+        for dir in [r"D:\Documents", r"d:\DOCUMENTS\", r"C:\Users\me\OneDrive - Contoso\Desktop", r"E:\Media\Pictures"] {
+            assert!(p.is_profile_or_known_folder(&canon(Path::new(dir))), "{dir}");
+            assert!(uninstall_lock(&p, &canon(Path::new(dir)), true).is_some(), "{dir}");
+        }
+        // Only the folder itself; what is inside, and the neighbours, are not known folders.
+        for dir in [r"D:\Documents\Thing", r"D:\Docs", r"E:\Media"] {
+            assert!(!p.is_profile_or_known_folder(&canon(Path::new(dir))), "{dir}");
+        }
     }
 
     #[test]

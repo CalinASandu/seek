@@ -33,6 +33,7 @@ export function lockText(lock: Lock): string {
     case "unsupportedPath": return "Seek can't remove this kind of path, so it stays.";
     case "reparsePoint": return "A link to somewhere else, so it stays.";
     case "claimed": return "An app or a running program is using it, so it stays.";
+    case "sharedFolder": return "Inside a folder Windows and other apps share, so it stays.";
   }
 }
 

@@ -646,6 +646,20 @@ pub fn add_shortcut(parts: &mut ClaimParts, name: &str, target: &str, env: &dyn 
     push_paths(parts, paths, &format!("The Start Menu shortcut {name}"), "shortcuts");
 }
 
+/// [`add_shortcut`] for a shortcut that works: one whose target is gone (`exists` says so) claims
+/// nothing, so the folder of an uninstalled app is not held by its own dead shortcut.
+pub fn add_shortcut_if_there(
+    parts: &mut ClaimParts,
+    name: &str,
+    target: &str,
+    env: &dyn Fn(&str) -> Option<String>,
+    exists: &dyn Fn(&str) -> bool,
+) {
+    if exists(target) {
+        add_shortcut(parts, name, target, env);
+    }
+}
+
 pub fn add_process(parts: &mut ClaimParts, image: &str) {
     let who = format!("A running program ({image})");
     let Some(exe) = clean(image) else { return };
@@ -715,6 +729,13 @@ impl LiveClaims {
     /// For tests: readers and a clock they control.
     pub fn with_readers(installed: Reader, installed_age: Duration, running: Reader, running_age: Duration, clock: Clock) -> LiveClaims {
         LiveClaims { clock, installed: Cached::new(installed, installed_age), running: Cached::new(running, running_age) }
+    }
+
+    /// Forgets both snapshots: the next question reads installed apps and running programs again.
+    pub fn refresh(&self) {
+        for list in [&self.installed, &self.running] {
+            *list.slot.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
     }
 
     #[cfg(test)]
@@ -1147,6 +1168,13 @@ mod real {
         (!t.is_empty()).then_some(t)
     }
 
+    /// Whether a shortcut's target is still there. A drive that may stall is not asked: its
+    /// shortcuts are taken as working.
+    fn target_exists(target: &str) -> bool {
+        let first = command_paths(target, &env).into_iter().next();
+        first.is_none_or(|p| !is_fixed_local(&p) || Path::new(&p).exists())
+    }
+
     /// The raw target of each shortcut (`None` for one that can't be opened), in order. Opens
     /// them on a thread of its own: IShellLink wants its own apartment.
     pub(super) fn link_targets(files: &[std::path::PathBuf]) -> Vec<Option<String>> {
@@ -1206,7 +1234,7 @@ mod real {
                 }
                 for (name, target) in found {
                     match target {
-                        Some(t) => add_shortcut(parts, &name, &t, &env),
+                        Some(t) => add_shortcut_if_there(parts, &name, &t, &env, &target_exists),
                         None => parts.skipped.shortcuts += 1,
                     }
                 }

@@ -17,11 +17,11 @@ use std::path::{Path, PathBuf};
 
 use super::{evidence, kind_of, unix_now_ms, walk, IndexFacts, Kind, Summary};
 use crate::claims::{expand_env, is_fixed_local, link_targets, whole_words_match, words, InstalledNames};
-use crate::confidence::{is_publisher_name, name_len, names_are_similar, score, Evidence, MAX_DEPTH};
+use crate::confidence::{is_publisher_name, name_len, names_are_similar, same_publisher, score, Evidence, MAX_DEPTH};
 use crate::facts::{modified_ms, ClaimCheck};
 use crate::model::{AppRow, FolderSource, LeftoverRow};
 use crate::paths::{canon, is_inside};
-use crate::protect::{never_listed, Places};
+use crate::protect::{never_listed, uninstall_blocked, Places};
 
 /// How a folder's or a shortcut's name compares with the app's name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -37,9 +37,10 @@ pub(crate) enum NameMatch {
 pub(crate) fn match_name(folder: &str, app: &str) -> NameMatch {
     if name_len(&words(folder)) <= 4 || name_len(&words(app)) <= 4 {
         NameMatch::None
-    } else if whole_words_match(folder, app) {
+    } else if words(folder) == words(app) {
         NameMatch::Exact
-    } else if names_are_similar(folder, app) {
+    } else if whole_words_match(folder, app) || names_are_similar(folder, app) {
+        // A match that needed build words trimmed (`Python 3.12.4 (64-bit)` for `Python`) is rough.
         NameMatch::Rough
     } else {
         NameMatch::None
@@ -107,22 +108,21 @@ fn name_hits(app: &AppRow, places: &Places, claims: &dyn ClaimCheck, recorded: O
                 }
                 let path = entry.path();
                 let c = canon(&path);
-                if never_listed(places, &c) {
+                // Neither listed nor entered: what Windows and other apps share, and what the
+                // engine would lock anyway.
+                if never_listed(places, &c) || uninstall_blocked(places, &c) {
                     continue;
                 }
                 let name = entry.file_name().to_string_lossy().into_owned();
                 let matched = match_name(&name, &app.name);
                 let under_publisher = parent_name.as_deref().is_some_and(|p| is_publisher(p, &app.publisher));
-                if (matched != NameMatch::None || under_publisher) && claims.is_claimed(&path).is_none() {
+                // Every row needs its own name match; sitting under the publisher's folder is only evidence.
+                // The publisher's own folder is searched into and is never a row.
+                if matched != NameMatch::None && !is_publisher(&name, &app.publisher) && claims.is_claimed(&path).is_none() {
                     let mut found = Vec::new();
                     match matched {
                         NameMatch::Exact => found.push(Evidence::ExactAppName),
-                        NameMatch::Rough => {
-                            found.push(Evidence::RoughNameMatch);
-                            if is_publisher(&name, &app.publisher) {
-                                found.push(Evidence::NamedAfterCompany);
-                            }
-                        }
+                        NameMatch::Rough => found.push(Evidence::RoughNameMatch),
                         NameMatch::None => {}
                     }
                     if under_publisher {
@@ -150,7 +150,7 @@ fn install_hit(app: &AppRow, places: &Places) -> Option<Hit> {
     }
     let path = PathBuf::from(app.folder.as_deref()?);
     let c = canon(&path);
-    if never_listed(places, &c) || places.is_or_contains_place(&c) {
+    if never_listed(places, &c) || places.is_or_contains_place(&c) || uninstall_blocked(places, &c) {
         return None;
     }
     let md = is_real_dir(&path)?;
@@ -161,6 +161,15 @@ fn install_hit(app: &AppRow, places: &Places) -> Option<Hit> {
     }
     found.extend(depth_evidence(level_below_root(places, &c)));
     Some(Hit { in_program_files: places.in_program_files(&c), modified_ms: modified_ms(&md), canon: c, path, found })
+}
+
+/// Every row loses the points when another listed app has this app's publisher (compared with
+/// company suffixes dropped). Not added twice.
+fn add_publisher_still_installed(ev: &mut Vec<Evidence>, app: &AppRow, installed: &InstalledNames) {
+    let shared = !app.publisher.trim().is_empty() && installed.publishers.iter().any(|p| same_publisher(&app.publisher, p));
+    if shared && !ev.contains(&Evidence::PublisherStillInstalled) {
+        ev.push(Evidence::PublisherStillInstalled);
+    }
 }
 
 /// The `.lnk` files in the Start Menu `Programs` folders, links not followed.
@@ -190,11 +199,18 @@ fn shortcut_files(places: &Places) -> Vec<PathBuf> {
     out
 }
 
-/// Start Menu shortcuts of the app: those whose target is inside its folder (whatever the folder's
-/// source, and whether or not it is still there), and those named exactly like the app unless they
-/// still point at something that is there (that is another install's shortcut, and it works).
-fn shortcut_rows(app: &AppRow, places: &Places, links: &dyn Fn(&[PathBuf]) -> Vec<Option<String>>) -> Vec<(i32, LeftoverRow)> {
-    let folder = app.folder.as_deref().map(|f| canon(Path::new(f)));
+/// Start Menu shortcuts of the app, and only those that no longer work: the target is gone (or the
+/// shortcut can't be read, and it is named exactly like the app). A shortcut that still reaches
+/// something is another program's or another install's, and is never listed. Of the dead ones,
+/// those pointing into the folder the app itself recorded, and those named exactly like the app.
+fn shortcut_rows(
+    app: &AppRow,
+    places: &Places,
+    recorded: Option<&str>,
+    installed: &InstalledNames,
+    links: &dyn Fn(&[PathBuf]) -> Vec<Option<String>>,
+) -> Vec<(i32, LeftoverRow)> {
+    let folder = recorded;
     let files = shortcut_files(places);
     let mut targets = links(&files);
     targets.resize(files.len(), None);
@@ -203,11 +219,11 @@ fn shortcut_rows(app: &AppRow, places: &Places, links: &dyn Fn(&[PathBuf]) -> Ve
         let stem = file.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
         let target = target.map(|t| expand_env(&t, &env_var)).map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
         let target_canon = target.as_deref().map(|t| canon(Path::new(t)));
-        let points_in = matches!((&target_canon, &folder), (Some(t), Some(f)) if is_inside(t, f));
+        let points_in = matches!((&target_canon, folder), (Some(t), Some(f)) if is_inside(t, f));
         let exact = match_name(&stem, &app.name) == NameMatch::Exact;
         // A target on a drive that may stall isn't looked at: such a shortcut is taken as working.
-        let works = !points_in && target.as_deref().is_some_and(|t| !is_fixed_local(t) || Path::new(t).exists());
-        if !(points_in || (exact && !works)) {
+        let works = target.as_deref().is_some_and(|t| !is_fixed_local(t) || Path::new(t).exists());
+        if works || !(points_in || exact) {
             continue;
         }
         let c = canon(&file);
@@ -222,6 +238,7 @@ fn shortcut_rows(app: &AppRow, places: &Places, links: &dyn Fn(&[PathBuf]) -> Ve
         if exact {
             ev.push(Evidence::ExactAppName);
         }
+        add_publisher_still_installed(&mut ev, app, installed);
         let (total, level, reasons) = score(&ev);
         out.push((
             total,
@@ -283,6 +300,7 @@ pub(crate) fn for_app_with(
         let name = hit.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         let mut ev = hit.found.clone();
         ev.extend(evidence(&name, &s, hit.modified_ms, now_ms, installed));
+        add_publisher_still_installed(&mut ev, app, installed);
         let (total, level, reasons) = score(&ev);
         scored.push((
             total,
@@ -298,7 +316,7 @@ pub(crate) fn for_app_with(
             },
         ));
     }
-    scored.extend(shortcut_rows(app, places, links));
+    scored.extend(shortcut_rows(app, places, recorded.as_deref(), installed, links));
     scored.sort_by(|(ta, a), (tb, b)| tb.cmp(ta).then(b.size.cmp(&a.size)).then_with(|| a.path.cmp(&b.path)));
     scored.into_iter().map(|(_, r)| r).collect()
 }

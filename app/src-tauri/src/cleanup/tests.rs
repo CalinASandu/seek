@@ -103,7 +103,7 @@ fn idle_core() -> Arc<Core> {
     let places = fake_places();
     let facts: Arc<dyn FileFacts> = Arc::new(RealFacts);
     let engine = Engine::new(places.clone(), Arc::new(NeverRecycles), None, facts.clone(), Arc::new(ClaimsEveryFolder));
-    Arc::new(Core { engine, places, facts })
+    Arc::new(Core { engine, places, facts, claims: None })
 }
 
 fn state_with(core: Arc<Core>) -> CleanState {
@@ -879,7 +879,7 @@ fn after_a_commit_the_scan_state_no_longer_lists_what_was_moved() {
     let places = Places::for_tests(&s("win"), &[&s("pf")], &s("users"), &s("users/me"), &s("pd"), &[&s("users/me/appdata")]);
     let facts: Arc<dyn FileFacts> = Arc::new(DiskOnly);
     let engine = Engine::new(places.clone(), Arc::new(DeletesTempFiles), None, facts.clone(), Arc::new(ClaimsEveryFolder));
-    let state = state_with(Arc::new(Core { engine, places, facts }));
+    let state = state_with(Arc::new(Core { engine, places, facts, claims: None }));
     let core = state.core().unwrap();
     let names = ["a.bin", "b.bin", "c.bin"];
     let paths: Vec<PathBuf> = names.iter().map(|n| b.join("users/me/docs").join(n)).collect();
@@ -1055,4 +1055,10 @@ fn real_leftovers_list_with_index() {
         writeln!(text, "{:?} | {} | {} | {}", r.level, r.size, r.path, reasons.join("; ")).unwrap();
     }
     std::fs::write(r"D:\Programming\seek\.superpowers\sdd\2026-11-05-seek-decimator\task-11-real-list-index.txt", text).unwrap();
+}
+
+#[test]
+fn the_real_core_keeps_its_claims_so_a_listing_can_refresh_them() {
+    let places = Places::from_system().unwrap();
+    assert!(Core::real(places).claims.is_some());
 }

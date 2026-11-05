@@ -156,7 +156,8 @@ export type Lock =
   | "linkedPc"
   | "unsupportedPath"
   | "reparsePoint"
-  | "claimed";
+  | "claimed"
+  | "sharedFolder";
 
 /** How sure Seek is that a leftover folder is dead. */
 export type Level = "veryLikely" | "likely" | "notSure" | "probablyInUse";
