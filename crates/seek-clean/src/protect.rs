@@ -78,6 +78,11 @@ impl Places {
         }
     }
 
+    /// True if `canon_path` (in `canon` form) is Program Files or inside it.
+    pub fn in_program_files(&self, canon_path: &str) -> bool {
+        self.program_files.iter().any(|p| is_inside(canon_path, p))
+    }
+
     /// Fixed places for tests. Paths are put through `canon`.
     pub fn for_tests(
         windows: &str,

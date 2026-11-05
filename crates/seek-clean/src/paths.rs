@@ -3,10 +3,16 @@
 //! Safety rules compare paths as strings, so every spelling of the same place must reduce to one
 //! string: case, `/` vs `\`, `\\?\`, `.` and `..`, trailing slashes and 8.3 short names.
 
+use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 
 use windows::core::PCWSTR;
-use windows::Win32::Storage::FileSystem::GetLongPathNameW;
+use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::Storage::FileSystem::{
+    CreateFileW, GetFinalPathNameByHandleW, GetLongPathNameW, FILE_FLAG_BACKUP_SEMANTICS,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_NAME_NORMALIZED, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, OPEN_EXISTING,
+};
 
 /// Lowercased, `\\?\` stripped, `.`/`..` resolved lexically (never touching the disk), trailing
 /// slash removed, and 8.3 short names expanded for the longest prefix that exists. The path
@@ -129,10 +135,93 @@ fn long_path(path: &str) -> Option<String> {
     }
 }
 
+/// A handle opened only to ask questions (no data access), closed on drop.
+pub(crate) struct QueryHandle(pub(crate) HANDLE);
+
+impl Drop for QueryHandle {
+    fn drop(&mut self) {
+        // SAFETY: the handle was returned by CreateFileW and is closed exactly once.
+        unsafe {
+            let _ = CloseHandle(self.0);
+        }
+    }
+}
+
+/// Opens a file or folder without reading its contents and without following a link in the
+/// last segment. Parent links are still followed by Windows, which `real_location` relies on.
+pub(crate) fn open_query(path: &Path) -> Option<QueryHandle> {
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    // SAFETY: `wide` is NUL-terminated and outlives the call.
+    let h = unsafe {
+        CreateFileW(
+            PCWSTR(wide.as_ptr()),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            None,
+        )
+    };
+    h.ok().map(QueryHandle)
+}
+
+/// Where an existing path really is, in `canon` form, with every link in its parents resolved
+/// (a junction into `C:\Windows` shows up as `c:\windows\...`). `None` if it can't be opened.
+pub fn real_location(path: &Path) -> Option<String> {
+    let h = open_query(path)?;
+    let mut buf = vec![0u16; 1024];
+    loop {
+        // SAFETY: `h` is a valid handle and `buf` a valid buffer.
+        let n = unsafe { GetFinalPathNameByHandleW(h.0, &mut buf, FILE_NAME_NORMALIZED) } as usize;
+        if n == 0 {
+            return None;
+        }
+        if n < buf.len() {
+            let s = String::from_utf16_lossy(&buf[..n]);
+            return Some(canon(Path::new(&s)));
+        }
+        buf.resize(n + 1, 0);
+    }
+}
+
+/// Test helper: makes a junction `link` -> `target` with `mklink /J`. False if that failed.
+#[cfg(test)]
+pub(crate) fn make_junction(link: &Path, target: &Path) -> bool {
+    let ok = std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(link)
+        .arg(target)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !ok {
+        eprintln!("mklink /J failed here; junction test skipped");
+    }
+    ok
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use windows::Win32::Storage::FileSystem::GetShortPathNameW;
+
+    #[test]
+    fn real_location_resolves_a_junction_in_the_parents() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::write(real.join("f.txt"), b"x").unwrap();
+        let junc = dir.path().join("junc");
+        if !make_junction(&junc, &real) {
+            return;
+        }
+        let via = real_location(&junc.join("f.txt")).unwrap();
+        let direct = real_location(&real.join("f.txt")).unwrap();
+        assert_eq!(via, direct);
+        assert!(via.ends_with(r"\real\f.txt"), "{via}");
+        assert!(real_location(&dir.path().join("missing")).is_none());
+    }
 
     fn c(p: &str) -> String {
         canon(Path::new(p))

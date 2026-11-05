@@ -31,6 +31,10 @@ pub enum Lock {
     LinkedPc,
     /// Not an absolute drive-letter path (relative, UNC, device, volume-GUID...). Fails closed.
     UnsupportedPath,
+    /// The candidate is itself a link (junction or symlink). Never followed, never removed.
+    ReparsePoint,
+    /// A folder an app owns, found when the engine looked (at review or at removal).
+    Claimed,
 }
 
 /// How sure Seek is that a leftover folder is dead.
