@@ -58,13 +58,13 @@ pub struct Stat {
     pub cloud: bool,
 }
 
-const ATTR_DIRECTORY: u32 = 0x10;
-const ATTR_REPARSE: u32 = 0x400;
+pub(crate) const ATTR_DIRECTORY: u32 = 0x10;
+pub(crate) const ATTR_REPARSE: u32 = 0x400;
 const ATTR_OFFLINE: u32 = 0x1000;
 const ATTR_RECALL_ON_OPEN: u32 = 0x4_0000;
 const ATTR_RECALL_ON_DATA_ACCESS: u32 = 0x40_0000;
 
-fn is_cloud(attrs: u32) -> bool {
+pub(crate) fn is_cloud(attrs: u32) -> bool {
     attrs & (ATTR_OFFLINE | ATTR_RECALL_ON_OPEN | ATTR_RECALL_ON_DATA_ACCESS) != 0
 }
 

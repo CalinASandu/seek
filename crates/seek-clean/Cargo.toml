@@ -9,11 +9,15 @@ rust-version.workspace = true
 serde = { workspace = true }
 # Review tokens are random; already in the workspace (seek-hub, seek-sync).
 rand = { workspace = true }
+# Duplicate finder: equality is the full BLAKE3 hash of the whole file (named by the spec).
+blake3 = { workspace = true }
 windows = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Storage_FileSystem",
     "Win32_System_Com",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
     "Win32_System_Registry",
     "Win32_System_Threading",
     "Win32_UI_Shell",

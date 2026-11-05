@@ -3,6 +3,7 @@
 
 #![cfg(windows)]
 
+pub mod dupes;
 pub mod engine;
 pub mod facts;
 pub mod model;
