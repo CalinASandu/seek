@@ -41,6 +41,11 @@ pub fn open_path(path: &str) -> Result<(), String> {
     shell_execute("open", path, None)
 }
 
+/// Opens the Recycle Bin in Explorer.
+pub fn open_recycle_bin() -> Result<(), String> {
+    shell_execute("open", "shell:RecycleBinFolder", None)
+}
+
 pub fn reveal_path(path: &str) -> Result<(), String> {
     let target = Path::new(path);
     if target.exists() {

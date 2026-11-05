@@ -196,6 +196,8 @@ export interface DupScanState {
   checkedBytes: number;
   totalBytes: number;
   current: string | null;
+  /** Something the scan left out or couldn't read, in plain words; kept after the scan ends. */
+  notice?: string | null;
 }
 export type CleanEvent =
   | { type: "group"; group: DupGroup }

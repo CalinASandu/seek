@@ -310,6 +310,25 @@ fn tokens_are_random_and_only_eight_stay_valid() {
 }
 
 #[test]
+fn dropping_reviews_expires_every_token_and_removes_nothing() {
+    let env = Env::new(false);
+    let a = env.file("users/me/docs/a.bin", b"aa");
+    let b = env.file("users/me/docs/b.bin", b"aa");
+    let one = env.engine.prepare(vec![dups(&[&a, &b])], &[]);
+    let two = env.engine.prepare(vec![dups(&[&a, &b])], &[]);
+    env.engine.drop_reviews();
+    for t in [&one.token, &two.token] {
+        let e = env.engine.commit(t, &[0], &[]).unwrap_err();
+        assert!(e.contains("no longer valid"), "{e}");
+    }
+    assert!(env.rec.calls().is_empty());
+    assert!(a.exists() && b.exists());
+    // reviews made after the drop work as before
+    let again = env.engine.prepare(vec![dups(&[&a, &b])], &[]);
+    assert!(env.engine.commit(&again.token, &[0], &[]).is_ok());
+}
+
+#[test]
 fn an_item_not_in_the_token_is_refused() {
     let env = Env::new(false);
     let a = env.file("users/me/docs/a.bin", b"aa");

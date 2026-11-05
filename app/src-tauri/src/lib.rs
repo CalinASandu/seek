@@ -1,5 +1,6 @@
 //! Seek desktop app: Tauri shell around the React UI, talking to seek-service over a named pipe.
 
+mod cleanup;
 mod commands;
 mod pipe;
 mod service_ctl;
@@ -15,6 +16,7 @@ use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager, WindowEvent};
 
+use cleanup::CleanState;
 use pipe::ServiceLink;
 
 fn show_main(app: &AppHandle) {
@@ -37,10 +39,11 @@ fn toggle_main(app: &AppHandle) {
 
 /// Tells the service while the window is showing, so its indexes are in memory before the first search.
 /// Once the window is hidden the service unloads them.
-async fn keep_service_awake(app: AppHandle, link: Arc<ServiceLink>) {
+async fn keep_service_awake(app: AppHandle, link: Arc<ServiceLink>, clean: Arc<CleanState>) {
     const LOOK_EVERY: Duration = Duration::from_millis(500);
     const REPEAT_EVERY: Duration = Duration::from_secs(20);
     let mut told: Option<Instant> = None;
+    let mut hidden_since: Option<Instant> = None;
     loop {
         tokio::time::sleep(LOOK_EVERY).await;
         let showing = app
@@ -48,10 +51,16 @@ async fn keep_service_awake(app: AppHandle, link: Arc<ServiceLink>) {
             .is_some_and(|w| w.is_visible().unwrap_or(false) && !w.is_minimized().unwrap_or(false));
         if !showing {
             told = None;
-        } else if told.is_none_or(|t| t.elapsed() >= REPEAT_EVERY) {
-            told = Some(Instant::now());
-            let _ = link.request(Request::Wake).await;
+            hidden_since.get_or_insert_with(Instant::now);
+        } else {
+            hidden_since = None;
+            if told.is_none_or(|t| t.elapsed() >= REPEAT_EVERY) {
+                told = Some(Instant::now());
+                let _ = link.request(Request::Wake).await;
+            }
         }
+        // Finished duplicate results do not outlast a long absence (see `cleanup`).
+        clean.window_hidden_for(hidden_since.map(|t| t.elapsed()));
     }
 }
 
@@ -83,18 +92,20 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let link = Arc::new(ServiceLink::default());
+    let clean = Arc::new(CleanState::default());
     tauri::Builder::default()
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             Some(vec!["--minimized"]),
         ))
         .manage(link.clone())
+        .manage(clean.clone())
         .setup(move |app| {
             let handle = app.handle().clone();
             let events_link = link.clone();
             tauri::async_runtime::spawn(async move { events_link.run_events(handle).await });
             let (handle, wake_link) = (app.handle().clone(), link.clone());
-            tauri::async_runtime::spawn(keep_service_awake(handle, wake_link));
+            tauri::async_runtime::spawn(keep_service_awake(handle, wake_link, clean.clone()));
             // Shares get their own connection: a multi-megabyte index upload must not sit in front of
             // the window's searches on the shared one.
             app.manage(shares::start(Arc::new(ServiceLink::default())));
@@ -143,6 +154,12 @@ pub fn run() {
             commands::space_tree,
             commands::space_largest,
             commands::space_types,
+            cleanup::clean_scan_start,
+            cleanup::clean_scan_cancel,
+            cleanup::clean_scan_state,
+            cleanup::clean_prepare,
+            cleanup::clean_commit,
+            cleanup::open_recycle_bin,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Seek");

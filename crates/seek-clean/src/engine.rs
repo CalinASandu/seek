@@ -325,6 +325,15 @@ impl Engine {
         (lock, admin, drive)
     }
 
+    /// Forgets every outstanding review: their tokens stop working (the sheet reports it expired)
+    /// and what they remembered about the disk is freed. Removes nothing.
+    pub fn drop_reviews(&self) {
+        self.tokens
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
+
     /// Takes the token out of the store (single use) and returns its review.
     fn take(&self, token: &str) -> Option<Review> {
         let mut tokens = self.tokens.lock().unwrap();

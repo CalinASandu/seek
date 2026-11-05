@@ -3,7 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import type { CleanEvent, SeekApi, SeekEvent } from "./types";
 
 export const EVENT_CHANNEL = "seek://event";
-/** Duplicate-scan events of the Decimator (the Rust side arrives in a later task). */
+/** Duplicate-scan events of the Decimator (`app/src-tauri/src/cleanup.rs`). */
 export const CLEAN_EVENT_CHANNEL = "seek://clean";
 
 export function createTauriApi(): SeekApi {
@@ -37,8 +37,9 @@ export function createTauriApi(): SeekApi {
     spaceTree: (deviceId, path, depth) => invoke("space_tree", { deviceId, path, depth }),
     spaceLargest: (deviceId, path, limit) => invoke("space_largest", { deviceId, path, limit }),
     spaceTypes: (deviceId, path) => invoke("space_types", { deviceId, path }),
-    // Decimator: the Rust commands arrive in later tasks. Until then each call rejects ("command not found"),
-    // which the view shows as a plain error; nothing here runs at load.
+    // Decimator. Rust has clean_scan_start / _cancel / _state, clean_prepare, clean_commit and open_recycle_bin.
+    // The rest (leftovers, apps, history, put back, uninstall) arrive in later tasks; until then each of those
+    // rejects ("command not found"), which the view shows as a plain error. Nothing here runs at load.
     cleanScanStart: (deviceIds) => invoke("clean_scan_start", { deviceIds }),
     cleanScanCancel: () => invoke("clean_scan_cancel"),
     cleanScanState: () => invoke("clean_scan_state"),
