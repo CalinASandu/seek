@@ -159,9 +159,9 @@ This can't be exact. Portable tools have folders in AppData with no uninstall en
 | Name only roughly matches the app | -2 | Apps |
 | Folder is named after the company, not the product | -2 | Apps |
 | Each level of depth below the top (at most 2 levels) | -2 | Apps |
-| Another installed app has a similar name | -2 | Apps |
+| Another installed app has a similar name | -2 | Both |
 | Empty folder, or nothing left but empty folders | +4 | Both |
-| No subfolders | +2 | Both |
+| No subfolders | +1 | Both |
 | Nothing inside changed for a year | +2 | Both |
 | Generic name (`Data`, `Common`, `Shared`, `Bin`, `Config`) | -3 | Both |
 | Contains programs (`.exe`, `.dll`) | -4 | Both |

@@ -58,7 +58,7 @@ fn later() -> i64 {
 }
 
 fn run(w: &World, claims: &dyn ClaimCheck, installed: &InstalledNames, now: i64) -> Vec<LeftoverRow> {
-    scan_with(&w.places, claims, installed, now, &walk).rows
+    scan_with(&w.places, claims, installed, now, &NoIndex, &walk).rows
 }
 
 fn find<'a>(rows: &'a [LeftoverRow], name: &str) -> &'a LeftoverRow {
@@ -221,7 +221,7 @@ fn an_unreadable_folder_does_not_fail_the_scan() {
         put(&w.local.join(n), "a.txt", 1);
     }
     let walker = |p: &Path| if p.ends_with("Bad") { None } else { walk(p) };
-    let out = scan_with(&w.places, &Claims::default(), &names(), later(), &walker);
+    let out = scan_with(&w.places, &Claims::default(), &names(), later(), &NoIndex, &walker);
     assert_eq!(out.rows.len(), 2);
     assert_eq!(out.left_out, 1);
     assert!(!out.rows.iter().any(|r| r.path.ends_with("Bad")));
@@ -240,7 +240,7 @@ fn a_folder_that_vanishes_mid_scan_is_dropped() {
         }
         walk(p)
     };
-    let out = scan_with(&w.places, &Claims::default(), &names(), later(), &walker);
+    let out = scan_with(&w.places, &Claims::default(), &names(), later(), &NoIndex, &walker);
     assert_eq!(out.rows.len(), 1);
     assert!(out.rows[0].path.ends_with("Stays"));
 }
@@ -299,8 +299,8 @@ fn a_folder_named_after_a_publisher_with_an_installed_app_scores_low() {
         assert!(r.reasons.iter().any(|x| x.points == -4));
     }
     assert!(!has_reason(find(&rows, "Unrelated Studio"), "publisher still has an app"));
-    // -4 against a 4-point "no subfolders" + "a year" leaves these at "not sure", not "very likely".
-    assert_eq!(find(&rows, "Google").level, Level::NotSure);
+    // -4 against "no subfolders" (+1) and "a year" (+2) is below zero.
+    assert_eq!(find(&rows, "Google").level, Level::ProbablyInUse); // 1 + 2 - 4
 }
 
 #[test]
@@ -321,7 +321,7 @@ fn nothing_is_called_safe() {
         assert!(!t.to_lowercase().contains("safe"), "{t}");
     }
     // The facts argument is part of the signature even though the walk reads the disk itself.
-    let all = scan(&w.places, &Claims::default(), &installed, &RealFacts);
+    let all = scan(&w.places, &Claims::default(), &installed, &RealFacts, &NoIndex);
     assert_eq!(all.len(), rows.len());
 }
 
@@ -351,7 +351,7 @@ fn real_leftovers_list() {
         r
     };
     let started = std::time::Instant::now();
-    let out = scan_with(&places, &claims, &installed, unix_now_ms(), &walker);
+    let out = scan_with(&places, &claims, &installed, unix_now_ms(), &NoIndex, &walker);
     let elapsed = started.elapsed();
     let mut per = per_cell.into_inner();
 
@@ -376,4 +376,48 @@ fn real_leftovers_list() {
     }
     let file = r"D:\Programming\seek\.superpowers\sdd\2026-11-05-seek-decimator\task-11-real-list.txt";
     std::fs::write(file, text).unwrap();
+}
+
+/// Answers for folders by name; `None` for the rest. Remembers what it was asked.
+struct FakeIndex {
+    known: Vec<(&'static str, Summary)>,
+    asked: std::sync::Mutex<Vec<Vec<String>>>,
+}
+
+impl IndexFacts for FakeIndex {
+    fn summaries(&self, folders: &[PathBuf]) -> Vec<Option<Summary>> {
+        self.asked.lock().unwrap().push(folders.iter().map(|p| p.to_string_lossy().into_owned()).collect());
+        folders.iter().map(|p| self.known.iter().find(|(n, _)| p.ends_with(n)).map(|(_, s)| s.clone())).collect()
+    }
+}
+
+#[test]
+fn index_facts_are_used_and_the_walk_runs_only_for_none() {
+    let w = world();
+    for n in ["InIndex", "NotInIndex", "Online"] {
+        put(&w.local.join(n), "real.txt", 3);
+    }
+    let from_index = Summary { size: 12_345, files: 4, newest_ms: 1_000, subfolders: true, has_files: true, top: vec!["from-index".into()], ..Summary::default() };
+    let index = FakeIndex {
+        known: vec![("InIndex", from_index), ("Online", Summary { cloud: true, size: 1, ..Summary::default() })],
+        asked: Default::default(),
+    };
+    let walked = std::sync::Mutex::new(Vec::new());
+    let walker = |p: &Path| {
+        walked.lock().unwrap().push(p.file_name().unwrap().to_string_lossy().into_owned());
+        walk(p)
+    };
+    let out = scan_with(&w.places, &Claims::default(), &names(), later(), &index, &walker);
+    // One question for every candidate, not one per folder.
+    let asked = index.asked.lock().unwrap();
+    assert_eq!(asked.len(), 1);
+    assert_eq!(asked[0].len(), 3);
+    // The walk ran for the folder the index didn't know, and only for it.
+    assert_eq!(*walked.lock().unwrap(), vec!["NotInIndex".to_string()]);
+    let r = find(&out.rows, "InIndex");
+    assert_eq!((r.size, r.contents.clone()), (12_345, vec!["from-index".to_string()]));
+    assert_eq!(find(&out.rows, "NotInIndex").size, 3);
+    // A folder holding something online-only is left out, as the walk leaves it out.
+    assert!(!out.rows.iter().any(|r| r.path.ends_with("Online")));
+    assert_eq!(out.left_out, 1);
 }

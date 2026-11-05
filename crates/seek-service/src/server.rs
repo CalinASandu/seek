@@ -287,6 +287,7 @@ async fn handle(state: Arc<State>, conn: Arc<Conn>, req: Request) -> Response {
         Request::StaleData => tokio::task::spawn_blocking(move || Response::StaleData { files: state.stale_data() })
             .await
             .unwrap_or_else(|e| err(format!("listing stale data failed: {e}"))),
+        Request::FolderFacts { paths } => folder_facts(state, conn, paths).await,
         Request::Status => Response::Status(status(&state)),
         Request::Subscribe => Response::Ok,
         Request::StartPairing
@@ -641,6 +642,45 @@ async fn same_size_files(
 }
 
 /// `Some(None)` for the drive root, `Some(Some(row))` for a live folder, `None` when there is no such folder.
+/// What the index knows about each folder in `paths`, for the folders on this PC's online drives.
+/// Hidden rows are handled as the space view does; a hidden folder is not found.
+async fn folder_facts(state: Arc<State>, conn: Arc<Conn>, paths: Vec<String>) -> Response {
+    tokio::task::spawn_blocking(move || {
+        let me = state.host_id();
+        let mut facts: Vec<Option<seek_core::FolderFact>> = vec![None; paths.len()];
+        for s in state.snapshot("folder facts") {
+            if s.device.indexed_by_host != me || s.device.state != DeviceState::Online {
+                continue;
+            }
+            let mount = s.device.last_mount_point.as_str();
+            let prefix = format!("{}\\", mount.trim_end_matches('\\').to_lowercase());
+            let mine: Vec<usize> = (0..paths.len()).filter(|&i| paths[i].to_lowercase().starts_with(&prefix)).collect();
+            if mine.is_empty() {
+                continue;
+            }
+            let ix = s.index.read().unwrap();
+            let hidden = state.hidden_for(&s.device, &conn.sid, conn.elevated, &conn.hidden);
+            let mask = state.hidden_mask(&s.device, &ix, &conn.sid, &hidden);
+            let wanted: Vec<&str> = mine.iter().map(|&i| paths[i].as_str()).collect();
+            let found = ix.find_folders(mount, &wanted);
+            let visible: Vec<(usize, u32)> = mine
+                .iter()
+                .zip(found)
+                .filter_map(|(&i, row)| row.map(|r| (i, r)))
+                .filter(|&(_, r)| !mask.as_ref().is_some_and(|m| m[r as usize]))
+                .collect();
+            let rows: Vec<u32> = visible.iter().map(|&(_, r)| r).collect();
+            let got = seek_core::folder_facts(&ix, mask.as_deref().map(Vec::as_slice), &rows);
+            for ((i, _), f) in visible.into_iter().zip(got) {
+                facts[i] = Some(f);
+            }
+        }
+        Response::FolderFacts { facts }
+    })
+    .await
+    .unwrap_or_else(|e| err(format!("folder facts failed: {e}")))
+}
+
 fn space_folder(ix: &DeviceIndex, mount: &str, path: &str) -> Option<Option<u32>> {
     let path = path.trim_end_matches('\\');
     if path.eq_ignore_ascii_case(mount.trim_end_matches('\\')) {

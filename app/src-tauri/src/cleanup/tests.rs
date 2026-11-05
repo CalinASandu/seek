@@ -107,7 +107,7 @@ fn idle_core() -> Arc<Core> {
 }
 
 fn state_with(core: Arc<Core>) -> CleanState {
-    CleanState { core: Mutex::new(Some(core)), shared: Arc::new(Shared::default()), emit: Mutex::new(None) }
+    CleanState { core: Mutex::new(Some(core)), listed: Mutex::new(Default::default()), shared: Arc::new(Shared::default()), emit: Mutex::new(None) }
 }
 
 fn group(size: u64, paths: &[&str]) -> DupGroup {
@@ -292,10 +292,9 @@ fn folder_and_stale_requests_become_candidates() {
     assert!(matches!(&cands[1], Candidate::StaleFile { .. }));
     // A folder that merely looks like a log file, and that the service does not list, stays a folder.
     assert!(matches!(&cands[2], Candidate::Folder { .. }));
-    // Only leftover and uninstall folders are removed this way.
+    // Only leftover folders are removed this way.
     assert!(folder_candidates(Why::Duplicate, vec![f(r"C:\x")], &[]).is_err());
     assert!(folder_candidates(Why::StaleData, vec![f(r"C:\x")], &[]).is_err());
-    assert!(folder_candidates(Why::Uninstall, vec![f(r"C:\x")], &[]).is_ok());
     // A stale request keeps only what the service still calls stale.
     let wanted = vec![r"C:\ProgramData\Seek\indexes\old.seekidx".to_string(), r"C:\ProgramData\Seek\indexes\live.seekidx".to_string()];
     let cands = stale_candidates(wanted, &listed);
@@ -901,4 +900,121 @@ fn after_a_commit_the_scan_state_no_longer_lists_what_was_moved() {
 
     // a rejected commit is a plain error and prunes nothing
     assert!(state.commit(&core, "no-such-token", &[0], &[]).is_err());
+}
+
+#[test]
+fn an_uninstall_folder_request_is_refused_for_now() {
+    let f = ReqFolder { path: r"C:\Users\me\AppData\Local\Old".into(), level: None, reasons: vec![] };
+    let e = folder_candidates(Why::Uninstall, vec![f], &[]).unwrap_err();
+    assert!(e.contains("Leftovers list"), "{e}");
+}
+
+#[test]
+fn a_leftover_path_not_in_the_last_list_is_refused() {
+    let shown = vec![folder_row(r"C:\Users\me\AppData\Local\Old", Level::Likely), stale_row(&stale(r"C:\ProgramData\Seek\indexes\a.seekidx"))];
+    let listed = listed_set(&shown);
+    // What was shown is accepted, however it is spelled.
+    assert!(check_listed([r"c:\users\ME\appdata\local\old", r"C:\ProgramData\Seek\indexes\A.SEEKIDX"], &listed).is_ok());
+    // Anything else is not, even a real folder one level up or somewhere else entirely.
+    for p in [r"C:\Users\me\Documents\Photos", r"D:\Projects", r"C:\Users\me\AppData\Local", r"C:\Users\me\AppData\Local\Old\Sub"] {
+        let e = check_listed([r"C:\Users\me\AppData\Local\Old", p], &listed).unwrap_err();
+        assert!(e.contains(p), "{e}");
+    }
+    // Before any list was shown, nothing is accepted.
+    assert!(check_listed([r"C:\x"], &listed_set(&[])).is_err());
+}
+
+#[test]
+fn stale_rows_sort_by_size_within_their_level() {
+    let mut small = folder_row(r"C:\a\small", Level::VeryLikely);
+    small.size = 10;
+    let mut big = folder_row(r"C:\a\big", Level::VeryLikely);
+    big.size = 9_000;
+    let mut file = stale(r"C:\ProgramData\Seek\indexes\mid.seekidx");
+    file.size = 500;
+    let rows = merge_leftovers(vec![small, big], Ok(vec![file]));
+    let sizes: Vec<u64> = rows.iter().map(|r| r.size).collect();
+    assert_eq!(sizes, vec![9_000, 500, 10]);
+}
+
+#[test]
+fn index_facts_become_a_summary() {
+    let fact = seek_core::FolderFact {
+        size: 5,
+        files: 2,
+        newest_modified: 77,
+        has_files: true,
+        has_subfolders: true,
+        has_programs: true,
+        has_link: false,
+        has_cloud: true,
+        top_names: vec!["a".into()],
+    };
+    let s = summary_of(fact);
+    assert_eq!((s.size, s.files, s.newest_ms), (5, 2, 77));
+    assert!(s.has_files && s.subfolders && s.programs && s.cloud);
+    assert_eq!(s.top, vec!["a".to_string()]);
+}
+
+#[test]
+fn a_stale_row_says_what_the_file_is() {
+    assert_eq!(stale_row(&stale(r"C:\ProgramData\Seek\indexes\a.seekidx")).contents, vec!["Seek's index for a drive it no longer knows".to_string()]);
+    assert_eq!(stale_row(&stale(r"C:\ProgramData\Seek\journal\a.log")).contents, vec!["Seek's change log for a drive it no longer knows".to_string()]);
+}
+
+/// Read-only run on this PC against the running service: the scan with the index's facts, then 10
+/// folders compared with what a walk of the disk says. Writes the list file; removes nothing.
+/// If the running service does not know `FolderFacts` (an older build), it says so and stops.
+#[test]
+#[ignore = "reads this PC's folders and talks to the running service; writes only the list file"]
+fn real_leftovers_list_with_index() {
+    use leftovers::IndexFacts;
+    use std::fmt::Write as _;
+    let link = Arc::new(ServiceLink::default());
+    let index = ServiceIndex(link.clone());
+    let probe = tauri::async_runtime::block_on(link.request(Request::FolderFacts { paths: vec![r"C:\Windows".to_string()] }));
+    match probe {
+        Ok(Response::FolderFacts { .. }) => {}
+        other => {
+            println!("NO INDEX FACTS: the running service did not answer FolderFacts: {other:?}");
+            return;
+        }
+    }
+    let places = Places::from_system().expect("places");
+    let claims = LiveClaims::new();
+    let installed = claims::read_installed_names();
+    let t = Instant::now();
+    let rows = leftovers::scan(&places, &claims, &installed, &RealFacts, &index);
+    let elapsed = t.elapsed();
+
+    // Which folders did the index know? Ask again for the same rows.
+    let paths: Vec<PathBuf> = rows.iter().map(|r| PathBuf::from(&r.path)).collect();
+    let known = index.summaries(&paths);
+    let in_index = known.iter().filter(|k| k.is_some()).count();
+
+    let mut text = String::new();
+    writeln!(text, "elapsed_ms: {} (with the service's index)", elapsed.as_millis()).unwrap();
+    writeln!(text, "rows: {}, of which the index knew {}", rows.len(), in_index).unwrap();
+    for level in [Level::VeryLikely, Level::Likely, Level::NotSure, Level::ProbablyInUse] {
+        writeln!(text, "  {level:?}: {}", rows.iter().filter(|r| r.level == level).count()).unwrap();
+    }
+    // Ten folders of different sizes, index against walk.
+    let mut by_size: Vec<usize> = (0..rows.len()).filter(|&i| known[i].is_some()).collect();
+    by_size.sort_by_key(|&i| rows[i].size);
+    let picks: Vec<usize> = (0..10).filter_map(|k| by_size.get(k * by_size.len().max(1) / 10).copied()).collect();
+    writeln!(text, "\nindex vs walk (size, files, newest change):").unwrap();
+    for i in picks {
+        let (idx, walked) = (known[i].as_ref().unwrap(), leftovers::walk(&paths[i]));
+        let w = match &walked {
+            Some(w) => format!("size {} files {} newest {}", w.size, w.files, w.newest_ms),
+            None => "walk failed".to_string(),
+        };
+        writeln!(text, "{} | index: size {} files {} newest {} | walk: {w}", rows[i].path, idx.size, idx.files, idx.newest_ms).unwrap();
+    }
+    writeln!(text, "\nlevel | size | name | reasons").unwrap();
+    for r in &rows {
+        let reasons: Vec<String> = r.reasons.iter().map(|x| format!("{:+} {}", x.points, x.text)).collect();
+        writeln!(text, "{:?} | {} | {} | {}", r.level, r.size, r.path, reasons.join("; ")).unwrap();
+    }
+    std::fs::write(r"D:\Programming\seek\.superpowers\sdd\2026-11-05-seek-decimator\task-11-real-list-index.txt", text).unwrap();
 }

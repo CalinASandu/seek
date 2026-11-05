@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub use seek_core::{Device, DeviceId, ResultRow, SortKey, SpaceNode, TypeTotal};
+pub use seek_core::{Device, DeviceId, FolderFact, ResultRow, SortKey, SpaceNode, TypeTotal};
 
 pub const PIPE_NAME: &str = r"\\.\pipe\seek-v1";
 pub const PROTOCOL_VERSION: u32 = 3;
@@ -77,6 +77,9 @@ pub enum Request {
     SameSizeFiles { min_size: u64, device_ids: Vec<DeviceId>, cursor: Option<u64>, limit: u32 },
     /// Seek's own index and journal files that no known drive owns. Read-only.
     StaleData,
+    /// What the index knows about each folder (full paths), parallel to `paths`; `None` where the
+    /// folder is not in a loaded index of this PC. Read-only.
+    FolderFacts { paths: Vec<String> },
 }
 
 /// A file in the service's data folder that no known drive owns. `modified` is unix epoch milliseconds.
@@ -123,6 +126,7 @@ pub enum Response {
     /// `next` = the size to pass as `cursor` for the following page; `None` = that was the last page.
     SameSizeFiles { groups: Vec<SizeGroup>, next: Option<u64> },
     StaleData { files: Vec<StaleFile> },
+    FolderFacts { facts: Vec<Option<FolderFact>> },
     Memory { report: MemoryReport },
 }
 

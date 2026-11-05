@@ -388,13 +388,22 @@ pub fn stale_row(f: &StaleFile) -> LeftoverRow {
         needs_admin: true,
         level: seek_clean::confidence::level(STALE_POINTS),
         reasons: vec![Reason { text: STALE_REASON.to_string(), points: STALE_POINTS }],
-        contents: Vec::new(),
+        contents: vec![stale_line(&f.path).to_string()],
+    }
+}
+
+/// What a stale file is, in the place where the window lists what is inside a row.
+fn stale_line(path: &str) -> &'static str {
+    if path.to_lowercase().ends_with(".log") {
+        "Seek's change log for a drive it no longer knows"
+    } else {
+        "Seek's index for a drive it no longer knows"
     }
 }
 
 /// The folder rows with Seek's own stale files added. If the service could not be asked, the
 /// folders are still the answer and there are simply no stale rows. Highest level first; within
-/// a level the order the scan gave (most likely, then biggest) is kept.
+/// a level the biggest first, as the window lists them.
 pub fn merge_leftovers(folders: Vec<LeftoverRow>, stale: Result<Vec<StaleFile>, String>) -> Vec<LeftoverRow> {
     let mut rows = folders;
     match stale {
@@ -407,17 +416,63 @@ pub fn merge_leftovers(folders: Vec<LeftoverRow>, stale: Result<Vec<StaleFile>, 
         Level::NotSure => 2,
         Level::ProbablyInUse => 3,
     };
-    rows.sort_by_key(|r| rank(r.level));
+    rows.sort_by_key(|r| (rank(r.level), std::cmp::Reverse(r.size)));
     rows
 }
 
-/// The folders on this PC that nothing claims, scored. Slow (it reads every folder's metadata),
-/// so only ever called from a thread of its own. It builds its own claims, so it shares no lock
-/// with the removal path.
-fn scan_folders(core: &Core) -> Vec<LeftoverRow> {
+/// Facts about folders from Seek's own index, asked of the service in one request. Called from a
+/// thread that may block. If the service can't be reached, it knows nothing and the folders are walked.
+struct ServiceIndex(Arc<ServiceLink>);
+
+pub fn summary_of(f: seek_core::FolderFact) -> leftovers::Summary {
+    leftovers::Summary {
+        size: f.size,
+        files: f.files,
+        newest_ms: f.newest_modified,
+        subfolders: f.has_subfolders,
+        has_files: f.has_files,
+        programs: f.has_programs,
+        top: f.top_names,
+        cloud: f.has_cloud,
+    }
+}
+
+impl leftovers::IndexFacts for ServiceIndex {
+    fn summaries(&self, folders: &[PathBuf]) -> Vec<Option<leftovers::Summary>> {
+        let paths: Vec<String> = folders.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+        match tauri::async_runtime::block_on(self.0.request(Request::FolderFacts { paths })) {
+            Ok(Response::FolderFacts { facts }) if facts.len() == folders.len() => {
+                facts.into_iter().map(|f| f.map(summary_of)).collect()
+            }
+            other => {
+                tracing::warn!("folder facts not available, walking the folders: {other:?}");
+                vec![None; folders.len()]
+            }
+        }
+    }
+}
+
+/// The folders on this PC that nothing claims, scored. Slow when it has to walk (it reads every
+/// folder's metadata), so only ever called from a thread of its own. It builds its own claims, so it
+/// shares no lock with the removal path.
+fn scan_folders(core: &Core, link: Arc<ServiceLink>) -> Vec<LeftoverRow> {
     let claims = LiveClaims::new();
     let installed = claims::read_installed_names();
-    leftovers::scan(&core.places, &claims, &installed, &*core.facts)
+    leftovers::scan(&core.places, &claims, &installed, &*core.facts, &ServiceIndex(link))
+}
+
+/// The paths of the last list `clean_leftovers` gave, lowercased and in `canon` form.
+pub fn listed_set(rows: &[LeftoverRow]) -> HashSet<String> {
+    rows.iter().map(|r| canon(Path::new(&r.path))).collect()
+}
+
+/// Refuses a leftover or stale request for a path that was not in the last list. The window only
+/// asks for what it was shown; anything else is not a request Seek made.
+pub fn check_listed<'a>(paths: impl IntoIterator<Item = &'a str>, listed: &HashSet<String>) -> Result<(), String> {
+    match paths.into_iter().find(|p| !listed.contains(&canon(Path::new(p)))) {
+        None => Ok(()),
+        Some(p) => Err(format!("{p} isn't in the list of leftovers Seek last showed, so it can't be removed from here. Look again, then review it.")),
+    }
 }
 
 fn same_place(a: &str, b: &str) -> bool {
@@ -426,10 +481,11 @@ fn same_place(a: &str, b: &str) -> bool {
 
 /// Candidates for a request to remove leftover folders. A path the service reports as stale is
 /// one of Seek's own files (`StaleFile`); anything else is a folder, and the engine refuses
-/// whatever is not one. `why` can only be `Leftover` or `Uninstall`.
+/// whatever is not one. `why` can only be `Leftover` for now: removing what an uninstall left
+/// behind gets its own checks later.
 pub fn folder_candidates(why: Why, folders: Vec<ReqFolder>, stale: &[StaleFile]) -> Result<Vec<Candidate>, String> {
-    if !matches!(why, Why::Leftover | Why::Uninstall) {
-        return Err("Seek can only remove leftover folders this way.".to_string());
+    if why != Why::Leftover {
+        return Err("Seek can only remove folders from the Leftovers list this way.".to_string());
     }
     Ok(folders
         .into_iter()
@@ -699,6 +755,8 @@ impl Core {
 
 pub struct CleanState {
     core: Mutex<Option<Arc<Core>>>,
+    /// What the last Leftovers list held.
+    listed: Mutex<HashSet<String>>,
     shared: Arc<Shared>,
     /// Sends events to the window; set once the app exists.
     emit: Mutex<Option<Arc<Emit>>>,
@@ -706,7 +764,7 @@ pub struct CleanState {
 
 impl Default for CleanState {
     fn default() -> Self {
-        CleanState { core: Mutex::new(None), shared: Arc::new(Shared::default()), emit: Mutex::new(None) }
+        CleanState { core: Mutex::new(None), listed: Mutex::new(HashSet::new()), shared: Arc::new(Shared::default()), emit: Mutex::new(None) }
     }
 }
 
@@ -914,10 +972,13 @@ pub fn clean_scan_state(clean: Clean<'_>) -> ScanState {
 #[tauri::command]
 pub async fn clean_leftovers(clean: Clean<'_>, link: State<'_, Arc<ServiceLink>>) -> Result<Vec<LeftoverRow>, String> {
     let core = clean.core()?;
-    let walk = tauri::async_runtime::spawn_blocking(move || scan_folders(&core));
+    let own_link: Arc<ServiceLink> = (*link).clone();
+    let walk = tauri::async_runtime::spawn_blocking(move || scan_folders(&core, own_link));
     let stale = fetch_stale(&link).await;
     let folders = walk.await.map_err(|e| format!("Looking for leftovers stopped unexpectedly: {e}"))?;
-    Ok(merge_leftovers(folders, stale))
+    let rows = merge_leftovers(folders, stale);
+    *clean.listed.lock().unwrap_or_else(|e| e.into_inner()) = listed_set(&rows);
+    Ok(rows)
 }
 
 #[tauri::command]
@@ -932,11 +993,15 @@ pub async fn clean_prepare(clean: Clean<'_>, link: State<'_, Arc<ServiceLink>>, 
             candidates_from_request(groups, &owners)
         }
         PrepareRequest::Folders { why, folders } => {
+            check_listed(folders.iter().map(|f| f.path.as_str()), &clean.listed.lock().unwrap_or_else(|e| e.into_inner()))?;
             // Which files are stale is also asked now. Only a request that names one needs the answer.
             let stale = if folders.iter().any(|f| looks_stale(&f.path)) { fetch_stale(&link).await? } else { Vec::new() };
             folder_candidates(why, folders, &stale)?
         }
-        PrepareRequest::Stale { files } => stale_candidates(files, &fetch_stale(&link).await?),
+        PrepareRequest::Stale { files } => {
+            check_listed(files.iter().map(String::as_str), &clean.listed.lock().unwrap_or_else(|e| e.into_inner()))?;
+            stale_candidates(files, &fetch_stale(&link).await?)
+        }
     };
     tauri::async_runtime::spawn_blocking(move || core.engine.prepare(candidates, &protected))
         .await

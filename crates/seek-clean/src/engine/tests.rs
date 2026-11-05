@@ -202,7 +202,8 @@ impl Env {
             &s("users/me"),
             &s("pd"),
             &[&s("users/me/appdata")],
-        );
+        )
+        .with_scan_root_for_tests(&s("left"));
         let rec = Arc::new(FakeRecycler::default());
         let claims = Arc::new(FakeClaims::default());
         let elev = Arc::new(FakeElevator::default());
@@ -516,7 +517,7 @@ fn admin_items_go_through_the_elevator_in_one_call() {
 #[test]
 fn a_stale_file_needs_admin() {
     let env = Env::new(false);
-    let f = env.file("pd/Seek/old.dat", b"x");
+    let f = env.file("pd/Seek/indexes/old.seekidx", b"x");
     let prep = env
         .engine
         .prepare(vec![Candidate::StaleFile { path: f.clone() }], &[]);
@@ -950,7 +951,10 @@ fn a_claim_on_the_real_location_counts() {
         .insert(PathBuf::from(canon(&env.p("left/realdir/app"))));
     let prep = env
         .engine
-        .prepare(vec![leftover(&env.p("left/jumpdir/app"))], &[]);
+        .prepare(
+            vec![Candidate::Folder { path: env.p("left/jumpdir/app"), why: Why::Uninstall, level: None, reasons: vec![] }],
+            &[],
+        );
     assert_eq!(prep.items[0].lock, Some(Lock::Claimed));
 }
 
@@ -1073,4 +1077,56 @@ fn a_file_swapped_for_a_look_alike_stays() {
     let r = env.engine.commit(&prep.token, &[1], &[]).unwrap();
     assert!(left(&r, 1).contains("changed"));
     assert!(b.exists() && env.rec.calls().is_empty());
+}
+
+#[test]
+fn a_leftover_request_outside_the_scan_roots_is_locked() {
+    let env = Env::new(false);
+    env.file("users/me/docs/Photos/a.jpg", b"x");
+    env.file("elsewhere/Projects/a.rs", b"x");
+    let prep = env
+        .engine
+        .prepare(vec![leftover(&env.p("users/me/docs/Photos")), leftover(&env.p("elsewhere/Projects"))], &[]);
+    assert_eq!(prep.items.len(), 2);
+    for item in &prep.items {
+        assert_eq!(item.lock, Some(Lock::UnsupportedPath), "{}", item.path);
+    }
+    // Commit refuses them too.
+    let r = env.engine.commit(&prep.token, &[0, 1], &[]).unwrap();
+    assert!(r.items.iter().all(|i| matches!(i.outcome, Outcome::Left { .. })));
+    assert!(env.p("elsewhere/Projects/a.rs").exists());
+}
+
+#[test]
+fn a_leftover_request_two_levels_deep_is_locked() {
+    let env = Env::new(false);
+    env.file("left/app/inner/a.bin", b"x");
+    env.file("left/app2/a.bin", b"x");
+    let prep = env.engine.prepare(vec![leftover(&env.p("left/app/inner")), leftover(&env.p("left/app2"))], &[]);
+    assert_eq!(prep.items[0].lock, Some(Lock::UnsupportedPath));
+    assert_eq!(prep.items[1].lock, None);
+}
+
+#[test]
+fn a_stale_request_outside_seeks_data_folder_is_locked() {
+    let env = Env::new(false);
+    let ok_idx = env.file("pd/Seek/indexes/a.seekidx", b"x");
+    let ok_log = env.file("pd/Seek/journal/a.LOG", b"x");
+    let other = env.file("pd/Other/a.seekidx", b"x");
+    let wrong_ext = env.file("pd/Seek/indexes/devices.json", b"x");
+    let swapped = env.file("pd/Seek/journal/a.seekidx", b"x");
+    let nested = env.file("pd/Seek/indexes/sub/a.seekidx", b"x");
+    let docs = env.file("users/me/docs/a.seekidx", b"x");
+    let prep = env.engine.prepare(
+        [&ok_idx, &ok_log, &other, &wrong_ext, &swapped, &nested, &docs]
+            .iter()
+            .map(|p| Candidate::StaleFile { path: (*p).clone() })
+            .collect(),
+        &[],
+    );
+    let locks: Vec<Option<Lock>> = prep.items.iter().map(|i| i.lock).collect();
+    let bad = Some(Lock::UnsupportedPath);
+    assert_eq!(locks[0], None);
+    assert_eq!(locks[1], None);
+    assert_eq!(&locks[2..], &[bad; 5], "{locks:?}");
 }

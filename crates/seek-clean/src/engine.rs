@@ -13,7 +13,7 @@ use crate::model::{
     ReviewItem, Why,
 };
 use crate::paths::{canon, is_inside, real_location, target_location};
-use crate::protect::{lock_for, Places};
+use crate::protect::{candidate_lock, lock_for, Places};
 use crate::reasons::*;
 use support::{in_system_store, inside_any, new_token, run_admin, spellings};
 
@@ -296,6 +296,9 @@ impl Engine {
                 .any(|p| spell.iter().any(|s| is_inside(p, s)))
         {
             lock = Some(Lock::Protected);
+        }
+        if lock.is_none() {
+            lock = candidate_lock(&self.places, c, why);
         }
         let pf = |s: &&str| self.places.in_program_files(s);
         let admin = why == Why::StaleData || (why == Why::Leftover && spell.iter().any(pf));
