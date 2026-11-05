@@ -515,6 +515,9 @@ export function createMockApi(opts: MockOptions = {}): SeekApi {
       await delay();
       return { ...settings, excludeFolders: [...settings.excludeFolders], protectedPaths: [...settings.protectedPaths] };
     },
+    async settingsProblem() {
+      return null;
+    },
     async setSettings(s) {
       await delay();
       settings = { ...s, protectedPaths: s.protectedPaths ?? [] };

@@ -202,7 +202,11 @@ export interface DupScanState {
 export type CleanEvent =
   | { type: "group"; group: DupGroup }
   | { type: "progress"; checkedBytes: number; totalBytes: number; current: string | null }
-  | { type: "done" };
+  | { type: "done" }
+  /** The backend let go of the finished results after a long absence: nothing is left to show. */
+  | { type: "dropped" }
+  /** The whole notice text, sent as soon as it is raised. */
+  | { type: "notice"; text: string };
 
 export interface LeftoverRow {
   path: string;
@@ -300,7 +304,10 @@ export interface SeekApi {
   serviceState(): Promise<ServiceState>;
   installService(): Promise<void>;
   getSettings(): Promise<Settings>;
+  /** Rejects when the settings could not be saved (for instance an unreadable settings file that must not be overwritten). */
   setSettings(s: Settings): Promise<void>;
+  /** Why the saved settings, and so the protected list, can't be used; null when they can. */
+  settingsProblem(): Promise<string | null>;
   startPairing(): Promise<PairingCode>;
   discoveredPcs(): Promise<PcInfo[]>;
   joinPairing(addr: string, code: string): Promise<void>;

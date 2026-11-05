@@ -80,13 +80,14 @@ function Shell() {
 
   const { devices, status, progress, peers, hub, refresh } = useDevices();
   const remotePc = useMemo(() => remotePcNames(devices, peers), [devices, peers]);
-  const { settings, update } = useSettings();
+  const { settings, problem: settingsProblem, update } = useSettings();
   const settingsRef = useRef(settings);
   settingsRef.current = settings;
   const protectPath = useCallback(
-    (path: string) => {
+    async (path: string): Promise<void> => {
       const cur = settingsRef.current.protectedPaths;
-      if (!cur.some((p) => p.toLowerCase() === path.toLowerCase())) update({ protectedPaths: [...cur, path] });
+      // rejects when it can't be saved: the review sheet says so and keeps the row
+      if (!cur.some((p) => p.toLowerCase() === path.toLowerCase())) await update({ protectedPaths: [...cur, path] });
     },
     [update],
   );
@@ -336,7 +337,8 @@ function Shell() {
           version={status?.serviceVersion}
           peers={peers}
           hub={hub}
-          onChange={update}
+          problem={settingsProblem}
+          onChange={(patch) => void update(patch).catch((e: unknown) => notify(errText(e)))}
           onSharing={(on) => void api.setSharing(on).catch((e: unknown) => notify(errText(e)))}
           onLinkPc={() => setShowLink(true)}
           onUnlinkHub={(done) =>

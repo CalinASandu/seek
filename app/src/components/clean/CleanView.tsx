@@ -41,7 +41,7 @@ interface Props {
   /** The drives of this PC that can be scanned. */
   scanDeviceIds: string[];
   protectedPaths: string[];
-  onProtect: (path: string) => void;
+  onProtect: (path: string) => Promise<void>;
   notify: (message: string) => void;
 }
 

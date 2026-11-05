@@ -17,7 +17,8 @@ interface Props {
   /** What is inside each folder, to show when it is opened. */
   contents: ReadonlyMap<string, string[]>;
   /** "Always protect": the item leaves this removal and goes on the protected list. */
-  onProtect: (path: string) => void;
+  /** Rejects when the choice cannot be saved. */
+  onProtect: (path: string) => Promise<void>;
   /** Called when the sheet closes: the paths that really went to the Recycle Bin (and were not put back), and whether a removal ran. */
   onClose: (moved: string[], committed: boolean) => void;
 }
@@ -70,6 +71,8 @@ export function ReviewSheet({ request, picked, contents, onProtect, onClose }: P
   const api = useApi();
   const [phase, setPhase] = useState<"preparing" | "ready" | "failed" | "moving" | "done">("preparing");
   const [problem, setProblem] = useState<string | null>(null);
+  const [protectError, setProtectError] = useState<string | null>(null);
+  const protecting = useRef(new Set<number>());
   const [prepared, setPrepared] = useState<Prepared | null>(null);
   const [ticked, setTicked] = useState<ReadonlySet<number>>(new Set());
   const [hidden, setHidden] = useState<ReadonlySet<number>>(new Set());
@@ -152,8 +155,19 @@ export function ReviewSheet({ request, picked, contents, onProtect, onClose }: P
       return next;
     });
   };
-  const protect = (it: ReviewItem) => {
-    onProtect(it.path);
+  const protect = async (it: ReviewItem) => {
+    if (protecting.current.has(it.id)) return;
+    protecting.current.add(it.id);
+    setProtectError(null);
+    try {
+      await onProtect(it.path);
+    } catch (e) {
+      // not saved: the row stays, and the sheet says so rather than looking as if it worked
+      setProtectError(`"Always protect" could not be saved. ${errText(e)}`);
+      return;
+    } finally {
+      protecting.current.delete(it.id);
+    }
     setHidden((cur) => new Set(cur).add(it.id));
     setTicked((cur) => {
       const next = new Set(cur);
@@ -335,6 +349,11 @@ export function ReviewSheet({ request, picked, contents, onProtect, onClose }: P
               {missing > 0 && ` ${plural(missing)} ${missing === 1 ? "is" : "are"} no longer there and left out.`}
             </span>
           </div>
+          {protectError && (
+            <p className="review-warn" role="alert">
+              {protectError}
+            </p>
+          )}
           <VirtualRows
             className="review-list"
             role="grid"

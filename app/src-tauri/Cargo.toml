@@ -29,3 +29,6 @@ base64.workspace = true
 tracing.workspace = true
 windows-service.workspace = true
 windows-sys.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

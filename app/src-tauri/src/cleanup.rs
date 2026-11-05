@@ -15,12 +15,13 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use seek_clean::dupes::{self, ScanEvent, SizeBatch, SizeFile, MIN_DUPLICATE_BYTES};
 use seek_clean::engine::Engine;
 use seek_clean::facts::{ClaimCheck, FileFacts, RealFacts};
-use seek_clean::model::{Candidate, CommitResult, DupGroup, Prepared};
+use seek_clean::model::{Candidate, CommitResult, DupGroup, Outcome, Prepared};
+use seek_clean::paths::canon;
 use seek_clean::protect::Places;
 use seek_clean::recycle::ShellRecycler;
 use seek_core::{Device, DeviceId, DeviceState, HostId};
@@ -90,39 +91,53 @@ pub fn this_host_of(peers: Result<HostId, String>, devices: &[Device]) -> Result
 // ---- planning a scan -----------------------------------------------------------------------
 
 pub struct ScanPlan {
-    /// Drives to ask the service about: this PC's chosen ones, then every linked PC's.
-    pub ask: Vec<DeviceId>,
+    /// This PC's chosen drives that are ready: the only source of what is scanned.
+    pub ask_local: Vec<DeviceId>,
+    /// Every linked PC's drives, asked about in a second, best-effort pass that only builds the
+    /// "other PCs" notes. Empty when there is nothing local to read.
+    pub ask_linked: Vec<DeviceId>,
     pub owners: Owners,
-    /// Said in the scan line: drives left out because their first scan isn't done.
+    /// Said right away: drives left out because their first scan isn't done, or why nothing runs.
     pub notice: Option<String>,
     /// True when no drive of this PC is left to read.
     pub nothing_local: bool,
 }
 
+const LINKED_ONLY: &str = "Duplicates only looks at this PC's drives, so nothing was scanned.";
+
 /// Which drives to ask the service about. Of the drives asked for, only this PC's count; one still
-/// on its first scan is left out (its index is partial) and named. Linked PCs' drives are added
-/// so their same-name files can be noted, but only when there is something local to read.
+/// on its first scan is left out (its index is partial) and named. A linked PC's drive that was
+/// picked is not scanned and the notice says why.
 pub fn plan_scan(requested: &[DeviceId], devices: &[Device], this_host: HostId, pc_names: &HashMap<HostId, String>) -> ScanPlan {
     let owners = owners_of(devices, this_host, pc_names);
-    let mut ask: Vec<DeviceId> = Vec::new();
+    let mut ask_local: Vec<DeviceId> = Vec::new();
     let mut left_out: Vec<String> = Vec::new();
+    let mut picked_linked = false;
     for id in requested {
         let Some(d) = devices.iter().find(|d| d.id == *id) else { continue };
-        if !owners.get(&d.id).is_some_and(|o| o.local) || ask.contains(id) {
+        if !owners.get(&d.id).is_some_and(|o| o.local) {
+            picked_linked = true;
+            continue;
+        }
+        if ask_local.contains(id) {
             continue;
         }
         if d.state == DeviceState::Scanning && d.index_updated_at == 0 {
             left_out.push(d.display_name.clone());
         } else {
-            ask.push(*id);
+            ask_local.push(*id);
         }
     }
-    let nothing_local = ask.is_empty();
-    if !nothing_local {
-        ask.extend(devices.iter().filter(|d| !owners[&d.id].local).map(|d| d.id));
+    let nothing_local = ask_local.is_empty();
+    let ask_linked: Vec<DeviceId> = if nothing_local { Vec::new() } else { devices.iter().filter(|d| !owners[&d.id].local).map(|d| d.id).collect() };
+    let mut notes = Vec::new();
+    if !left_out.is_empty() {
+        notes.push(format!("Left out, still being indexed for the first time: {}.", left_out.join(", ")));
     }
-    let notice = (!left_out.is_empty()).then(|| format!("Left out, still being indexed for the first time: {}.", left_out.join(", ")));
-    ScanPlan { ask, owners, notice, nothing_local }
+    if nothing_local && picked_linked && left_out.is_empty() {
+        notes.push(LINKED_ONLY.to_string());
+    }
+    ScanPlan { ask_local, ask_linked, owners, notice: (!notes.is_empty()).then(|| notes.join(" ")), nothing_local }
 }
 
 // ---- splitting the service's rows ------------------------------------------------------------
@@ -227,8 +242,9 @@ pub struct Gathered {
 pub type Page = Result<(Vec<SizeGroup>, Option<u64>), String>;
 
 /// Fetches pages until the last one, splitting each as it arrives so the rows are released. An
-/// error ends the paging with what was gathered so far. Cancel stops it between pages.
-pub async fn gather<F, Fut>(mut fetch: F, owners: &Owners, cancel: &AtomicBool) -> Gathered
+/// error ends the paging with what was gathered so far. Cancel stops it between pages. With
+/// `keep_batches` false only the linked-PC notes are kept.
+pub async fn gather<F, Fut>(mut fetch: F, owners: &Owners, keep_batches: bool, cancel: &AtomicBool) -> Gathered
 where
     F: FnMut(Option<u64>) -> Fut,
     Fut: Future<Output = Page>,
@@ -244,7 +260,9 @@ where
             }
         };
         let split = split_rows(groups, owners); // the page's rows end here
-        out.batches.extend(split.batches);
+        if keep_batches {
+            out.batches.extend(split.batches);
+        }
         out.linked.extend(split.linked);
         match next {
             None => break,
@@ -255,6 +273,42 @@ where
             }
             Some(n) => cursor = Some(n),
         }
+    }
+    out
+}
+
+const OTHER_PCS_LOST: &str = "Files on your other PCs couldn't be compared this time.";
+
+pub struct Collected {
+    /// The scan's whole input, from this PC's drives alone.
+    pub batches: Vec<SizeBatch>,
+    pub linked: Vec<LinkedRow>,
+    /// The local pager ended on an error; the message names the user's own drive.
+    pub local_notice: Option<String>,
+    /// The second pass failed: only the Other PCs section is lost.
+    pub linked_notice: Option<String>,
+}
+
+/// Two passes. The first pages this PC's drives only and is the sole source of `batches`, so an
+/// error in it is about the user's own drive. The second, only if linked drives exist, pages this
+/// PC's plus the linked drives (the service's two-or-more rule needs both sides) and keeps only
+/// the notes for the Other PCs section; if it fails that section is empty and the scan is untouched.
+pub async fn collect<F, Fut>(mut fetch: F, plan: &ScanPlan, cancel: &AtomicBool) -> Collected
+where
+    F: FnMut(Vec<DeviceId>, Option<u64>) -> Fut,
+    Fut: Future<Output = Page>,
+{
+    let local = gather(|cursor| fetch(plan.ask_local.clone(), cursor), &plan.owners, true, cancel).await;
+    let mut out = Collected { batches: local.batches, linked: Vec::new(), local_notice: local.notice, linked_notice: None };
+    if plan.ask_linked.is_empty() || cancel.load(Ordering::Relaxed) {
+        return out;
+    }
+    let both: Vec<DeviceId> = plan.ask_local.iter().chain(&plan.ask_linked).copied().collect();
+    let second = gather(|cursor| fetch(both.clone(), cursor), &plan.owners, false, cancel).await;
+    if second.notice.is_some() {
+        out.linked_notice = Some(OTHER_PCS_LOST.to_string());
+    } else {
+        out.linked = second.linked;
     }
     out
 }
@@ -301,18 +355,36 @@ pub fn candidates_from_request(groups: Vec<Vec<ReqFile>>, owners: &Owners) -> Ve
     out
 }
 
+/// The groups of a request to remove duplicates. The other kinds belong to later tasks.
+pub fn duplicate_groups(req: PrepareRequest) -> Result<Vec<Vec<ReqFile>>, String> {
+    match req {
+        PrepareRequest::Duplicates { groups } => Ok(groups),
+        PrepareRequest::Folders {} | PrepareRequest::Stale {} => Err("Removing leftovers isn't available in this version yet.".to_string()),
+    }
+}
+
 // ---- hidden time -----------------------------------------------------------------------------
 
-/// Results go once the scan is over and the window has been hidden for five minutes. Never while
-/// a scan runs.
-pub fn should_drop_results(scan_running: bool, hidden_for: Option<Duration>) -> bool {
-    !scan_running && hidden_for.is_some_and(|d| d >= HIDDEN_DROP_AFTER)
+/// Results go once the scan is over and five minutes have passed since the later of two things: the
+/// window being hidden and the scan finishing (a scan that ends after 40 hidden minutes keeps its
+/// results for 5 more). `finished_ago` is `None` when no scan has finished; `hidden_for` is `None`
+/// while the window shows, which also resets the clock. Never while a scan runs.
+pub fn should_drop_results(scan_running: bool, finished_ago: Option<Duration>, hidden_for: Option<Duration>) -> bool {
+    if scan_running {
+        return false;
+    }
+    let Some(hidden) = hidden_for else { return false };
+    finished_ago.map_or(hidden, |f| f.min(hidden)) >= HIDDEN_DROP_AFTER
 }
 
 // ---- shared scan state -------------------------------------------------------------------------
 
+const SCAN_STOPPED: &str = "The scan stopped early, so these results may be incomplete.";
+
 #[derive(Default)]
 struct Inner {
+    /// Counts scans. Every call that belongs to one scan carries its number and does nothing for an older one.
+    generation: u64,
     running: bool,
     found: Vec<DupGroup>,
     other_pcs: Vec<OtherPcMatch>,
@@ -322,6 +394,7 @@ struct Inner {
     current: Option<String>,
     notice: Option<String>,
     done_sent: bool,
+    finished_at: Option<Instant>,
     cancel: Arc<AtomicBool>,
 }
 
@@ -348,14 +421,25 @@ impl Shared {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Marks a scan as running, with a fresh slate. One scan at a time.
-    pub fn begin(&self, notice: Option<String>) -> Result<Arc<AtomicBool>, String> {
+    /// Marks a scan as running, with a fresh slate and its cancel flag, before anything else is
+    /// asked of the service. One scan at a time. Returns the scan's number.
+    pub fn begin(&self) -> Result<(u64, Arc<AtomicBool>), String> {
         let mut i = self.lock();
         if i.running {
             return Err("A scan is already running.".to_string());
         }
-        *i = Inner { running: true, notice, cancel: Arc::new(AtomicBool::new(false)), ..Inner::default() };
-        Ok(i.cancel.clone())
+        let generation = i.generation + 1;
+        *i = Inner { generation, running: true, cancel: Arc::new(AtomicBool::new(false)), ..Inner::default() };
+        Ok((generation, i.cancel.clone()))
+    }
+
+    /// The scan could not even start (the service did not answer): it stops running, silently,
+    /// because the command that started it reports the failure.
+    pub fn abort(&self, gen: u64) {
+        let mut i = self.lock();
+        if i.generation == gen && i.running {
+            *i = Inner { generation: gen, done_sent: true, ..Inner::default() };
+        }
     }
 
     pub fn state(&self) -> ScanState {
@@ -379,22 +463,42 @@ impl Shared {
         self.lock().running
     }
 
-    pub fn add_notice(&self, text: &str) {
-        let mut i = self.lock();
-        i.notice = Some(match i.notice.take() {
-            Some(n) => format!("{n} {text}"),
-            None => text.to_string(),
-        });
+    /// How long ago the last scan finished.
+    pub fn finished_ago(&self) -> Option<Duration> {
+        self.lock().finished_at.map(|t| t.elapsed())
+    }
+
+    /// Adds a sentence to the scan's notice and tells the window the whole notice at once.
+    pub fn add_notice(&self, gen: u64, text: &str, emit: &Emit) {
+        let full = {
+            let mut i = self.lock();
+            if i.generation != gen {
+                return;
+            }
+            let full = match i.notice.take() {
+                Some(n) => format!("{n} {text}"),
+                None => text.to_string(),
+            };
+            i.notice = Some(full.clone());
+            full
+        };
+        emit(json!({ "type": "notice", "text": full }));
     }
 
     /// The linked-PC files to pair with the groups when the scan ends.
-    pub fn keep_linked(&self, rows: Vec<LinkedRow>) {
-        self.lock().linked = rows;
+    pub fn keep_linked(&self, gen: u64, rows: Vec<LinkedRow>) {
+        let mut i = self.lock();
+        if i.generation == gen {
+            i.linked = rows;
+        }
     }
 
-    pub fn on_event(&self, e: ScanEvent, emit: &Emit) {
+    pub fn on_event(&self, gen: u64, e: ScanEvent, emit: &Emit) {
         let message = {
             let mut i = self.lock();
+            if i.generation != gen {
+                return;
+            }
             match e {
                 ScanEvent::Group(g) => {
                     let m = json!({ "type": "group", "group": g });
@@ -416,28 +520,31 @@ impl Shared {
         }
     }
 
-    /// Ends the scan: not running, other-PC notes worked out, `done` sent. Safe to call again.
-    pub fn finish(&self, emit: &Emit) {
+    /// Ends the scan: not running, other-PC notes worked out, `done` sent. Safe to call again, and
+    /// a no-op for a scan that is no longer the current one.
+    pub fn finish(&self, gen: u64, emit: &Emit) {
         {
             let mut i = self.lock();
-            if i.done_sent {
+            if i.generation != gen || i.done_sent {
                 return;
             }
             i.done_sent = true;
             i.running = false;
             i.current = None;
+            i.finished_at = Some(Instant::now());
             let linked = std::mem::take(&mut i.linked);
             i.other_pcs = other_pc_matches(&linked, &i.found);
         }
         emit(json!({ "type": "done" }));
     }
 
-    /// Forgets the results. Not while a scan runs.
-    pub fn drop_results(&self) {
+    /// Forgets the results. Not while a scan runs. True if there was anything to forget.
+    pub fn drop_results(&self) -> bool {
         let mut i = self.lock();
         if i.running {
-            return;
+            return false;
         }
+        let had = !i.found.is_empty() || !i.other_pcs.is_empty() || i.notice.is_some() || i.total > 0 || i.checked > 0;
         i.found = Vec::new();
         i.other_pcs = Vec::new();
         i.linked = Vec::new();
@@ -445,13 +552,40 @@ impl Shared {
         i.total = 0;
         i.current = None;
         i.notice = None;
+        had
+    }
+
+    /// Takes moved files out of the results with the rules the window uses: a group with fewer than
+    /// two copies left, or with nothing left to free, goes. Figures and the suggested keep are
+    /// worked out again as `dupes` does.
+    pub fn prune(&self, moved: &[String], downloads_like: &[String]) {
+        let gone: HashSet<String> = moved.iter().map(|p| canon(Path::new(p))).collect();
+        let is_gone = |p: &str| gone.contains(&canon(Path::new(p)));
+        let mut i = self.lock();
+        let found = std::mem::take(&mut i.found);
+        i.found = found
+            .into_iter()
+            .filter_map(|g| if g.copies.iter().any(|c| is_gone(&c.path)) { dupes::without_copies(&g, is_gone, downloads_like) } else { Some(g) })
+            .collect();
     }
 }
 
-/// Runs `body`, then finishes the scan whatever `body` did, a panic included.
-pub fn run_guarded(shared: &Shared, emit: &Emit, body: impl FnOnce() + std::panic::UnwindSafe) {
-    let _ = std::panic::catch_unwind(body);
-    shared.finish(emit);
+fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// Runs `body`, then finishes the scan whatever `body` did. A panic is logged, and the scan says
+/// its results may be incomplete.
+pub fn run_guarded(shared: &Shared, gen: u64, emit: &Emit, body: impl FnOnce() + std::panic::UnwindSafe) {
+    if let Err(payload) = std::panic::catch_unwind(body) {
+        tracing::error!("the duplicate scan panicked: {}", panic_text(&*payload));
+        shared.add_notice(gen, SCAN_STOPPED, emit);
+    }
+    shared.finish(gen, emit);
 }
 
 // ---- managed state -----------------------------------------------------------------------------
@@ -486,15 +620,29 @@ impl Core {
 pub struct CleanState {
     core: Mutex<Option<Arc<Core>>>,
     shared: Arc<Shared>,
+    /// Sends events to the window; set once the app exists.
+    emit: Mutex<Option<Arc<Emit>>>,
 }
 
 impl Default for CleanState {
     fn default() -> Self {
-        CleanState { core: Mutex::new(None), shared: Arc::new(Shared::default()) }
+        CleanState { core: Mutex::new(None), shared: Arc::new(Shared::default()), emit: Mutex::new(None) }
     }
 }
 
 impl CleanState {
+    /// Lets the state talk to the window on `seek://clean`.
+    pub fn set_app(&self, app: AppHandle) {
+        let emit: Arc<Emit> = Arc::new(move |v| {
+            let _ = app.emit(CLEAN_EVENT_CHANNEL, v);
+        });
+        *self.emit.lock().unwrap_or_else(|e| e.into_inner()) = Some(emit);
+    }
+
+    fn emitter(&self) -> Arc<Emit> {
+        self.emit.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_else(|| Arc::new(|_| {}))
+    }
+
     /// The engine, built on first use. If Windows can't name the protected places this is a plain
     /// error and nothing can be scanned or removed; it is tried again next time.
     fn core(&self) -> Result<Arc<Core>, String> {
@@ -508,23 +656,39 @@ impl CleanState {
         Ok(core)
     }
 
-    /// Called by the look loop with how long the window has been hidden.
+    /// Called by the look loop with how long the window has been hidden (`None` while it shows).
+    /// When the results are due to go they are dropped, the engine forgets its reviews, and a
+    /// window that is listening is told so it can let go of the groups.
     pub fn window_hidden_for(&self, hidden_for: Option<Duration>) {
-        if !should_drop_results(self.shared.is_running(), hidden_for) {
+        if !should_drop_results(self.shared.is_running(), self.shared.finished_ago(), hidden_for) {
             return;
         }
-        self.shared.drop_results();
-        let slot = self.core.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(core) = slot.as_ref() {
+        let had_results = self.shared.drop_results();
+        if let Some(core) = self.core.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
             core.engine.drop_reviews();
         }
+        if had_results {
+            (*self.emitter())(json!({ "type": "dropped" }));
+        }
+    }
+
+    /// Removes the chosen items of a review, then takes what was moved out of the results so it
+    /// cannot come back through `clean_scan_state`.
+    fn commit(&self, core: &Core, token: &str, ids: &[u32], protected: &[String]) -> Result<CommitResult, String> {
+        let result = core.engine.commit(token, ids, protected)?;
+        let moved: Vec<String> = result.items.iter().filter(|i| matches!(i.outcome, Outcome::Moved { .. })).map(|i| i.path.clone()).collect();
+        if !moved.is_empty() {
+            self.shared.prune(&moved, &downloads_like());
+        }
+        Ok(result)
     }
 }
 
 // ---- talking to the service --------------------------------------------------------------------
 
 fn unexpected(r: Response) -> String {
-    format!("unexpected reply from service: {r:?}")
+    tracing::warn!("unexpected reply from the service: {r:?}");
+    "The Seek service gave an answer the app didn't expect.".to_string()
 }
 
 /// The drives and PCs the service knows, and which of them is this PC.
@@ -549,8 +713,8 @@ async fn fetch_context(link: &ServiceLink) -> Result<Context, String> {
     Ok(Context { devices, this_host, pc_names })
 }
 
-async fn fetch_page(link: &ServiceLink, ids: &[DeviceId], cursor: Option<u64>) -> Page {
-    let req = Request::SameSizeFiles { min_size: MIN_DUPLICATE_BYTES, device_ids: ids.to_vec(), cursor, limit: PAGE_LIMIT };
+async fn fetch_page(link: &ServiceLink, ids: Vec<DeviceId>, cursor: Option<u64>) -> Page {
+    let req = Request::SameSizeFiles { min_size: MIN_DUPLICATE_BYTES, device_ids: ids, cursor, limit: PAGE_LIMIT };
     match link.request(req).await? {
         Response::SameSizeFiles { groups, next } => Ok((groups, next)),
         other => Err(unexpected(other)),
@@ -565,8 +729,10 @@ fn downloads_like() -> Vec<String> {
 
 /// The scan itself: all the paging first, on its own connection, then the reading, which needs
 /// nothing from the service. The connection is closed before the first file is read.
+#[allow(clippy::too_many_arguments)]
 async fn scan_job(
     shared: Arc<Shared>,
+    gen: u64,
     emit: Arc<Emit>,
     core: Arc<Core>,
     link: Arc<ServiceLink>,
@@ -577,26 +743,33 @@ async fn scan_job(
     if plan.nothing_local {
         return;
     }
-    let gathered = {
-        let (conn, ids) = (&*link, &plan.ask[..]);
-        gather(|cursor| fetch_page(conn, ids, cursor), &plan.owners, &cancel).await
+    let collected = {
+        let conn = &*link;
+        collect(|ids, cursor| fetch_page(conn, ids, cursor), &plan, &cancel).await
     };
     drop(link);
-    if let Some(n) = &gathered.notice {
-        shared.add_notice(n);
+    for notice in [&collected.local_notice, &collected.linked_notice].into_iter().flatten() {
+        shared.add_notice(gen, notice, &*emit);
     }
-    shared.keep_linked(gathered.linked);
+    shared.keep_linked(gen, collected.linked);
     if cancel.load(Ordering::Relaxed) {
         return;
     }
-    let batches = gathered.batches;
+    let batches = collected.batches;
     let _ = tauri::async_runtime::spawn_blocking(move || {
         let sh = shared.clone();
         run_guarded(
             &shared,
+            gen,
             &*emit,
             std::panic::AssertUnwindSafe(|| {
-                dupes::scan(batches, &core.places, &protected, &*core.facts, &downloads_like(), &cancel, |e| sh.on_event(e, &*emit));
+                let complete = dupes::scan(batches, &core.places, &protected, &*core.facts, &downloads_like(), &cancel, |e| {
+                    sh.on_event(gen, e, &*emit)
+                });
+                if !complete {
+                    tracing::error!("the duplicate scan stopped on a panic of its own");
+                    sh.add_notice(gen, SCAN_STOPPED, &*emit);
+                }
             }),
         );
     })
@@ -608,33 +781,43 @@ async fn scan_job(
 type Clean<'a> = State<'a, Arc<CleanState>>;
 
 #[tauri::command]
-pub async fn clean_scan_start(app: AppHandle, clean: Clean<'_>, device_ids: Vec<DeviceId>) -> Result<(), String> {
+pub async fn clean_scan_start(clean: Clean<'_>, device_ids: Vec<DeviceId>) -> Result<(), String> {
     let core = clean.core()?;
     let protected: Vec<PathBuf> = settings::protected_paths_strict()?.into_iter().map(PathBuf::from).collect();
+    let emit = clean.emitter();
+    // Running, with its cancel flag, from now: a Cancel while the service is being asked stops the scan.
+    let (gen, cancel) = clean.shared.begin()?;
     // The paging has a connection of its own, closed when the paging is over.
     let link = Arc::new(ServiceLink::default());
-    let ctx = fetch_context(&link).await?;
-    let plan = plan_scan(&device_ids, &ctx.devices, ctx.this_host, &ctx.pc_names);
-    let cancel = clean.shared.begin(plan.notice.clone())?;
+    let plan = match fetch_context(&link).await {
+        Ok(ctx) => plan_scan(&device_ids, &ctx.devices, ctx.this_host, &ctx.pc_names),
+        Err(e) => {
+            clean.shared.abort(gen);
+            return Err(e);
+        }
+    };
+    if let Some(n) = &plan.notice {
+        clean.shared.add_notice(gen, n, &*emit);
+    }
     let shared = clean.shared.clone();
-    let emit: Arc<Emit> = Arc::new(move |v| {
-        let _ = app.emit(CLEAN_EVENT_CHANNEL, v);
-    });
     tauri::async_runtime::spawn(async move {
-        let worker = tauri::async_runtime::spawn(scan_job(shared.clone(), emit.clone(), core, link, plan, protected, cancel));
+        let worker = tauri::async_runtime::spawn(scan_job(shared.clone(), gen, emit.clone(), core, link, plan, protected, cancel));
         // Whatever happened to the worker, a panic included, the window hears `done` and the scan stops running.
-        let _ = worker.await;
-        shared.finish(&*emit);
+        if let Err(e) = worker.await {
+            tracing::error!("the duplicate scan job failed: {e}");
+            shared.add_notice(gen, SCAN_STOPPED, &*emit);
+        }
+        shared.finish(gen, &*emit);
     });
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn clean_scan_cancel(clean: Clean<'_>) {
     clean.shared.cancel();
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn clean_scan_state(clean: Clean<'_>) -> ScanState {
     clean.shared.state()
 }
@@ -642,12 +825,7 @@ pub fn clean_scan_state(clean: Clean<'_>) -> ScanState {
 #[tauri::command]
 pub async fn clean_prepare(clean: Clean<'_>, link: State<'_, Arc<ServiceLink>>, req: PrepareRequest) -> Result<Prepared, String> {
     let core = clean.core()?;
-    let groups = match req {
-        PrepareRequest::Duplicates { groups } => groups,
-        PrepareRequest::Folders {} | PrepareRequest::Stale {} => {
-            return Err("Removing leftovers isn't available in this version yet.".to_string());
-        }
-    };
+    let groups = duplicate_groups(req)?;
     let protected = settings::protected_paths_strict()?;
     // Which copies are on this PC is asked of the service now, not remembered from the scan.
     let ctx = fetch_context(&link).await?;
@@ -662,8 +840,9 @@ pub async fn clean_prepare(clean: Clean<'_>, link: State<'_, Arc<ServiceLink>>, 
 pub async fn clean_commit(clean: Clean<'_>, token: String, ids: Vec<u32>) -> Result<CommitResult, String> {
     let core = clean.core()?;
     let protected = settings::protected_paths_strict()?;
+    let state: Arc<CleanState> = (*clean).clone();
     // Removal happens on a thread of its own; the engine lets one commit run at a time.
-    tauri::async_runtime::spawn_blocking(move || core.engine.commit(&token, &ids, &protected))
+    tauri::async_runtime::spawn_blocking(move || state.commit(&core, &token, &ids, &protected))
         .await
         .map_err(|e| e.to_string())?
 }
@@ -677,405 +856,4 @@ pub async fn open_recycle_bin() -> Result<(), String> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use seek_clean::model::{DupCopy, Lock, Outcome};
-    use seek_core::{DeviceIdentity, DeviceKind, ResultRow};
-    use std::sync::atomic::AtomicUsize;
-
-    const MB: u64 = 1_048_576;
-
-    fn id(n: u128) -> DeviceId {
-        DeviceId::from_u128(n)
-    }
-    fn host(n: u128) -> HostId {
-        HostId::from_u128(n)
-    }
-
-    fn device(n: u128, host_n: u128, state: DeviceState, updated: i64) -> Device {
-        Device {
-            id: id(n),
-            identity: DeviceIdentity::Volume { serial: n as u64, filesystem: "NTFS".into() },
-            display_name: format!("Drive {n}"),
-            label: String::new(),
-            filesystem: "NTFS".into(),
-            kind: DeviceKind::Fixed,
-            total_bytes: 0,
-            free_bytes: 0,
-            last_mount_point: "C:\\".into(),
-            indexed_by_host: host(host_n),
-            first_seen: 0,
-            last_seen: 0,
-            index_updated_at: updated,
-            state,
-            entry_count: 0,
-            error: None,
-        }
-    }
-
-    fn row(dev: u128, path: &str, size: u64) -> ResultRow {
-        let name = path.rsplit('\\').next().unwrap().to_string();
-        ResultRow {
-            name,
-            folder: String::new(),
-            full_path: path.to_string(),
-            size,
-            modified: 0,
-            created: 0,
-            is_dir: false,
-            attrs: 0,
-            device_id: id(dev),
-            device_name: String::new(),
-            online: true,
-        }
-    }
-
-    fn owners() -> Owners {
-        let mut o = Owners::new();
-        o.insert(id(1), Owner { local: true, pc_name: "This".into() });
-        o.insert(id(2), Owner { local: true, pc_name: "This".into() });
-        o.insert(id(9), Owner { local: false, pc_name: "Laptop".into() });
-        o
-    }
-
-    fn quiet() -> Box<Emit> {
-        Box::new(|_| {})
-    }
-
-    #[test]
-    fn split_rows_separates_local_from_linked_pcs() {
-        let groups = vec![
-            // two local copies and a linked file with the same name: the linked one is kept to be shown
-            SizeGroup {
-                size: 5 * MB,
-                files: vec![row(1, "C:\\a\\Movie.mkv", 5 * MB), row(2, "D:\\b\\movie.MKV", 5 * MB), row(9, "C:\\Users\\x\\Movie.mkv", 5 * MB)],
-            },
-            // a linked file whose name differs: not kept, and never a candidate
-            SizeGroup {
-                size: 3 * MB,
-                files: vec![row(1, "C:\\a\\one.bin", 3 * MB), row(2, "D:\\a\\one.bin", 3 * MB), row(9, "C:\\other.bin", 3 * MB)],
-            },
-            // one local file and one linked file: no local pair, so nothing from this size
-            SizeGroup { size: 2 * MB, files: vec![row(1, "C:\\only.bin", 2 * MB), row(9, "C:\\only.bin", 2 * MB)] },
-            // a drive nobody knows is ignored altogether
-            SizeGroup { size: 1_500_000, files: vec![row(1, "C:\\p.bin", 1_500_000), row(1, "C:\\q.bin", 1_500_000), row(77, "Z:\\p.bin", 1_500_000)] },
-        ];
-        let s = split_rows(groups, &owners());
-        assert_eq!(s.batches.len(), 3);
-        let paths = |b: &SizeBatch| b.files.iter().map(|f| f.path.to_string_lossy().into_owned()).collect::<Vec<_>>();
-        assert_eq!(s.batches[0].size, 5 * MB);
-        assert_eq!(paths(&s.batches[0]), vec!["C:\\a\\Movie.mkv", "D:\\b\\movie.MKV"]);
-        assert_eq!(s.batches[0].files[0].device_id, id(1).to_string());
-        assert_eq!(paths(&s.batches[2]), vec!["C:\\p.bin", "C:\\q.bin"]);
-        // no linked path is in any batch
-        let all: Vec<String> = s.batches.iter().flat_map(paths).collect();
-        assert!(!all.iter().any(|p| p.contains("Users\\x") || p.contains("other.bin") || p.contains("only.bin") || p.starts_with("Z:")));
-        assert_eq!(
-            s.linked,
-            vec![LinkedRow { name: "Movie.mkv".into(), size: 5 * MB, pc_name: "Laptop".into(), path: "C:\\Users\\x\\Movie.mkv".into() }]
-        );
-    }
-
-    fn group(size: u64, paths: &[&str]) -> DupGroup {
-        DupGroup {
-            id: 1,
-            name: String::new(),
-            size,
-            copies: paths
-                .iter()
-                .map(|p| DupCopy { path: p.to_string(), device_id: id(1).to_string(), size, modified: 0, lock: None, suggested_keep: false })
-                .collect(),
-            freeable: size,
-        }
-    }
-
-    #[test]
-    fn linked_files_show_only_next_to_a_confirmed_group_with_the_same_name_and_size() {
-        let linked = vec![
-            LinkedRow { name: "Movie.mkv".into(), size: 5 * MB, pc_name: "Laptop".into(), path: "C:\\Users\\x\\Movie.mkv".into() },
-            LinkedRow { name: "Other.mkv".into(), size: 5 * MB, pc_name: "Laptop".into(), path: "C:\\Other.mkv".into() },
-            LinkedRow { name: "Movie.mkv".into(), size: 6 * MB, pc_name: "Laptop".into(), path: "C:\\Other\\Movie.mkv".into() },
-        ];
-        // the group's second copy is named differently: the match is on any copy's name
-        let groups = vec![group(5 * MB, &["C:\\a\\x.bin", "D:\\b\\movie.MKV"])];
-        let m = other_pc_matches(&linked, &groups);
-        assert_eq!(m, vec![OtherPcMatch { name: "Movie.mkv".into(), size: 5 * MB, pc_name: "Laptop".into(), path: "C:\\Users\\x\\Movie.mkv".into() }]);
-        assert!(other_pc_matches(&linked, &[]).is_empty());
-    }
-
-    #[test]
-    fn prepare_request_with_a_linked_device_becomes_a_refused_candidate() {
-        let file = |path: &str, dev: u128| ReqFile { path: path.into(), device_id: id(dev).to_string() };
-        let req = vec![vec![file("C:\\a\\x.bin", 1), file("D:\\b\\x.bin", 2), file("C:\\Users\\x\\x.bin", 9), file("Q:\\mystery.bin", 55)]];
-        let cands = candidates_from_request(req, &owners());
-        assert_eq!(
-            cands,
-            vec![
-                Candidate::Duplicates { copies: vec![PathBuf::from("C:\\a\\x.bin"), PathBuf::from("D:\\b\\x.bin")] },
-                Candidate::LinkedPc { path: "C:\\Users\\x\\x.bin".into() },
-                Candidate::LinkedPc { path: "Q:\\mystery.bin".into() },
-            ]
-        );
-        // an unreadable device id is treated like an unknown drive
-        let bad = candidates_from_request(vec![vec![ReqFile { path: "C:\\z.bin".into(), device_id: "nope".into() }]], &owners());
-        assert_eq!(bad, vec![Candidate::LinkedPc { path: "C:\\z.bin".into() }]);
-
-        // and the engine refuses it, whatever else is chosen
-        struct NeverRecycles;
-        impl seek_clean::facts::Recycler for NeverRecycles {
-            fn recycle(&self, _: &[PathBuf]) -> Vec<Result<String, String>> {
-                panic!("a linked file must never reach the Recycle Bin");
-            }
-        }
-        let places = Places::for_tests("C:\\Windows", &["C:\\Program Files"], "C:\\Users", "C:\\Users\\me", "C:\\ProgramData", &["C:\\Users\\me\\AppData"]);
-        let engine = Engine::new(places, Arc::new(NeverRecycles), None, Arc::new(RealFacts), Arc::new(NoFolderClaimsYet));
-        let prepared = engine.prepare(cands, &[]);
-        let linked: Vec<_> = prepared.items.iter().filter(|i| i.path.contains("Users\\x") || i.path.starts_with("Q:")).collect();
-        assert_eq!(linked.len(), 2);
-        assert!(linked.iter().all(|i| i.lock == Some(Lock::LinkedPc)));
-        let ids: Vec<u32> = linked.iter().map(|i| i.id).collect();
-        let r = engine.commit(&prepared.token, &ids, &[]).unwrap();
-        assert!(r.items.iter().all(|i| matches!(i.outcome, Outcome::Left { .. })));
-        assert_eq!(r.moved_bytes, 0);
-    }
-
-    #[test]
-    fn results_are_dropped_after_five_minutes_hidden_once_finished() {
-        let five = Duration::from_secs(300);
-        assert!(should_drop_results(false, Some(five)));
-        assert!(should_drop_results(false, Some(five + Duration::from_secs(1))));
-        assert!(!should_drop_results(false, Some(five - Duration::from_millis(1))));
-        assert!(!should_drop_results(false, None)); // the window is showing
-    }
-
-    #[test]
-    fn results_stay_while_the_scan_runs() {
-        assert!(!should_drop_results(true, Some(Duration::from_secs(3600))));
-        assert!(!should_drop_results(true, Some(Duration::from_secs(300))));
-    }
-
-    #[test]
-    fn dropping_results_clears_them_unless_a_scan_runs() {
-        let s = Shared::default();
-        s.begin(None).unwrap();
-        s.on_event(ScanEvent::Group(group(5 * MB, &["C:\\a", "C:\\b"])), &*quiet());
-        s.drop_results();
-        assert_eq!(s.state().found.len(), 1, "a running scan keeps its results");
-        s.finish(&*quiet());
-        s.drop_results();
-        let st = s.state();
-        assert!(!st.running && st.found.is_empty() && st.other_pcs.is_empty());
-        assert_eq!((st.checked_bytes, st.total_bytes, st.current), (0, 0, None));
-    }
-
-    fn page(sizes: &[(u64, &str)], next: Option<u64>) -> Page {
-        Ok((
-            sizes
-                .iter()
-                .map(|(sz, p)| SizeGroup { size: *sz, files: vec![row(1, &format!("C:\\{p}1"), *sz), row(2, &format!("D:\\{p}2"), *sz)] })
-                .collect(),
-            next,
-        ))
-    }
-
-    #[tokio::test]
-    async fn a_service_error_mid_paging_ends_the_scan_with_what_was_found_and_says_so() {
-        let calls = AtomicUsize::new(0);
-        let cursors = Mutex::new(Vec::new());
-        let cancel = AtomicBool::new(false);
-        let g = gather(
-            |cursor| {
-                cursors.lock().unwrap().push(cursor);
-                let n = calls.fetch_add(1, Ordering::SeqCst);
-                let r = match n {
-                    0 => page(&[(9 * MB, "big")], Some(4 * MB)),
-                    1 => page(&[(4 * MB, "mid")], Some(2 * MB)),
-                    _ => Err("Data could not be read right now, so its files can't be compared".to_string()),
-                };
-                async move { r }
-            },
-            &owners(),
-            &cancel,
-        )
-        .await;
-        assert_eq!(calls.load(Ordering::SeqCst), 3, "no more pages after the error");
-        assert_eq!(*cursors.lock().unwrap(), vec![None, Some(4 * MB), Some(2 * MB)]);
-        assert_eq!(g.batches.iter().map(|b| b.size).collect::<Vec<_>>(), vec![9 * MB, 4 * MB]);
-        let notice = g.notice.expect("the error is said");
-        assert!(notice.contains("Data could not be read right now"), "{notice}");
-    }
-
-    #[tokio::test]
-    async fn paging_stops_at_the_last_page_and_never_loops_on_a_stuck_cursor() {
-        let cancel = AtomicBool::new(false);
-        let g = gather(|_| async { page(&[(9 * MB, "a")], None) }, &owners(), &cancel).await;
-        assert_eq!(g.batches.len(), 1);
-        assert!(g.notice.is_none());
-        // a service that keeps answering with the same cursor ends the paging with a notice
-        let calls = AtomicUsize::new(0);
-        let g = gather(
-            |_| {
-                calls.fetch_add(1, Ordering::SeqCst);
-                async { page(&[(9 * MB, "a")], Some(9 * MB)) }
-            },
-            &owners(),
-            &cancel,
-        )
-        .await;
-        assert!(calls.load(Ordering::SeqCst) <= 2);
-        assert!(g.notice.is_some());
-    }
-
-    #[tokio::test]
-    async fn cancel_stops_the_paging_between_pages() {
-        let cancel = AtomicBool::new(false);
-        let calls = AtomicUsize::new(0);
-        let g = gather(
-            |_| {
-                calls.fetch_add(1, Ordering::SeqCst);
-                cancel.store(true, Ordering::SeqCst);
-                async { page(&[(9 * MB, "a")], Some(4 * MB)) }
-            },
-            &owners(),
-            &cancel,
-        )
-        .await;
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-        assert_eq!(g.batches.len(), 1);
-        assert!(g.notice.is_none());
-    }
-
-    fn counting() -> (Arc<Mutex<Vec<Value>>>, Box<Emit>) {
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        let s2 = seen.clone();
-        (seen, Box::new(move |v| s2.lock().unwrap().push(v)))
-    }
-
-    #[test]
-    fn done_is_sent_once_and_the_scan_stops_running_even_if_the_scan_panics() {
-        let s = Shared::default();
-        let (seen, emit) = counting();
-        s.begin(None).unwrap();
-        assert!(s.is_running());
-        run_guarded(&s, &*emit, || panic!("the scan blew up"));
-        assert!(!s.is_running());
-        assert!(!s.state().running);
-        s.finish(&*emit); // a second finish says nothing more
-        let dones = seen.lock().unwrap().iter().filter(|v| v["type"] == "done").count();
-        assert_eq!(dones, 1);
-        // a new scan can start afterwards
-        assert!(s.begin(None).is_ok());
-    }
-
-    #[test]
-    fn done_follows_a_cancel_and_the_groups_found_stay() {
-        let s = Shared::default();
-        let (seen, emit) = counting();
-        let cancel = s.begin(None).unwrap();
-        s.on_event(ScanEvent::Group(group(5 * MB, &["C:\\a", "C:\\b"])), &*emit);
-        s.on_event(ScanEvent::Progress { checked_bytes: 3, total_bytes: 9, current: Some("C:\\a".into()) }, &*emit);
-        s.cancel();
-        assert!(cancel.load(Ordering::SeqCst));
-        run_guarded(&s, &*emit, || {});
-        let st = s.state();
-        assert!(!st.running);
-        assert_eq!(st.found.len(), 1);
-        let types: Vec<String> = seen.lock().unwrap().iter().map(|v| v["type"].as_str().unwrap().to_string()).collect();
-        assert_eq!(types, vec!["group", "progress", "done"]);
-        assert_eq!(seen.lock().unwrap()[0]["group"]["copies"][0]["suggestedKeep"], false);
-    }
-
-    #[test]
-    fn a_second_scan_cannot_start_while_one_runs_and_the_notice_survives_to_the_state() {
-        let s = Shared::default();
-        s.begin(Some("Left out: Data".into())).unwrap();
-        assert!(s.begin(None).is_err());
-        s.add_notice("Backup could not be read right now");
-        let st = s.state();
-        assert_eq!(st.notice.as_deref(), Some("Left out: Data Backup could not be read right now"));
-        s.finish(&*quiet());
-        assert!(s.state().notice.is_some(), "the notice stays after the scan ends");
-    }
-
-    #[test]
-    fn finishing_pairs_linked_files_with_the_groups_that_were_confirmed() {
-        let s = Shared::default();
-        s.begin(None).unwrap();
-        s.keep_linked(vec![
-            LinkedRow { name: "x.bin".into(), size: 5 * MB, pc_name: "Laptop".into(), path: "C:\\x.bin".into() },
-            LinkedRow { name: "y.bin".into(), size: 5 * MB, pc_name: "Laptop".into(), path: "C:\\y.bin".into() },
-        ]);
-        s.on_event(ScanEvent::Group(group(5 * MB, &["C:\\a\\x.bin", "C:\\b\\x.bin"])), &*quiet());
-        assert!(s.state().other_pcs.is_empty(), "worked out when the scan ends");
-        s.finish(&*quiet());
-        let names: Vec<String> = s.state().other_pcs.into_iter().map(|m| m.name).collect();
-        assert_eq!(names, vec!["x.bin"]);
-    }
-
-    #[test]
-    fn a_scan_leaves_out_drives_still_on_their_first_scan_and_says_so() {
-        let devices = vec![
-            device(1, 100, DeviceState::Online, 5),
-            device(2, 100, DeviceState::Scanning, 0), // first scan
-            device(3, 100, DeviceState::Scanning, 7), // a rescan of an index that exists
-            device(9, 200, DeviceState::Online, 5),   // a linked PC's drive
-        ];
-        let names = HashMap::from([(host(200), "Laptop".to_string())]);
-        let all = [id(1), id(2), id(3)];
-        let plan = plan_scan(&all, &devices, host(100), &names);
-        assert_eq!(plan.ask, vec![id(1), id(3), id(9)], "this PC's ready drives, then the linked PC's");
-        assert!(!plan.nothing_local);
-        let notice = plan.notice.expect("the left-out drive is named");
-        assert!(notice.contains("Drive 2") && !notice.contains("Drive 3"), "{notice}");
-        assert!(plan.owners[&id(1)].local && !plan.owners[&id(9)].local);
-        assert_eq!(plan.owners[&id(9)].pc_name, "Laptop");
-        // a linked drive that was asked for is still a linked drive
-        let plan = plan_scan(&[id(9)], &devices, host(100), &names);
-        assert!(plan.nothing_local);
-        assert!(plan.ask.is_empty());
-        // everything on its first scan: nothing to read
-        let plan = plan_scan(&[id(2)], &devices, host(100), &names);
-        assert!(plan.nothing_local);
-    }
-
-    #[test]
-    fn this_pc_is_found_from_peers_or_from_a_single_host_and_otherwise_not_at_all() {
-        let one = vec![device(1, 100, DeviceState::Online, 1), device(2, 100, DeviceState::Online, 1)];
-        let two = vec![device(1, 100, DeviceState::Online, 1), device(9, 200, DeviceState::Online, 1)];
-        assert_eq!(this_host_of(Ok(host(200)), &two), Ok(host(200)));
-        assert_eq!(this_host_of(Err("sync is disabled".into()), &one), Ok(host(100)));
-        assert!(this_host_of(Err("sync is disabled".into()), &two).unwrap_err().contains("which drives"));
-    }
-
-    #[test]
-    fn a_stale_core_drops_its_reviews_with_the_results() {
-        // the engine behind a CleanState forgets reviews when results go
-        let places = Places::for_tests("C:\\Windows", &["C:\\Program Files"], "C:\\Users", "C:\\Users\\me", "C:\\ProgramData", &[]);
-        let facts: Arc<dyn FileFacts> = Arc::new(RealFacts);
-        let engine = Engine::new(places.clone(), Arc::new(seek_clean::recycle::ShellRecycler), None, facts.clone(), Arc::new(NoFolderClaimsYet));
-        let token = engine.prepare(vec![], &[]).token;
-        let state = CleanState { core: Mutex::new(Some(Arc::new(Core { engine, places, facts }))), shared: Arc::new(Shared::default()) };
-        state.window_hidden_for(Some(Duration::from_secs(299)));
-        state.window_hidden_for(None);
-        let core = state.core().unwrap();
-        assert!(core.engine.commit(&token, &[], &[]).is_ok(), "a review is still good before five minutes");
-        let token = core.engine.prepare(vec![], &[]).token;
-        state.window_hidden_for(Some(Duration::from_secs(301)));
-        assert!(core.engine.commit(&token, &[], &[]).unwrap_err().contains("no longer valid"));
-    }
-
-    #[test]
-    fn a_running_scan_keeps_its_results_and_reviews_while_hidden() {
-        let places = Places::for_tests("C:\\Windows", &["C:\\Program Files"], "C:\\Users", "C:\\Users\\me", "C:\\ProgramData", &[]);
-        let facts: Arc<dyn FileFacts> = Arc::new(RealFacts);
-        let engine = Engine::new(places.clone(), Arc::new(seek_clean::recycle::ShellRecycler), None, facts.clone(), Arc::new(NoFolderClaimsYet));
-        let token = engine.prepare(vec![], &[]).token;
-        let shared = Arc::new(Shared::default());
-        shared.begin(None).unwrap();
-        shared.on_event(ScanEvent::Group(group(5 * MB, &["C:\\a", "C:\\b"])), &*quiet());
-        let state = CleanState { core: Mutex::new(Some(Arc::new(Core { engine, places, facts }))), shared: shared.clone() };
-        state.window_hidden_for(Some(Duration::from_secs(3600)));
-        assert_eq!(shared.state().found.len(), 1);
-        assert!(state.core().unwrap().engine.commit(&token, &[], &[]).is_ok());
-    }
-}
+mod tests;

@@ -75,6 +75,9 @@ pub enum ScanEvent {
 /// this returns; nothing is kept afterwards. Cancel is checked between files and between buffer
 /// reads; groups already sent stay valid.
 ///
+/// Returns false when the scan stopped on a panic of its own (`Done` is still sent): what it
+/// found is then not the whole answer. Cancel is not a failure.
+///
 /// Only local files are handed in. Names, sizes and times come from the disk (`facts`), never
 /// from the caller.
 #[allow(clippy::too_many_arguments)]
@@ -86,7 +89,7 @@ pub fn scan(
     downloads_like: &[String],
     cancel: &AtomicBool,
     mut on_event: impl FnMut(ScanEvent) + Send,
-) {
+) -> bool {
     let mut meter = Meter::new(&mut on_event);
     let ctx = Ctx { places, protected: protected.iter().map(|p| p.to_string_lossy().into_owned()).collect(), facts, downloads_like, cancel };
     let outcome = catch_unwind(AssertUnwindSafe(|| {
@@ -96,12 +99,49 @@ pub fn scan(
         }
     }));
     match outcome {
-        Ok(()) => meter.send(ScanEvent::Done),
+        Ok(()) => {
+            meter.send(ScanEvent::Done);
+            true
+        }
         // The receiver itself panicked: stop, without calling it again.
         Err(payload) if meter.in_callback => resume_unwind(payload),
         // Anything else (the disk facts, preparing): the caller still gets its `Done`.
-        Err(_) => meter.send(ScanEvent::Done),
+        Err(_) => {
+            meter.send(ScanEvent::Done);
+            false
+        }
     }
+}
+
+/// A group after some copies were removed: `removed` says which paths are gone. `None` when fewer
+/// than two copies are left or nothing can be freed any more, the same rules as when a group is
+/// first shown. The freeable figure and the suggested keep are worked out the way `scan` does.
+pub fn without_copies(group: &DupGroup, removed: impl Fn(&str) -> bool, downloads_like: &[String]) -> Option<DupGroup> {
+    let mut copies: Vec<DupCopy> = group.copies.iter().filter(|c| !removed(&c.path)).cloned().collect();
+    if copies.len() < 2 {
+        return None;
+    }
+    let locks: Vec<Option<Lock>> = copies.iter().map(|c| c.lock).collect();
+    let freeable = freeable(group.size, &locks);
+    if freeable == 0 {
+        return None;
+    }
+    let items: Vec<(&Path, i64)> = copies.iter().map(|c| (Path::new(c.path.as_str()), c.modified)).collect();
+    let keep = keep_index(&items, &locks, downloads_like);
+    let name = Path::new(&copies[keep].path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    for (i, c) in copies.iter_mut().enumerate() {
+        c.suggested_keep = i == keep;
+    }
+    Some(DupGroup { id: group.id, name, size: group.size, copies, freeable })
+}
+
+/// Which copy to suggest keeping: one that stays anyway (a locked one) is the best, so the
+/// suggestion comes from the locked copies when there are any, and from all of them otherwise.
+fn keep_index(items: &[(&Path, i64)], locks: &[Option<Lock>], downloads_like: &[String]) -> usize {
+    let locked: Vec<usize> = (0..items.len()).filter(|&i| locks[i].is_some()).collect();
+    let pool: Vec<usize> = if locked.is_empty() { (0..items.len()).collect() } else { locked };
+    let picked: Vec<(&Path, i64)> = pool.iter().map(|&i| items[i]).collect();
+    pool[suggest_index(&picked, downloads_like)]
 }
 
 /// Which copy to suggest keeping: one outside Downloads and temp folders, then the shortest path,
@@ -507,12 +547,8 @@ fn build_group(batch: &Prepared, set: &[usize], id: u32, ctx: &Ctx) -> Option<Du
     if freeable == 0 {
         return None;
     }
-    // A copy that stays anyway is the best one to keep, so the suggestion comes from the locked
-    // copies when there are any, and from all of them otherwise. The spec's order applies within.
-    let locked: Vec<usize> = (0..files.len()).filter(|&i| locks[i].is_some()).collect();
-    let pool: Vec<usize> = if locked.is_empty() { (0..files.len()).collect() } else { locked };
-    let items: Vec<(&Path, i64)> = pool.iter().map(|&i| (files[i].path.as_path(), files[i].modified_ms)).collect();
-    let keep = pool[suggest_index(&items, ctx.downloads_like)];
+    let items: Vec<(&Path, i64)> = files.iter().map(|c| (c.path.as_path(), c.modified_ms)).collect();
+    let keep = keep_index(&items, &locks, ctx.downloads_like);
     let name = files[keep].path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let copies = files
         .iter()
@@ -1383,5 +1419,43 @@ mod tests {
         assert_eq!(gs.len(), 1);
         let ids: HashSet<&str> = gs[0].copies.iter().map(|c| c.device_id.as_str()).collect();
         assert_eq!(ids, HashSet::from(["one", "two"]));
+    }
+
+    fn copy(path: &str, modified: i64, lock: Option<Lock>) -> DupCopy {
+        DupCopy { path: path.into(), device_id: "d".into(), size: 5, modified, lock, suggested_keep: false }
+    }
+
+    #[test]
+    fn a_group_after_removals_is_gone_below_two_copies_or_with_nothing_to_free() {
+        let (dl, keep, other) = ("D:\\Downloads\\x.bin", "D:\\keep\\x.bin", "D:\\other\\longer\\x.bin");
+        let g = DupGroup {
+            id: 7,
+            name: "x".into(),
+            size: 5,
+            copies: vec![copy(dl, 1, None), copy(keep, 9, None), copy(other, 2, None)],
+            freeable: 10,
+        };
+        let same = without_copies(&g, |_| false, &["downloads".into()]).unwrap();
+        assert_eq!((same.copies.len(), same.freeable), (3, 10));
+        assert_eq!(same.copies.iter().filter(|c| c.suggested_keep).count(), 1);
+        assert!(same.copies[1].suggested_keep, "outside Downloads, then the shortest path");
+
+        // the suggested copy is the one removed: another takes over, and one fewer copy can be freed
+        let less = without_copies(&g, |p| p == keep, &["downloads".into()]).unwrap();
+        assert_eq!((less.id, less.copies.len(), less.freeable), (7, 2, 5));
+        assert_eq!(less.copies.iter().filter(|c| c.suggested_keep).count(), 1);
+        assert!(less.copies[1].suggested_keep && less.copies[1].path.contains("other"));
+
+        // one copy left is no group
+        assert!(without_copies(&g, |p| p != keep, &[]).is_none());
+
+        // when every copy left is locked nothing can be freed, so there is no group to show
+        let locked = DupGroup {
+            copies: vec![copy("C:\\a", 1, Some(Lock::ProgramFiles)), copy("C:\\b", 1, Some(Lock::AppData)), copy("D:\\c", 1, None)],
+            ..g.clone()
+        };
+        assert!(without_copies(&locked, |p| p == "D:\\c", &[]).is_none());
+        // with the unlocked copy still there, the locked ones stay and it can go
+        assert_eq!(without_copies(&locked, |_| false, &[]).unwrap().freeable, 5);
     }
 }
