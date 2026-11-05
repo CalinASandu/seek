@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use seek_clean::apps;
+use seek_clean::apps::{self, ShellLauncher, UninstallPhase, Uninstalls};
 use seek_clean::claims::{self, LiveClaims};
 use seek_clean::dupes::{self, ScanEvent, SizeBatch, SizeFile, MIN_DUPLICATE_BYTES};
 use seek_clean::engine::Engine;
@@ -339,7 +339,13 @@ pub struct ReqFolder {
 #[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum PrepareRequest {
     Duplicates { groups: Vec<Vec<ReqFile>> },
-    Folders { why: Why, folders: Vec<ReqFolder> },
+    /// `app_id` names the app whose uninstall left the folders (`Why::Uninstall` only).
+    Folders {
+        why: Why,
+        folders: Vec<ReqFolder>,
+        #[serde(default)]
+        app_id: Option<String>,
+    },
     Stale { files: Vec<String> },
 }
 
@@ -476,15 +482,50 @@ pub fn check_listed<'a>(paths: impl IntoIterator<Item = &'a str>, listed: &HashS
     }
 }
 
+/// Refuses a folder request for a path the matching list did not show. Leftovers are checked against
+/// the last Leftovers list; an uninstall's against the last list given for that same app, so one
+/// app's list can't vouch for another's, and a request that names no app gets nothing.
+pub fn check_folder_request<'a>(
+    why: Why,
+    app_id: Option<&str>,
+    paths: impl IntoIterator<Item = &'a str>,
+    leftovers: &HashSet<String>,
+    uninstalls: &HashMap<String, HashSet<String>>,
+) -> Result<(), String> {
+    match why {
+        Why::Uninstall => {
+            let app_id = app_id.ok_or("Seek needs to know which app these leftovers came from. Look again, then review them.")?;
+            let listed = uninstalls
+                .get(app_id)
+                .ok_or("Seek hasn't listed what that app left behind. Look again, then review it.")?;
+            check_listed(paths, listed)
+        }
+        _ => check_listed(paths, leftovers),
+    }
+}
+
 fn same_place(a: &str, b: &str) -> bool {
     canon(Path::new(a)) == canon(Path::new(b))
 }
 
 /// Candidates for a request to remove leftover folders. A path the service reports as stale is
 /// one of Seek's own files (`StaleFile`); anything else is a folder, and the engine refuses
-/// whatever is not one. `why` can only be `Leftover` for now: removing what an uninstall left
-/// behind gets its own checks later.
+/// whatever is not one. `why` is `Leftover` or `Uninstall`. What an uninstall left is a folder or a
+/// Start Menu shortcut (a `.lnk`); the engine refuses anything else of either kind, and none of it
+/// is one of Seek's own stale files.
 pub fn folder_candidates(why: Why, folders: Vec<ReqFolder>, stale: &[StaleFile]) -> Result<Vec<Candidate>, String> {
+    if why == Why::Uninstall {
+        return Ok(folders
+            .into_iter()
+            .map(|f| {
+                if Path::new(&f.path).extension().is_some_and(|e| e.eq_ignore_ascii_case("lnk")) {
+                    Candidate::Shortcut { path: PathBuf::from(f.path), level: f.level, reasons: f.reasons }
+                } else {
+                    Candidate::Folder { path: PathBuf::from(f.path), why, level: f.level, reasons: f.reasons }
+                }
+            })
+            .collect());
+    }
     if why != Why::Leftover {
         return Err("Seek can only remove folders from the Leftovers list this way.".to_string());
     }
@@ -758,6 +799,10 @@ pub struct CleanState {
     core: Mutex<Option<Arc<Core>>>,
     /// What the last Leftovers list held.
     listed: Mutex<HashSet<String>>,
+    /// What the last "what's left" list of each uninstalled app held, by app id.
+    uninstall_listed: Mutex<HashMap<String, HashSet<String>>>,
+    /// The uninstallers this run has started. Lives as long as the app, hidden window or not.
+    uninstalls: Uninstalls,
     shared: Arc<Shared>,
     /// Sends events to the window; set once the app exists.
     emit: Mutex<Option<Arc<Emit>>>,
@@ -765,7 +810,14 @@ pub struct CleanState {
 
 impl Default for CleanState {
     fn default() -> Self {
-        CleanState { core: Mutex::new(None), listed: Mutex::new(HashSet::new()), shared: Arc::new(Shared::default()), emit: Mutex::new(None) }
+        CleanState {
+            core: Mutex::new(None),
+            listed: Mutex::new(HashSet::new()),
+            uninstall_listed: Mutex::new(HashMap::new()),
+            uninstalls: Uninstalls::default(),
+            shared: Arc::new(Shared::default()),
+            emit: Mutex::new(None),
+        }
     }
 }
 
@@ -1004,10 +1056,16 @@ pub async fn clean_prepare(clean: Clean<'_>, link: State<'_, Arc<ServiceLink>>, 
             let owners = owners_of(&ctx.devices, ctx.this_host, &ctx.pc_names);
             candidates_from_request(groups, &owners)
         }
-        PrepareRequest::Folders { why, folders } => {
-            check_listed(folders.iter().map(|f| f.path.as_str()), &clean.listed.lock().unwrap_or_else(|e| e.into_inner()))?;
-            // Which files are stale is also asked now. Only a request that names one needs the answer.
-            let stale = if folders.iter().any(|f| looks_stale(&f.path)) { fetch_stale(&link).await? } else { Vec::new() };
+        PrepareRequest::Folders { why, folders, app_id } => {
+            check_folder_request(
+                why,
+                app_id.as_deref(),
+                folders.iter().map(|f| f.path.as_str()),
+                &clean.listed.lock().unwrap_or_else(|e| e.into_inner()),
+                &clean.uninstall_listed.lock().unwrap_or_else(|e| e.into_inner()),
+            )?;
+            // Which files are stale is also asked now. Only a leftovers request that names one needs the answer.
+            let stale = if why == Why::Leftover && folders.iter().any(|f| looks_stale(&f.path)) { fetch_stale(&link).await? } else { Vec::new() };
             folder_candidates(why, folders, &stale)?
         }
         PrepareRequest::Stale { files } => {
@@ -1029,6 +1087,44 @@ pub async fn clean_commit(clean: Clean<'_>, token: String, ids: Vec<u32>) -> Res
     tauri::async_runtime::spawn_blocking(move || state.commit(&core, &token, &ids, &protected))
         .await
         .map_err(|e| e.to_string())?
+}
+
+// ---- uninstalling -------------------------------------------------------------------------------------
+
+/// Starts the app's own uninstaller. The command is read from the registry here, by the app id
+/// alone: nothing the window sends is ever run. The real launcher is made only in this function.
+#[tauri::command]
+pub async fn uninstall_start(clean: Clean<'_>, app_id: String) -> Result<(), String> {
+    let state: Arc<CleanState> = (*clean).clone();
+    // Reading the registry, and an admin prompt if Windows asks for one, can take a while.
+    tauri::async_runtime::spawn_blocking(move || state.uninstalls.start(&ShellLauncher, apps::found_by_id(&app_id)))
+        .await
+        .map_err(|e| format!("Starting the uninstaller stopped unexpectedly: {e}"))?
+}
+
+/// Where the uninstall of this app stands: running, finished (the process ended and the registry
+/// entry is gone) or unresolved (it ended, and the entry was still there five minutes later).
+#[tauri::command(async)]
+pub fn uninstall_state(clean: Clean<'_>, app_id: String) -> Result<UninstallPhase, String> {
+    clean.uninstalls.state(&app_id)
+}
+
+/// What the uninstaller of this app left behind. The list is remembered as the only thing a
+/// review for this app may ask to remove.
+#[tauri::command]
+pub async fn uninstall_leftovers(clean: Clean<'_>, link: State<'_, Arc<ServiceLink>>, app_id: String) -> Result<Vec<LeftoverRow>, String> {
+    let core = clean.core()?;
+    let app = clean.uninstalls.app(&app_id).ok_or(apps::NOT_STARTED)?;
+    let own_link: Arc<ServiceLink> = (*link).clone();
+    let rows = tauri::async_runtime::spawn_blocking(move || {
+        let claims = LiveClaims::new();
+        let installed = claims::read_installed_names();
+        leftovers::for_app(&app, &core.places, &claims, &installed, &ServiceIndex(own_link))
+    })
+    .await
+    .map_err(|e| format!("Looking for what was left behind stopped unexpectedly: {e}"))?;
+    clean.uninstall_listed.lock().unwrap_or_else(|e| e.into_inner()).insert(app_id, listed_set(&rows));
+    Ok(rows)
 }
 
 #[tauri::command]

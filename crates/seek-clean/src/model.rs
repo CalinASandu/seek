@@ -73,6 +73,14 @@ pub enum Candidate {
         level: Option<Level>,
         reasons: Vec<Reason>,
     },
+    /// A Start Menu shortcut (`.lnk`) an uninstall left behind. Always `Why::Uninstall`; the
+    /// engine refuses anything that is not a `.lnk` file inside a Start Menu `Programs` folder.
+    #[serde(rename_all = "camelCase")]
+    Shortcut {
+        path: PathBuf,
+        level: Option<Level>,
+        reasons: Vec<Reason>,
+    },
     /// Seek's own stale file in ProgramData. Needs admin.
     #[serde(rename_all = "camelCase")]
     StaleFile { path: PathBuf },

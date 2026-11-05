@@ -574,6 +574,12 @@ pub fn read_uninstall_entry(hive: &str, view: &str, key: &str) -> Option<Uninsta
     real::read_one_entry(hive, view, key)
 }
 
+/// Where each Start Menu shortcut points, as written in the shortcut (`%VAR%` not yet expanded).
+/// `None` for one that can't be opened. Only reads.
+pub(crate) fn link_targets(files: &[std::path::PathBuf]) -> Vec<Option<String>> {
+    real::link_targets(files)
+}
+
 /// The full path of every running program's exe, as Windows reports it (programs of other users
 /// or elevated ones may be missing). Only reads.
 pub fn running_exes() -> Vec<String> {
@@ -1139,6 +1145,26 @@ mod real {
         link.GetPath(&mut buf, &mut data, SLGP_RAWPATH.0 as u32).ok()?;
         let t = text(&buf);
         (!t.is_empty()).then_some(t)
+    }
+
+    /// The raw target of each shortcut (`None` for one that can't be opened), in order. Opens
+    /// them on a thread of its own: IShellLink wants its own apartment.
+    pub(super) fn link_targets(files: &[std::path::PathBuf]) -> Vec<Option<String>> {
+        let files = files.to_vec();
+        let count = files.len();
+        std::thread::spawn(move || {
+            // SAFETY: balanced with CoUninitialize below.
+            if files.is_empty() || unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.is_err() {
+                return vec![None; files.len()];
+            }
+            // SAFETY: COM is initialised on this thread.
+            let found = files.iter().map(|f| unsafe { link_target(f) }).collect();
+            // SAFETY: balanced with the CoInitializeEx above.
+            unsafe { CoUninitialize() };
+            found
+        })
+        .join()
+        .unwrap_or_else(|_| vec![None; count])
     }
 
     fn shortcuts(parts: &mut ClaimParts) {

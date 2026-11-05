@@ -14,8 +14,10 @@ interface Props {
   onReview: (spec: SheetSpec) => void;
 }
 
-export function folderRequest(rows: LeftoverRow[], why: Why): PrepareRequest {
-  return { kind: "folders", why, folders: rows.map((r) => ({ path: r.path, level: r.level, reasons: r.reasons })) };
+/** `appId` names the app whose uninstall left the rows (for `why` "uninstall"). */
+export function folderRequest(rows: LeftoverRow[], why: Why, appId?: string): PrepareRequest {
+  const folders = rows.map((r) => ({ path: r.path, level: r.level, reasons: r.reasons }));
+  return appId === undefined ? { kind: "folders", why, folders } : { kind: "folders", why, folders, appId };
 }
 
 export function contentsOf(rows: LeftoverRow[]): Map<string, string[]> {

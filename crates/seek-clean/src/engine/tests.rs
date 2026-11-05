@@ -1130,3 +1130,5 @@ fn a_stale_request_outside_seeks_data_folder_is_locked() {
     assert_eq!(locks[1], None);
     assert_eq!(&locks[2..], &[bad; 5], "{locks:?}");
 }
+
+mod uninstall;

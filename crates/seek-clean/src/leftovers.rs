@@ -280,5 +280,10 @@ pub fn scan(
     scan_with(places, claims, installed, unix_now_ms(), index, &walk).rows
 }
 
+mod for_app;
+pub use for_app::for_app;
+#[cfg(test)]
+pub(crate) use for_app::{for_app_with, match_name, NameMatch};
+
 #[cfg(test)]
 mod tests;

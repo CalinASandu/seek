@@ -164,6 +164,9 @@ pub fn run() {
             cleanup::clean_prepare,
             cleanup::clean_commit,
             cleanup::open_recycle_bin,
+            cleanup::uninstall_start,
+            cleanup::uninstall_state,
+            cleanup::uninstall_leftovers,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Seek");

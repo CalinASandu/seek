@@ -107,7 +107,14 @@ fn idle_core() -> Arc<Core> {
 }
 
 fn state_with(core: Arc<Core>) -> CleanState {
-    CleanState { core: Mutex::new(Some(core)), listed: Mutex::new(Default::default()), shared: Arc::new(Shared::default()), emit: Mutex::new(None) }
+    CleanState {
+        core: Mutex::new(Some(core)),
+        listed: Mutex::new(Default::default()),
+        uninstall_listed: Mutex::new(Default::default()),
+        uninstalls: Uninstalls::default(),
+        shared: Arc::new(Shared::default()),
+        emit: Mutex::new(None),
+    }
 }
 
 fn group(size: u64, paths: &[&str]) -> DupGroup {
@@ -237,8 +244,9 @@ fn folder_row(path: &str, level: Level) -> LeftoverRow {
 fn leftover_and_stale_requests_are_read_as_the_window_sends_them() {
     // The shapes `folderRequest` (LeftoversTab) and the `stale` kind of `PrepareRequest` send.
     let folders = r#"{"kind":"folders","why":"leftover","folders":[{"path":"C:\\x","level":"likely","reasons":[{"text":"t","points":3}]},{"path":"C:\\y","level":null,"reasons":[]}]}"#;
-    let PrepareRequest::Folders { why, folders } = serde_json::from_str(folders).unwrap() else { panic!("not folders") };
+    let PrepareRequest::Folders { why, folders, app_id } = serde_json::from_str(folders).unwrap() else { panic!("not folders") };
     assert_eq!(why, Why::Leftover);
+    assert_eq!(app_id, None, "a leftovers request names no app");
     assert_eq!(folders.len(), 2);
     assert_eq!(folders[0].level, Some(Level::Likely));
     assert_eq!(folders[0].reasons, vec![Reason { text: "t".into(), points: 3 }]);
@@ -903,10 +911,40 @@ fn after_a_commit_the_scan_state_no_longer_lists_what_was_moved() {
 }
 
 #[test]
-fn an_uninstall_folder_request_is_refused_for_now() {
-    let f = ReqFolder { path: r"C:\Users\me\AppData\Local\Old".into(), level: None, reasons: vec![] };
-    let e = folder_candidates(Why::Uninstall, vec![f], &[]).unwrap_err();
-    assert!(e.contains("Leftovers list"), "{e}");
+fn an_uninstall_request_names_its_app_and_becomes_folders_and_shortcuts() {
+    let json = r#"{"kind":"folders","why":"uninstall","appId":"HKLM64\\{A}","folders":[{"path":"D:\\Apps\\Acme","level":"likely","reasons":[]},{"path":"C:\\Menu\\Acme.LNK","level":null,"reasons":[]}]}"#;
+    let PrepareRequest::Folders { why, folders, app_id } = serde_json::from_str(json).unwrap() else { panic!("not folders") };
+    assert_eq!((why, app_id.as_deref()), (Why::Uninstall, Some(r"HKLM64\{A}")));
+    // A service that calls the same name stale changes nothing: an uninstall never makes a StaleFile.
+    let stale = [stale(r"D:\Apps\Acme")];
+    let cands = folder_candidates(why, folders, &stale).unwrap();
+    assert!(matches!(&cands[0], Candidate::Folder { why: Why::Uninstall, level: Some(Level::Likely), .. }), "{:?}", cands[0]);
+    assert!(matches!(&cands[1], Candidate::Shortcut { .. }), "{:?}", cands[1]);
+}
+
+fn uninstall_lists(app: &str, rows: &[LeftoverRow]) -> HashMap<String, HashSet<String>> {
+    HashMap::from([(app.to_string(), listed_set(rows))])
+}
+
+#[test]
+fn an_uninstall_path_not_in_the_last_list_for_that_app_is_refused() {
+    let shown = [folder_row(r"D:\Apps\Acme", Level::VeryLikely), folder_row(r"C:\Menu\Acme.lnk", Level::Likely)];
+    let lists = uninstall_lists("app-a", &shown);
+    let leftovers = listed_set(&[folder_row(r"C:\Users\me\AppData\Local\Old", Level::Likely)]);
+    let ask = |app: Option<&str>, paths: &[&str]| check_folder_request(Why::Uninstall, app, paths.iter().copied(), &leftovers, &lists);
+    // What the list showed, however spelled.
+    assert!(ask(Some("app-a"), &[r"d:\apps\ACME", r"C:\Menu\Acme.lnk"]).is_ok());
+    // The user's own folders, anything else, even next to what was shown.
+    for p in [r"C:\Users\me\Documents", r"C:\Users\me", r"D:\Apps", r"D:\Apps\Acme\Sub", r"C:\Windows\System32"] {
+        assert!(ask(Some("app-a"), &[r"D:\Apps\Acme", p]).is_err(), "{p}");
+    }
+    // Another app's list doesn't vouch, an app never listed has nothing, and a request without an app gets nothing.
+    assert!(ask(Some("app-b"), &[r"D:\Apps\Acme"]).is_err());
+    assert!(ask(None, &[r"D:\Apps\Acme"]).is_err());
+    // The Leftovers list doesn't vouch for an uninstall, nor the reverse.
+    assert!(ask(Some("app-a"), &[r"C:\Users\me\AppData\Local\Old"]).is_err());
+    assert!(check_folder_request(Why::Leftover, None, [r"D:\Apps\Acme"], &leftovers, &lists).is_err());
+    assert!(check_folder_request(Why::Leftover, None, [r"C:\Users\me\AppData\Local\Old"], &leftovers, &lists).is_ok());
 }
 
 #[test]

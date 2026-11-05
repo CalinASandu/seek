@@ -237,7 +237,7 @@ export interface AppRow {
 
 export type PrepareRequest =
   | { kind: "duplicates"; groups: { path: string; deviceId: string }[][] }
-  | { kind: "folders"; why: Why; folders: { path: string; level: Level | null; reasons: Reason[] }[] }
+  | { kind: "folders"; why: Why; folders: { path: string; level: Level | null; reasons: Reason[] }[]; appId?: string }
   | { kind: "stale"; files: string[] };
 
 export interface ReviewItem {
