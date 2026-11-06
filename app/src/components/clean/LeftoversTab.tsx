@@ -8,6 +8,7 @@ import { useStore } from "../../lib/store";
 import { ConfidenceMeter, ReasonList } from "./ConfidenceMeter";
 import { Collapse, LockNote, MidPath, Placeholder, SelBar, Shielded, SkeletonRows, Tick } from "./parts";
 import type { SheetSpec } from "./CleanView";
+import { useRowMenu } from "./rowMenu";
 
 interface Props {
   ctl: CleanController;
@@ -108,9 +109,11 @@ interface LineProps {
 /** One leftover folder: shared by the Leftovers tab and the "what's left" step of an uninstall. */
 export function LeftLine({ row, ticked, locked, leave, onToggle }: LineProps) {
   const [open, setOpen] = useState(false);
+  const { rowProps, menu } = useRowMenu(row.path, "Folder actions");
   const name = row.path.slice(row.path.lastIndexOf("\\") + 1);
   return (
     <li
+      {...rowProps}
       className={`cl-row lf-row${leave !== undefined ? " is-leaving" : ""}`}
       style={leave !== undefined ? ({ "--i": leave } as CSSProperties) : undefined}
       data-key={row.path}
@@ -166,6 +169,7 @@ export function LeftLine({ row, ticked, locked, leave, onToggle }: LineProps) {
           </div>
         </Collapse>
       </div>
+      {menu}
     </li>
   );
 }

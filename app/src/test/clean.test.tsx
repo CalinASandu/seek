@@ -576,3 +576,164 @@ describe("Scan arrivals", () => {
     expect(notified).toBeLessThanOrEqual(3);
   });
 });
+
+describe("Always protect and Reveal from the row menu", () => {
+  const PF = "C:\\Program Files (x86)\\Battle.net Launcher";
+  const rowOf = (name: string) => screen.getByText(name).closest("li")!;
+  const rightClick = (user: UE, el: Element) => user.pointer({ keys: "[MouseRight]", target: el });
+  const openSettingsList = async (user: UE) => {
+    await user.click(screen.getByRole("button", { name: "Settings" }));
+    return (await screen.findByRole("heading", { name: "Protected from Cleanup" })).closest("section")!;
+  };
+  /** The first duplicate copy in Downloads, opened. */
+  async function firstCopy(user: UE) {
+    await scan(user);
+    const list = within(await expand(user, "vc_redist.x64.exe"));
+    const box = list.getByRole("checkbox", { name: /^Select C:\\Users\\Calin\\Downloads\\vc_redist/ });
+    return { box, li: box.closest("li")!, path: box.getAttribute("aria-label")!.slice("Select ".length) };
+  }
+
+  it("always_protect_from_the_menu_locks_the_row_and_appears_in_settings", async () => {
+    const { api, setSettings } = spied();
+    const user = await openClean(api);
+    await toLeftovers(user);
+    await rightClick(user, rowOf("Battle.net Launcher"));
+    expect(screen.getByRole("menu", { name: "Folder actions" })).toBeInTheDocument();
+    await user.click(screen.getByRole("menuitem", { name: "Always protect" }));
+    // saved first, then the row is judged again
+    await waitFor(() => expect(setSettings).toHaveBeenLastCalledWith(expect.objectContaining({ protectedPaths: [PF] })));
+    await waitFor(() => expect(rowOf("Battle.net Launcher")).toHaveTextContent("Protected"));
+    expect(within(rowOf("Battle.net Launcher")).queryByRole("checkbox")).toBeNull();
+
+    // it stays locked after a rescan
+    await user.click(screen.getByRole("button", { name: "Rescan" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Rescan" })).toBeEnabled());
+    expect(rowOf("Battle.net Launcher")).toHaveTextContent("Protected");
+    expect(within(rowOf("Battle.net Launcher")).queryByRole("checkbox")).toBeNull();
+
+    const section = await openSettingsList(user);
+    expect(await within(section).findByText(PF)).toBeInTheDocument();
+  });
+
+  it("removing_it_in_settings_unlocks_the_row", async () => {
+    const { api } = spied();
+    const user = await openClean(api);
+    await toLeftovers(user);
+    await rightClick(user, rowOf("Battle.net Launcher"));
+    await user.click(screen.getByRole("menuitem", { name: "Always protect" }));
+    await waitFor(() => expect(rowOf("Battle.net Launcher")).toHaveTextContent("Protected"));
+
+    const section = await openSettingsList(user);
+    await user.click(within(section).getByRole("button", { name: `Stop protecting ${PF}` }));
+    await user.click(screen.getByRole("button", { name: "Close settings" }));
+    await waitFor(() => expect(within(rowOf("Battle.net Launcher")).getByRole("checkbox")).toBeInTheDocument());
+    expect(rowOf("Battle.net Launcher")).not.toHaveTextContent("Protected");
+  });
+
+  it("protects a duplicate copy by its file, shows the protected reason, and Stop protecting undoes it", async () => {
+    const { api, setSettings } = spied();
+    const user = await openClean(api);
+    const { li, path } = await firstCopy(user);
+    await rightClick(user, li);
+    expect(screen.getByRole("menu", { name: "Copy actions" })).toBeInTheDocument();
+    await user.click(screen.getByRole("menuitem", { name: "Always protect" }));
+    await waitFor(() => expect(setSettings).toHaveBeenLastCalledWith(expect.objectContaining({ protectedPaths: [path] })));
+    const locked = (await screen.findByText(lockText("protected"), { selector: ".copy-why" })).closest("li")!;
+    expect(locked).toHaveTextContent(path.slice(path.lastIndexOf("\\") + 1));
+    expect(within(locked).queryByRole("checkbox")).toBeNull();
+
+    await rightClick(user, locked);
+    await user.click(screen.getByRole("menuitem", { name: "Stop protecting" }));
+    await waitFor(() => expect(setSettings).toHaveBeenLastCalledWith(expect.objectContaining({ protectedPaths: [] })));
+    await waitFor(() => expect(screen.queryByText(lockText("protected"), { selector: ".copy-why" })).toBeNull());
+  });
+
+  it("a protected folder locks what is inside it, and a copy's menu can't undo the folder's protection", async () => {
+    const { api } = spied();
+    await api.setSettings({ ...(await api.getSettings()), protectedPaths: ["C:\\Users\\Calin\\Downloads"] });
+    const user = await openClean(api);
+    await scan(user);
+    const list = within(await expand(user, "vc_redist.x64.exe"));
+    const locked = (await list.findByText(lockText("protected"), { selector: ".copy-why" })).closest("li")!;
+    expect(within(locked).queryByRole("checkbox")).toBeNull();
+    await rightClick(user, locked);
+    const item = screen.getByRole("menuitem", { name: "Stop protecting" });
+    expect(item).toBeDisabled();
+    expect(item).toHaveAttribute("title", expect.stringContaining("C:\\Users\\Calin\\Downloads"));
+    expect(screen.getByRole("menuitem", { name: "Reveal in Explorer" })).toBeEnabled();
+  });
+
+  it("when the list can't be saved it says so and the row is not shown as protected", async () => {
+    const base = makeApi();
+    let fail: (e: Error) => void = () => undefined;
+    const setSettings = vi.fn(() => new Promise<void>((_, reject) => void (fail = reject)));
+    const user = await openClean({ ...base, setSettings });
+    await toLeftovers(user);
+    await rightClick(user, rowOf("Battle.net Launcher"));
+    await user.click(screen.getByRole("menuitem", { name: "Always protect" }));
+    // while the save is still running the row is not judged protected yet
+    await waitFor(() => expect(setSettings).toHaveBeenCalled());
+    expect(rowOf("Battle.net Launcher")).not.toHaveTextContent("Protected");
+    fail(new Error("disk is full"));
+    expect(await screen.findByText(/"Always protect" could not be saved\. disk is full/)).toBeInTheDocument();
+    expect(setSettings).toHaveBeenCalled();
+    const row = rowOf("Battle.net Launcher");
+    expect(row).not.toHaveTextContent("Protected");
+    expect(within(row).getByRole("checkbox")).toBeInTheDocument();
+  });
+
+  it("opens on the context-menu key and on Shift+F10 for the focused row", async () => {
+    const user = await openClean();
+    await toLeftovers(user);
+    const li = rowOf("Battle.net Launcher");
+    within(li).getByRole("checkbox").focus();
+    await user.keyboard("{ContextMenu}");
+    expect(screen.getByRole("menu", { name: "Folder actions" })).toBeInTheDocument();
+    await user.keyboard("{Escape}");
+    expect(screen.queryByRole("menu")).toBeNull();
+    expect(within(li).getByRole("checkbox")).toHaveFocus();
+
+    await user.keyboard("{Shift>}{F10}{/Shift}");
+    const items = within(screen.getByRole("menu", { name: "Folder actions" })).getAllByRole("menuitem");
+    expect(items.map((i) => i.textContent)).toEqual(["Always protect", "Reveal in Explorer"]);
+    // the menu works from the keyboard alone: Enter chooses the first item
+    await user.keyboard("{Enter}");
+    await waitFor(() => expect(rowOf("Battle.net Launcher")).toHaveTextContent("Protected"));
+
+    // a duplicate copy opens its own menu the same way
+    await user.click(tab("Duplicates"));
+    const { box } = await firstCopy(user);
+    box.focus();
+    await user.keyboard("{ContextMenu}");
+    expect(screen.getByRole("menu", { name: "Copy actions" })).toBeInTheDocument();
+  });
+
+  it("Reveal in Explorer uses revealPath with the row's path", async () => {
+    const base = makeApi();
+    const revealPath = vi.fn(async () => undefined);
+    const user = await openClean({ ...base, revealPath });
+    await toLeftovers(user);
+    await rightClick(user, rowOf("Battle.net Launcher"));
+    await user.click(screen.getByRole("menuitem", { name: "Reveal in Explorer" }));
+    expect(revealPath).toHaveBeenCalledWith(PF);
+  });
+
+  it("a row protected after it was ticked drops out and is not sent for review", async () => {
+    const base = makeApi();
+    const cleanPrepare = vi.fn(base.cleanPrepare);
+    const user = await openClean({ ...base, cleanPrepare });
+    await toLeftovers(user);
+    await user.click(screen.getByRole("checkbox", { name: `Select ${PF}` }));
+    await user.click(screen.getByRole("checkbox", { name: /Select .*ZoomUpdater-Cache/ }));
+    await rightClick(user, rowOf("Battle.net Launcher"));
+    await user.click(screen.getByRole("menuitem", { name: "Always protect" }));
+    await waitFor(() => expect(rowOf("Battle.net Launcher")).toHaveTextContent("Protected"));
+    expect(screen.getByRole("region", { name: "Selection" })).toHaveTextContent(/^1 item, /);
+    await user.click(screen.getByRole("button", { name: "Review…" }));
+    await screen.findByRole("dialog", { name: /^Move 1 item/ });
+    expect(cleanPrepare).toHaveBeenCalledTimes(1);
+    const sent = JSON.stringify(cleanPrepare.mock.calls[0]![0]);
+    expect(sent).not.toContain("Battle.net");
+    expect(sent).toContain("ZoomUpdater-Cache");
+  });
+});
