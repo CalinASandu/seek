@@ -435,12 +435,12 @@ function seedHistory(scenario: CleanScenario, now: number): HistoryEntry[] {
   if (scenario === "empty") return [];
   const bin = (n: string, ext: string) => `C:\\$Recycle.Bin\\S-1-5-21-3857284719-221946123-1730241-1001\\$R${n}${ext}`;
   return [
-    { id: "h-seed-1", timeMs: now - 2 * 3_600_000, originalPath: "D:\\Downloads\\ubuntu-22.04.3-desktop-amd64 (1).iso", size: 4_700 * MB, why: "duplicate", binPath: bin("AB12CD", ".iso"), leftReason: null },
-    { id: "h-seed-2", timeMs: now - 2 * 3_600_000, originalPath: "C:\\Users\\Calin\\Downloads\\invoice-0382 (2).pdf", size: 2 * MB, why: "duplicate", binPath: bin("EF34GH", ".pdf"), leftReason: null },
-    { id: "h-seed-3", timeMs: now - 2 * 3_600_000, originalPath: "C:\\Users\\Calin\\Documents\\Work\\report-final.docx", size: 6 * MB, why: "duplicate", binPath: null, leftReason: "This changed after you reviewed it, so it was left in place." },
-    { id: "h-seed-4", timeMs: now - 3 * DAY, originalPath: "C:\\Users\\Calin\\AppData\\Local\\OldToolCache", size: 380 * MB, why: "leftover", binPath: bin("IJ56KL", ""), leftReason: null },
-    { id: "h-seed-5", timeMs: now - 9 * DAY, originalPath: "C:\\Users\\Calin\\AppData\\Roaming\\Skype for Desktop", size: 212 * MB, why: "leftover", binPath: bin("MN78OP", ""), leftReason: null },
-    { id: "h-seed-6", timeMs: now - 40 * DAY, originalPath: "C:\\Program Files (x86)\\Contoso Updater", size: 54 * MB, why: "uninstall", binPath: bin("QR90ST", ""), leftReason: null },
+    { id: "h-seed-1", timeMs: now - 2 * 3_600_000, originalPath: "D:\\Downloads\\ubuntu-22.04.3-desktop-amd64 (1).iso", size: 4_700 * MB, why: "duplicate", binPath: bin("AB12CD", ".iso"), leftReason: null, putBackMs: null },
+    { id: "h-seed-2", timeMs: now - 2 * 3_600_000, originalPath: "C:\\Users\\Calin\\Downloads\\invoice-0382 (2).pdf", size: 2 * MB, why: "duplicate", binPath: bin("EF34GH", ".pdf"), leftReason: null, putBackMs: null },
+    { id: "h-seed-3", timeMs: now - 2 * 3_600_000, originalPath: "C:\\Users\\Calin\\Documents\\Work\\report-final.docx", size: 6 * MB, why: "duplicate", binPath: null, leftReason: "This changed after you reviewed it, so it was left in place.", putBackMs: null },
+    { id: "h-seed-4", timeMs: now - 3 * DAY, originalPath: "C:\\Users\\Calin\\AppData\\Local\\OldToolCache", size: 380 * MB, why: "leftover", binPath: bin("IJ56KL", ""), leftReason: null, putBackMs: null },
+    { id: "h-seed-5", timeMs: now - 9 * DAY, originalPath: "C:\\Users\\Calin\\AppData\\Roaming\\Skype for Desktop", size: 212 * MB, why: "leftover", binPath: bin("MN78OP", ""), leftReason: null, putBackMs: null },
+    { id: "h-seed-6", timeMs: now - 40 * DAY, originalPath: "C:\\Program Files (x86)\\Contoso Updater", size: 54 * MB, why: "uninstall", binPath: bin("QR90ST", ""), leftReason: null, putBackMs: null },
   ];
 }
 
@@ -679,18 +679,18 @@ export function createMockClean(opts: MockCleanOptions): CleanApi {
         const entryId = `h-${nextHistory++}`;
         if (reason) {
           out.push({ id, path: it.path, size: it.size, outcome: { kind: "left", reason } });
-          entries.push({ id: entryId, timeMs: Date.now(), originalPath: it.path, size: it.size, why: it.why, binPath: null, leftReason: reason });
+          entries.push({ id: entryId, timeMs: Date.now(), originalPath: it.path, size: it.size, why: it.why, binPath: null, leftReason: reason, putBackMs: null });
         } else {
           const bin = binPathFor(it.path, id + nextHistory);
           out.push({ id, path: it.path, size: it.size, outcome: { kind: "moved", binPath: bin } });
-          entries.push({ id: entryId, timeMs: Date.now(), originalPath: it.path, size: it.size, why: it.why, binPath: bin, leftReason: null });
+          entries.push({ id: entryId, timeMs: Date.now(), originalPath: it.path, size: it.size, why: it.why, binPath: bin, leftReason: null, putBackMs: null });
           movedBytes += it.size;
           movedPaths.push(it.path);
         }
       }
       history = [...entries.reverse(), ...history];
       dropMoved(movedPaths);
-      return { items: out, movedBytes, stoppedEarly: null };
+      return { items: out, movedBytes, stoppedEarly: null, historyError: null };
     },
     async cleanHistory() {
       await delay();
@@ -701,9 +701,9 @@ export function createMockClean(opts: MockCleanOptions): CleanApi {
       return entryIds.map((id) => {
         const e = history.find((h) => h.id === id);
         if (!e || e.binPath === null) return { id, restored: false, reason: "This item was not moved, so there is nothing to put back." };
-        if (e.why === "uninstall") return { id, restored: false, reason: "An uninstaller's own work can't be put back." };
+        if (e.putBackMs !== null) return { id, restored: false, reason: "Already put back." };
         if (e.id === "h-seed-5") return { id, restored: false, reason: "No longer in the Recycle Bin" };
-        history = history.filter((h) => h.id !== id);
+        history = history.map((h) => (h.id === id ? { ...h, putBackMs: Date.now() } : h));
         return { id, restored: true, reason: null };
       });
     },

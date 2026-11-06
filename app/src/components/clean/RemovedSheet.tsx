@@ -87,14 +87,12 @@ export function RemovedSheet({ onClose, notify }: { onClose: () => void; notify:
                     <span className="removed-left" title={e.leftReason}>
                       {e.leftReason}
                     </span>
-                  ) : done?.restored ? (
+                  ) : e.putBackMs !== null || done?.restored ? (
                     <span className="removed-done">Put back</span>
                   ) : done ? (
                     <span className="removed-left" title={done.reason ?? undefined}>
                       {done.reason}
                     </span>
-                  ) : e.why === "uninstall" ? (
-                    <span className="removed-left">An uninstaller's work can't be put back</span>
                   ) : (
                     <button className="btn btn-small" aria-label={`Put back ${fileName(e.originalPath)}`} disabled={r === "busy"} onClick={() => void putBack(e.id)}>
                       Put back

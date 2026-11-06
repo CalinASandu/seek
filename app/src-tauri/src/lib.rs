@@ -64,6 +64,20 @@ async fn keep_service_awake(app: AppHandle, link: Arc<ServiceLink>, clean: Arc<C
     }
 }
 
+/// Quit: the window goes away at once, then a removal in flight (and its history write) gets up to two
+/// minutes to finish before the process exits. On a thread of its own, so the tray menu stays alive.
+fn quit_when_idle(app: &AppHandle) {
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.hide();
+    }
+    let app = app.clone();
+    std::thread::spawn(move || {
+        let clean: Arc<CleanState> = (*app.state::<Arc<CleanState>>()).clone();
+        clean.finish_in_flight(Duration::from_secs(120));
+        app.exit(0);
+    });
+}
+
 fn build_tray(app: &AppHandle) -> tauri::Result<()> {
     let open = MenuItem::with_id(app, "open", "Open Seek", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Quit Seek", true, None::<&str>)?;
@@ -74,7 +88,7 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
         .show_menu_on_left_click(false)
         .on_menu_event(|app, e| match e.id().as_ref() {
             "open" => show_main(app),
-            "quit" => app.exit(0),
+            "quit" => quit_when_idle(app),
             _ => {}
         })
         .on_tray_icon_event(|tray, e| {
@@ -190,6 +204,8 @@ pub fn run() {
             cleanup::clean_apps,
             cleanup::clean_prepare,
             cleanup::clean_commit,
+            cleanup::clean_history,
+            cleanup::clean_put_back,
             cleanup::open_recycle_bin,
             cleanup::uninstall_start,
             cleanup::uninstall_state,

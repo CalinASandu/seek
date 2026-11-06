@@ -138,6 +138,9 @@ pub struct CommitResult {
     pub items: Vec<ItemOutcome>,
     pub moved_bytes: u64,
     pub stopped_early: Option<String>,
+    /// Why Recently removed couldn't record this commit; the items were moved all the same.
+    #[serde(default)]
+    pub history_error: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]

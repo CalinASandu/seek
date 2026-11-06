@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use crate::facts::{ClaimCheck, Elevator, FileFacts, Recycler, Stat};
+use crate::history::{self, History};
 use crate::model::{
     Candidate, CommitResult, ItemOutcome, JobItem, Level, Lock, Outcome, Prepared, Reason,
     ReviewItem, Why,
@@ -129,6 +130,8 @@ pub struct Engine {
     tokens: Mutex<VecDeque<(String, Review)>>,
     /// Held for the whole of every `commit`: two commits never judge each other's survivors.
     serial: Mutex<()>,
+    /// Where each commit is written down (the window's engine only; never the elevated process's).
+    history: Option<Arc<History>>,
 }
 
 impl Engine {
@@ -149,7 +152,15 @@ impl Engine {
             claims,
             tokens: Mutex::new(VecDeque::new()),
             serial: Mutex::new(()),
+            history: None,
         }
+    }
+
+    /// Records every commit, item by item, in `history`. Only the window's engine gets one: the
+    /// elevated process reports to the window, which writes it down.
+    pub fn with_history(mut self, history: Arc<History>) -> Engine {
+        self.history = Some(history);
+        self
     }
 
     /// Replaces the guard held around each item's last look and recycle.
@@ -527,11 +538,43 @@ impl Engine {
                 &mut stopped,
             );
         }
+        let history_error = self.record(&review, &out);
         Ok(CommitResult {
             items: out,
             moved_bytes,
             stopped_early: stopped,
+            history_error,
         })
+    }
+
+    /// Writes one history entry per item of a finished commit, moved or left. A failure here never
+    /// undoes a removal: it comes back as text for the result to show.
+    fn record(&self, review: &Review, items: &[ItemOutcome]) -> Option<String> {
+        let history = self.history.as_ref()?;
+        if items.is_empty() {
+            return None;
+        }
+        let time_ms = history::now_ms();
+        let entries: Vec<history::Entry> = items
+            .iter()
+            .map(|i| {
+                let (bin_path, left_reason) = match &i.outcome {
+                    Outcome::Moved { bin_path } => (Some(bin_path.clone()), None),
+                    Outcome::Left { reason } => (None, Some(reason.clone())),
+                };
+                history::Entry {
+                    id: history::new_id(),
+                    time_ms,
+                    original_path: i.path.clone(),
+                    size: i.size,
+                    why: review.recs.get(&i.id).map_or(Why::Leftover, |r| r.why),
+                    bin_path,
+                    left_reason,
+                    put_back_ms: None,
+                }
+            })
+            .collect();
+        history.append(&entries).err()
     }
 
     /// Recycles one item. If Windows reports failure, the item counts as still there only when it

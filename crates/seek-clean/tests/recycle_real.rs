@@ -66,6 +66,46 @@ fn real_recycle_reports_a_location_and_restores() {
     assert_eq!(std::fs::read(&file).unwrap(), body, "restored contents differ");
 }
 
+/// Recycle a temp file, then put it back through the real `BinRestore` (the one the app uses,
+/// with the deletion-date check), and read the content again.
+#[test]
+#[ignore]
+fn real_put_back_restores_to_its_folder() {
+    use seek_clean::history::{now_ms, put_back, BinRestore, Entry, ShellBin};
+    use seek_clean::model::Why;
+
+    let dir = fixed_temp_dir();
+    let file: PathBuf = dir.path().join(format!("seek-putback-{}.txt", std::process::id()));
+    let body = b"seek decimator put back: recycled, then put back through history::put_back";
+    std::fs::write(&file, body).unwrap();
+
+    let report = recycle_one(&file).expect("recycle_one");
+    let bin = report.bin_location().expect("sink gave no new location").to_string();
+    assert!(!file.exists());
+    assert!(ShellBin.in_bin(&bin), "the bin does not list {bin}");
+
+    let entry = Entry {
+        id: "real-test".into(),
+        time_ms: now_ms(),
+        original_path: file.to_string_lossy().into_owned(),
+        size: body.len() as u64,
+        why: Why::Duplicate,
+        bin_path: Some(bin.clone()),
+        left_reason: None,
+        put_back_ms: None,
+    };
+    let result = put_back(&entry, &ShellBin);
+    assert!(
+        result.restored,
+        "PUT BACK FAILED, the test file is still in the Recycle Bin and must be restored or \
+         removed by hand: original {} / bin {bin} / reason: {:?}",
+        file.display(),
+        result.reason
+    );
+    assert_eq!(std::fs::read(&file).unwrap(), body, "restored contents differ");
+    assert!(!ShellBin.in_bin(&bin), "still listed in the bin after the restore");
+}
+
 /// MaxCapacity in MB for the volume holding `root`, from the user's bin settings (read only).
 fn max_capacity_mb(root: &str) -> Option<u64> {
     let mut guid = [0u16; 64];

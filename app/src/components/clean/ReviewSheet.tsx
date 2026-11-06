@@ -310,6 +310,13 @@ export function ReviewSheet({ request, picked, contents, onProtect, onClose }: P
               : "Everything was left where it was."}
           </p>
           {result.stoppedEarly && <p className="review-warn">Removal stopped early. {result.stoppedEarly}</p>}
+          {result.historyError && (
+            <p className="review-warn" role="status">
+              {movedPaths.length > 0
+                ? `Moved, but Recently removed couldn't record it: ${result.historyError} The items are in the Recycle Bin.`
+                : `Recently removed couldn't record this: ${result.historyError}`}
+            </p>
+          )}
           {putBack && !putBack.busy && (
             <p className="review-note" role="status">
               {putBack.done > 0 ? `Put back ${plural(putBack.done)}.` : "Nothing was put back."}

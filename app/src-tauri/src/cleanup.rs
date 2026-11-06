@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use seek_clean::apps::{self, ShellLauncher, UninstallPhase, Uninstalls};
@@ -23,6 +23,7 @@ use seek_clean::dupes::{self, ScanEvent, SizeBatch, SizeFile, MIN_DUPLICATE_BYTE
 use seek_clean::elevated::{JobElevator, LaunchError, Launcher};
 use seek_clean::engine::Engine;
 use seek_clean::facts::{Elevator, FileFacts, RealFacts};
+use seek_clean::history::{self, History, PutBackResult, ShellBin};
 use seek_clean::leftovers;
 use seek_clean::model::{AppRow, Candidate, CommitResult, DupGroup, Level, LeftoverRow, Outcome, Prepared, Reason, Why};
 use seek_clean::paths::canon;
@@ -794,7 +795,9 @@ impl Core {
         let facts: Arc<dyn FileFacts> = Arc::new(RealFacts);
         let claims = Arc::new(LiveClaims::new());
         // Program Files leftovers and Seek's stale data go through one UAC prompt per commit.
-        let engine = Engine::new(places.clone(), Arc::new(ShellRecycler), Some(Arc::new(UacElevator)), facts.clone(), claims.clone());
+        // Every commit is written to Recently removed. Only this engine has a history; the elevated process reports to it.
+        let engine = Engine::new(places.clone(), Arc::new(ShellRecycler), Some(Arc::new(UacElevator)), facts.clone(), claims.clone())
+            .with_history(Arc::new(History::open_default()));
         Core { engine, places, facts, claims: Some(claims) }
     }
 }
@@ -910,6 +913,28 @@ pub struct CleanState {
     shared: Arc<Shared>,
     /// Sends events to the window; set once the app exists.
     emit: Mutex<Option<Arc<Emit>>>,
+    /// Removals and put-backs in flight, so Quit can wait for them (and their history write).
+    busy: Mutex<Busy>,
+    idle: Condvar,
+}
+
+#[derive(Default)]
+struct Busy {
+    running: u32,
+    quitting: bool,
+}
+
+/// Counts one removal or put-back in flight until it drops.
+struct InFlight<'a>(&'a CleanState);
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        let mut b = self.0.busy.lock().unwrap_or_else(|e| e.into_inner());
+        b.running = b.running.saturating_sub(1);
+        if b.running == 0 {
+            self.0.idle.notify_all();
+        }
+    }
 }
 
 impl Default for CleanState {
@@ -921,6 +946,8 @@ impl Default for CleanState {
             uninstalls: Uninstalls::default(),
             shared: Arc::new(Shared::default()),
             emit: Mutex::new(None),
+            busy: Mutex::new(Busy::default()),
+            idle: Condvar::new(),
         }
     }
 }
@@ -969,9 +996,35 @@ impl CleanState {
         }
     }
 
+    /// Counts a removal or put-back as in flight. Refused once Quit has begun: it would be cut off.
+    fn begin(&self) -> Result<InFlight<'_>, String> {
+        let mut b = self.busy.lock().unwrap_or_else(|e| e.into_inner());
+        if b.quitting {
+            return Err("Seek is closing. Nothing was changed.".into());
+        }
+        b.running += 1;
+        Ok(InFlight(self))
+    }
+
+    /// Quit: refuses new removals, then waits up to `limit` for the ones running (including their
+    /// history write). True when none is left. Sleeps on a condition variable; it never spins.
+    pub fn finish_in_flight(&self, limit: Duration) -> bool {
+        let mut b = self.busy.lock().unwrap_or_else(|e| e.into_inner());
+        b.quitting = true;
+        let deadline = Instant::now() + limit;
+        while b.running > 0 {
+            let Some(left) = deadline.checked_duration_since(Instant::now()).filter(|d| !d.is_zero()) else {
+                return false;
+            };
+            b = self.idle.wait_timeout(b, left).unwrap_or_else(|e| e.into_inner()).0;
+        }
+        true
+    }
+
     /// Removes the chosen items of a review, then takes what was moved out of the results so it
     /// cannot come back through `clean_scan_state`.
     fn commit(&self, core: &Core, token: &str, ids: &[u32], protected: &[String]) -> Result<CommitResult, String> {
+        let _flying = self.begin()?;
         let result = core.engine.commit(token, ids, protected)?;
         let moved: Vec<String> = result.items.iter().filter(|i| matches!(i.outcome, Outcome::Moved { .. })).map(|i| i.path.clone()).collect();
         if !moved.is_empty() {
@@ -1191,6 +1244,27 @@ pub async fn clean_commit(clean: Clean<'_>, token: String, ids: Vec<u32>) -> Res
     tauri::async_runtime::spawn_blocking(move || state.commit(&core, &token, &ids, &protected))
         .await
         .map_err(|e| e.to_string())?
+}
+
+/// Past removals, newest first. A history that can't be read is an error with its reason; a damaged
+/// file is set aside the next time Seek removes something.
+#[tauri::command]
+pub async fn clean_history() -> Result<Vec<history::Entry>, String> {
+    tauri::async_runtime::spawn_blocking(|| History::open_default().try_list())
+        .await
+        .map_err(|e| format!("Reading Recently removed stopped unexpectedly: {e}"))?
+}
+
+/// Puts the listed entries back from the Recycle Bin. Restoring is COM on a thread of its own.
+#[tauri::command]
+pub async fn clean_put_back(clean: Clean<'_>, entry_ids: Vec<String>) -> Result<Vec<PutBackResult>, String> {
+    let state: Arc<CleanState> = (*clean).clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _flying = state.begin()?;
+        Ok(history::put_back_ids(&History::open_default(), &ShellBin, &entry_ids))
+    })
+    .await
+    .map_err(|e| format!("Putting back stopped unexpectedly: {e}"))?
 }
 
 // ---- uninstalling -------------------------------------------------------------------------------------
