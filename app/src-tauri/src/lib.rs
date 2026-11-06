@@ -97,13 +97,19 @@ pub fn clean_elevated_dispatch(args: &[std::ffi::OsString]) -> Option<i32> {
     if args.first()? != "--clean-elevated" {
         return None;
     }
-    Some(match args {
-        [_, pipe_name] => match pipe_name.to_str() {
-            Some(name) => seek_clean::elevated::run_main(name, settings::protected_paths_strict()),
-            None => 2,
-        },
-        _ => 2,
-    })
+    // Only the right shape of arguments gets any further (a refusal reads nothing and changes nothing).
+    let [_, pipe_name] = args else { return Some(2) };
+    let Some(name) = pipe_name.to_str().filter(|n| seek_clean::elevated::pipe::name_ok(n)) else {
+        return Some(2);
+    };
+    // First, before any place, claim or setting is read: the system folders from Windows and HKLM,
+    // checked against the environment, which is then overwritten with them.
+    let trusted = seek_clean::elevated::trust::establish();
+    let protected = match &trusted {
+        Ok(_) => settings::protected_paths_strict(),
+        Err(e) => Err(e.clone()),
+    };
+    Some(seek_clean::elevated::run_main(name, protected, trusted))
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]

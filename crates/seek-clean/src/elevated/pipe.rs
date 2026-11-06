@@ -27,17 +27,20 @@ use windows::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSe
 use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
 use windows::Win32::Storage::FileSystem::{FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_DUPLEX, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT};
 use windows::Win32::System::Pipes::{
-    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId, GetNamedPipeServerProcessId, PIPE_READMODE_BYTE,
-    PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
+    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId, GetNamedPipeServerProcessId, WaitNamedPipeW,
+    PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
 };
 use windows::Win32::System::IO::CancelSynchronousIo;
 
 const PREFIX: &str = r"\\.\pipe\seek-clean-";
-/// How long a client that connects before the window knows which process it started waits for
-/// that to be known. A client that is still unknown then is not the one started.
-const PID_WAIT: Duration = Duration::from_secs(2);
+/// The most a client that is connected before the window knows which process it started waits for
+/// that to be known (the prompt may be open that long: the process does not exist until it is
+/// answered). It is then judged by process id like any other. Never longer than this in total.
+const PID_WAIT: Duration = Duration::from_secs(15 * 60);
 /// Clients turned away before the server gives up.
 const MAX_CONNECTS: u32 = 32;
+/// How long the elevated copy tries to connect, waiting for a free instance.
+const CONNECT_WINDOW: Duration = Duration::from_secs(30);
 /// How long the elevated copy waits to write its result.
 pub const REPLY_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -138,8 +141,9 @@ impl Server {
                         want = Some(p);
                         want
                     }
+                    // The launch ended without a process (or the process has exited): nobody is the one.
                     Err(mpsc::RecvTimeoutError::Disconnected) => return Err("no process was started".into()),
-                    Err(mpsc::RecvTimeoutError::Timeout) => None,
+                    Err(mpsc::RecvTimeoutError::Timeout) => return Err("the process that was started never came".into()),
                 },
             };
             if pid == Some(client) {
@@ -241,8 +245,10 @@ pub struct Client {
 impl Client {
     /// Connects without letting the server impersonate this process, and asks which process serves.
     pub fn connect(name: &str) -> Result<Client, String> {
+        let end = Instant::now() + CONNECT_WINDOW;
+        let w = wide(name);
         let mut last = String::new();
-        for _ in 0..50 {
+        while Instant::now() < end {
             let opened = std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
@@ -255,9 +261,12 @@ impl Client {
                     unsafe { GetNamedPipeServerProcessId(HANDLE(file.as_raw_handle()), &mut pid) }.map_err(|e| e.to_string())?;
                     return Ok(Client { file, server_pid: pid });
                 }
+                // Another client holds the instance (one that will be turned away, or a first try
+                // before the server is listening again): wait for a free one, up to a second at a time.
                 Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY.0 as i32) => {
                     last = e.to_string();
-                    std::thread::sleep(Duration::from_millis(100));
+                    // SAFETY: `w` is NUL-terminated.
+                    let _ = unsafe { WaitNamedPipeW(PCWSTR(w.as_ptr()), 1000) };
                 }
                 Err(e) => return Err(e.to_string()),
             }

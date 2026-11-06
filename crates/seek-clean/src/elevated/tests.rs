@@ -1053,3 +1053,192 @@ fn a_reply_over_the_cap_is_refused_unsent() {
     let client = pipe::Client::connect(&name).unwrap();
     assert!(client.reply_within(&[0u8; 11], 10, Duration::from_secs(1)).unwrap_err().contains("too big"));
 }
+
+// ---- R1: system folders from Windows and HKLM, never the environment ---------------------------------------
+
+use super::trust::{self, TrustedFolders};
+
+fn map_reader(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+    let m: HashMap<String, String> = pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+    move |n| m.get(n).cloned()
+}
+
+fn trusted_sample() -> TrustedFolders {
+    let profile = map_reader(&[("ProgramData", r"%SystemDrive%\ProgramData"), ("ProfilesDirectory", r"%SystemDrive%\Users"), ("Public", r"%SystemDrive%\Users\Public")]);
+    let version = map_reader(&[
+        ("ProgramFilesDir", r"C:\Program Files"),
+        ("ProgramFilesDir (x86)", r"C:\Program Files (x86)"),
+        ("CommonFilesDir", r"C:\Program Files\Common Files"),
+        ("CommonFilesDir (x86)", r"C:\Program Files (x86)\Common Files"),
+        ("ProgramW6432Dir", r"C:\Program Files"),
+        ("CommonW6432Dir", r"C:\Program Files\Common Files"),
+    ]);
+    trust::derive(r"C:\WINDOWS", &profile, &version).unwrap()
+}
+
+#[test]
+fn the_trusted_folders_are_derived_from_the_windows_folder_and_hklm_alone() {
+    let t = trusted_sample();
+    assert_eq!((t.system_drive.as_str(), t.program_data.as_str(), t.profiles_dir.as_str()), ("C:", r"C:\ProgramData", r"C:\Users"));
+    assert_eq!(t.public.as_deref(), Some(r"C:\Users\Public"));
+    assert_eq!(t.get("programdata").as_deref(), Some(r"C:\ProgramData"));
+    assert_eq!(t.get("ALLUSERSPROFILE").as_deref(), Some(r"C:\ProgramData"));
+    assert_eq!(t.get("windir").as_deref(), Some(r"C:\WINDOWS"));
+    assert_eq!(t.get("ProgramFiles(x86)").as_deref(), Some(r"C:\Program Files (x86)"));
+    assert_eq!(t.get("LOCALAPPDATA"), None);
+    // A drive other than C: carries through to everything expanded from %SystemDrive%.
+    let d = trust::derive(r"D:\Windows", &map_reader(&[("ProgramData", r"%systemdrive%\PD"), ("ProfilesDirectory", r"%SystemDrive%\Users")]), &map_reader(&[("ProgramFilesDir", r"D:\Program Files")])).unwrap();
+    assert_eq!((d.system_drive.as_str(), d.program_data.as_str()), ("D:", r"D:\PD"));
+    assert_eq!(d.program_w6432, r"D:\Program Files", "ProgramW6432 falls back to Program Files");
+}
+
+#[test]
+fn a_value_that_needs_the_environment_or_is_missing_is_not_trusted() {
+    let version = map_reader(&[("ProgramFilesDir", r"C:\Program Files")]);
+    let ok_profile = [("ProgramData", r"%SystemDrive%\ProgramData"), ("ProfilesDirectory", r"%SystemDrive%\Users")];
+    // Any variable but %SystemDrive% would be read from the environment: refused.
+    let with_env = map_reader(&[("ProgramData", r"%ProgramData%\x"), ("ProfilesDirectory", r"%SystemDrive%\Users")]);
+    assert!(trust::derive(r"C:\WINDOWS", &with_env, &version).is_err());
+    // Each required value must be there.
+    assert!(trust::derive(r"C:\WINDOWS", &map_reader(&[("ProgramData", r"C:\PD")]), &version).is_err());
+    assert!(trust::derive(r"C:\WINDOWS", &map_reader(&ok_profile), &map_reader(&[])).is_err());
+    assert!(trust::derive(r"\\server\share\WINDOWS", &map_reader(&ok_profile), &version).is_err());
+    assert!(trust::expand_system_drive(r"%SystemDrive%\a\%SystemDrive%", "C:").unwrap().starts_with(r"C:\a\C:"));
+}
+
+#[test]
+fn an_environment_that_disagrees_is_detected_and_one_that_agrees_is_not() {
+    let t = trusted_sample();
+    let env = |pairs: Vec<(&'static str, &'static str)>| {
+        let m: HashMap<&str, &str> = pairs.into_iter().collect();
+        move |n: &str| m.get(n).map(|v| v.to_string())
+    };
+    // Same values, spelled differently (case, slash, trailing slash), and variables that aren't set.
+    assert!(trust::mismatches(&t, &env(vec![("SystemDrive", "c:"), ("ProgramData", r"c:\programdata\"), ("ProgramFiles", "C:/Program Files")])).is_empty());
+    assert!(trust::mismatches(&t, &env(vec![])).is_empty());
+    for (name, bad) in [("SystemDrive", "Z:"), ("ProgramData", r"Z:\Evil"), ("ALLUSERSPROFILE", r"C:\Elsewhere"), ("SystemRoot", r"C:\Other"), ("ProgramFiles", r"C:\Evil"), ("PUBLIC", r"C:\Users\Other"), ("CommonProgramFiles(x86)", r"C:\x")] {
+        assert_eq!(trust::mismatches(&t, &env(vec![(name, bad)])), vec![name], "{name}");
+    }
+}
+
+#[test]
+fn places_that_disagree_with_the_trusted_folders_are_refused() {
+    let t = trusted_sample();
+    let places = |win: &str, pf: &[&str], users: &str, pd: &str| Places::for_tests(win, pf, users, r"C:\Users\me", pd, &[]);
+    let good = places(r"C:\WINDOWS", &[r"C:\Program Files", r"C:\Program Files (x86)"], r"C:\Users", r"C:\ProgramData");
+    assert_eq!(trust::check_places(&good, &t), Ok(()));
+    for bad in [
+        places(r"C:\Other", &[r"C:\Program Files"], r"C:\Users", r"C:\ProgramData"),
+        places(r"C:\WINDOWS", &[r"C:\Program Files"], r"C:\Users", r"Z:\ProgramData"),
+        places(r"C:\WINDOWS", &[r"C:\Program Files"], r"Z:\Users", r"C:\ProgramData"),
+        places(r"C:\WINDOWS", &[r"C:\Evil"], r"C:\Users", r"C:\ProgramData"),
+        places(r"C:\WINDOWS", &[r"C:\Program Files", r"C:\Evil"], r"C:\Users", r"C:\ProgramData"),
+        places(r"C:\WINDOWS", &[], r"C:\Users", r"C:\ProgramData"),
+        good.clone().with_start_menus_for_tests(r"C:\Users\me\Programs", r"C:\Elsewhere\Programs"),
+    ] {
+        assert_eq!(trust::check_places(&bad, &t), Err(trust::NOT_TRUSTED.to_string()));
+    }
+}
+
+#[test]
+fn the_all_users_start_menu_must_be_inside_program_data() {
+    let env = Env::new();
+    let outside = env.p("elsewhere/Programs");
+    let places = env.places.clone().with_start_menus_for_tests(&env.p("users/me/Programs").to_string_lossy(), &outside.to_string_lossy());
+    let lnk = env.file(r"elsewhere\Programs\Old.lnk", b"lnk");
+    assert!(check_item(&env.item(0, &lnk, Why::Uninstall), &places, env.claims.as_ref(), &HashSet::new()).is_err());
+    assert!(!places.in_all_users_start_menu(&crate::paths::canon(&lnk)));
+}
+
+#[test]
+fn this_machines_own_environment_agrees_with_what_hklm_says() {
+    // No false alarm on a normal system, or the admin step could never run.
+    let t = trust::read_trusted().expect("the trusted folders can be read here");
+    assert!(t.windows_dir.len() > 3 && t.program_data.starts_with(&t.system_drive), "{t:?}");
+    let off = trust::mismatches(&t, &|n| std::env::var(n).ok());
+    assert!(off.is_empty(), "{off:?} differ from the environment: {t:?}");
+}
+
+/// Run by the next test in a child process with a poisoned environment; does nothing otherwise.
+#[test]
+fn trust_child_probe() {
+    if std::env::var("SEEK_TRUST_PROBE").as_deref() != Ok("1") {
+        return;
+    }
+    let t = trust::read_trusted().expect("readable");
+    assert_ne!(t.system_drive, "Z:", "SystemDrive came from the environment");
+    assert!(!t.program_data.starts_with("Z:"), "ProgramData came from the environment: {t:?}");
+    assert!(!t.profiles_dir.starts_with("Z:"), "{t:?}");
+    let off = trust::mismatches(&t, &|n| std::env::var(n).ok());
+    assert!(off.contains(&"SystemDrive") && off.contains(&"ProgramData"), "{off:?}");
+    // The whole first step refuses, and leaves the environment overwritten with the trusted values.
+    assert_eq!(trust::establish().unwrap_err(), trust::NOT_TRUSTED);
+    assert_eq!(std::env::var("SystemDrive").unwrap(), t.system_drive);
+    assert_eq!(std::env::var("ProgramData").unwrap(), t.program_data);
+    println!("PROBE-OK");
+}
+
+#[test]
+fn a_child_process_with_a_poisoned_system_drive_and_program_data_is_not_believed() {
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["elevated::tests::trust_child_probe", "--exact", "--nocapture", "--test-threads=1"])
+        .env("SEEK_TRUST_PROBE", "1")
+        .env("SystemDrive", "Z:")
+        .env("ProgramData", r"Z:\Evil")
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success() && text.contains("PROBE-OK"), "{text}");
+}
+
+// ---- R2: an early client is judged by pid, not dropped ------------------------------------------------------
+
+/// The "elevated copy" connects at once, before the window has been told which process it started,
+/// and the window learns that after a pause.
+struct LateStartLauncher(Box<dyn Fn(&str) -> u32 + Send + Sync + 'static>);
+
+impl Launcher for LateStartLauncher {
+    fn launch_and_wait(&self, name: &str, started: &dyn Fn(u32)) -> Result<u32, LaunchError> {
+        std::thread::scope(|s| {
+            let client = s.spawn(|| (self.0)(name));
+            std::thread::sleep(Duration::from_millis(400));
+            started(std::process::id());
+            Ok(client.join().unwrap())
+        })
+    }
+}
+
+#[test]
+fn a_client_that_connects_before_the_pid_is_known_and_is_the_launched_process_is_served() {
+    let env = Arc::new(Env::new());
+    let app = env.folder("pf/App");
+    let items = vec![env.item(0, &app, Why::Leftover)];
+    let e = env.clone();
+    let l = LateStartLauncher(Box::new(move |name| run_main_with(name, &|_| Ok(e.ctx())) as u32));
+    let out = run_elevated(&items, SID, std::process::id(), &l);
+    assert!(is_moved(&out.items[0]), "{out:?}");
+    assert!(!app.exists());
+}
+
+#[test]
+fn a_second_client_waits_for_a_free_instance_instead_of_failing() {
+    let name = pipe::new_name();
+    let server = pipe::Server::create(&name).unwrap();
+    let first = pipe::Client::connect(&name).unwrap(); // takes the only instance
+    let h = server.handle().0 as usize;
+    let freed = std::thread::spawn(move || {
+        use windows::Win32::System::Pipes::{ConnectNamedPipe, DisconnectNamedPipe};
+        std::thread::sleep(Duration::from_millis(500));
+        // The server turns the first client away and listens again.
+        unsafe {
+            let _ = DisconnectNamedPipe(windows::Win32::Foundation::HANDLE(h as *mut _));
+            let _ = ConnectNamedPipe(windows::Win32::Foundation::HANDLE(h as *mut _), None);
+        }
+    });
+    let t = std::time::Instant::now();
+    let second = pipe::Client::connect(&name);
+    assert!(second.is_ok(), "{:?}", second.err());
+    assert!(t.elapsed() >= Duration::from_millis(300), "it should have had to wait");
+    freed.join().unwrap();
+    drop(first);
+}
