@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use windows::core::PWSTR;
 use windows::Win32::Foundation::{CloseHandle, LocalFree, HANDLE, HLOCAL};
 use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
-use windows::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
+use windows::Win32::Security::{GetTokenInformation, TokenUser, PSID, TOKEN_QUERY, TOKEN_USER};
 use windows::Win32::System::Threading::{
     GetCurrentProcess, OpenProcess, OpenProcessToken, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
     PROCESS_QUERY_LIMITED_INFORMATION,
@@ -106,16 +106,20 @@ fn token_user_of_process(process: HANDLE) -> Result<String, String> {
         .map_err(|e| e.to_string())?;
     // SAFETY: the call filled the buffer with a TOKEN_USER whose SID points into the same buffer.
     let sid = unsafe { (*buf.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+    sid_text(sid)
+}
+
+/// A SID as the usual `S-1-5-21-...` text. `sid` must be valid for the call.
+pub fn sid_text(sid: PSID) -> Result<String, String> {
     let mut text = PWSTR::null();
-    // SAFETY: `sid` is valid while `buf` lives; the string is freed with LocalFree below.
+    // SAFETY: the caller's `sid` is valid; the string is freed with LocalFree below.
     unsafe { ConvertSidToStringSidW(sid, &mut text) }.map_err(|e| e.to_string())?;
     // SAFETY: `text` is a valid NUL-terminated string from the call above, freed once here.
-    let s = unsafe {
+    unsafe {
         let s = text.to_string().map_err(|e| e.to_string());
         let _ = LocalFree(Some(HLOCAL(text.0.cast())));
         s
-    }?;
-    Ok(s)
+    }
 }
 
 fn image_path(process: HANDLE) -> Result<PathBuf, String> {

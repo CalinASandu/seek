@@ -44,6 +44,9 @@ pub struct Places {
     scan_roots: Vec<PathBuf>,
     /// The `Programs` folder of the current user's Start Menu, then the all-users one, as written.
     start_menus: Vec<PathBuf>,
+    /// `FOLDERID_CommonPrograms` alone: the all-users Start Menu `Programs` folder. Kept apart
+    /// from the user's `Programs`, which can be moved anywhere (even into ProgramData).
+    common_programs: Option<PathBuf>,
     /// Where Windows says Desktop, Documents, Downloads, Pictures, Music, Videos, Saved Games and
     /// Favorites are, which may not be in the profile (`D:\Documents`, a OneDrive move).
     known_dirs: Vec<String>,
@@ -65,6 +68,11 @@ pub fn trusted_folder_env(name: &str) -> Option<String> {
         "systemdrive" => windows_dir_trusted().map(|w| w.chars().take(2).collect()),
         _ => None,
     }
+}
+
+/// The users folder (`C:\Users`) from Windows.
+pub fn users_folder() -> Option<String> {
+    known_raw(&FOLDERID_UserProfiles)
 }
 
 /// True for the names `trusted_folder_env` answers for.
@@ -142,6 +150,7 @@ impl Places {
             .map(PathBuf::from)
             .collect();
         let start_menus = [&FOLDERID_Programs, &FOLDERID_CommonPrograms].into_iter().filter_map(known_raw).map(PathBuf::from).collect();
+        let common_programs = known_raw(&FOLDERID_CommonPrograms).map(PathBuf::from);
         let known_dirs = [
             &FOLDERID_Desktop,
             &FOLDERID_Documents,
@@ -158,6 +167,7 @@ impl Places {
         let places = Places {
             scan_roots,
             start_menus,
+            common_programs,
             known_dirs,
             windows,
             program_files,
@@ -197,10 +207,17 @@ impl Places {
         self.program_files.iter().cloned().chain(self.start_menus.iter().map(|m| canon(m))).collect()
     }
 
-    /// True if `canon_path` (in `canon` form) is inside a Start Menu `Programs` folder that lives
-    /// in ProgramData: the all-users one (`FOLDERID_CommonPrograms`).
+    /// True if `canon_path` (in `canon` form) is inside the all-users Start Menu `Programs`
+    /// folder, which is `FOLDERID_CommonPrograms` and nothing else.
     pub fn in_all_users_start_menu(&self, canon_path: &str) -> bool {
-        self.start_menus.iter().map(|m| canon(m)).any(|m| is_inside(&m, &self.program_data) && is_inside(canon_path, &m))
+        self.common_programs.as_ref().is_some_and(|m| is_inside(canon_path, &canon(m)))
+    }
+
+    /// Tests only: where the user's and the all-users Start Menu `Programs` folders are.
+    pub fn with_start_menus_for_tests(mut self, user: &str, all_users: &str) -> Places {
+        self.start_menus = vec![PathBuf::from(user), PathBuf::from(all_users)];
+        self.common_programs = Some(PathBuf::from(all_users));
+        self
     }
 
     /// True if `canon_path` (in `canon` form) is Program Files or inside it.
@@ -295,6 +312,7 @@ impl Places {
         .flatten()
         .collect();
         Places {
+            common_programs: menu(program_data, r"Microsoft\Windows\Start Menu\Programs"),
             start_menus,
             known_dirs: Vec::new(),
             scan_roots: program_files.iter().chain(app_data).map(PathBuf::from).collect(),
