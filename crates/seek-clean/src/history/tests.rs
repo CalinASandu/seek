@@ -409,7 +409,8 @@ fn a_taken_original_whose_bin_item_is_gone_counts_as_put_back_and_is_recorded() 
     let mk = |n: u32| {
         let original = dir.path().join(format!("f{n}.txt"));
         std::fs::write(&original, b"back").unwrap();
-        Entry { original_path: original.to_string_lossy().into_owned(), ..moved(n) }
+        // removed after the file was made: what is there is the restored item
+        Entry { original_path: original.to_string_lossy().into_owned(), time_ms: now_ms() + 3_600_000, ..moved(n) }
     };
     h.append(&[mk(1), mk(2)]).unwrap();
     let bin = FakeBin::new(Ok(())).listing(Ok(false));
@@ -421,6 +422,22 @@ fn a_taken_original_whose_bin_item_is_gone_counts_as_put_back_and_is_recorded() 
     assert_eq!(bin.calls(), 0, "no verb");
     assert_eq!(*bin.listings.lock().unwrap(), 1, "the bin is listed once for the batch");
     assert!(h.list().iter().all(|e| e.put_back_ms.is_some()));
+}
+
+#[test]
+fn a_taken_original_made_after_the_removal_is_something_new_even_if_the_bin_item_is_gone() {
+    let dir = tempfile::tempdir().unwrap();
+    let original = dir.path().join("report.txt");
+    std::fs::write(&original, b"new").unwrap();
+    let h = History::open(file_in(dir.path()));
+    // the removal was recorded long before this file was created
+    h.append(&[Entry { original_path: original.to_string_lossy().into_owned(), time_ms: 1_000, ..moved(1) }]).unwrap();
+    let bin = FakeBin::new(Ok(())).listing(Ok(false));
+    let out = put_back_ids(&h, &bin, &["e1".into()]);
+    assert!(!out[0].restored);
+    assert_eq!(out[0].reason, Some(format!("Something new is at {}. Move it first.", original.display())));
+    assert!(h.list()[0].put_back_ms.is_none());
+    assert_eq!(bin.calls(), 0);
 }
 
 #[test]

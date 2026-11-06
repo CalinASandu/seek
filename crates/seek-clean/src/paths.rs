@@ -25,7 +25,7 @@ pub fn canon(p: &Path) -> String {
 }
 
 /// True when the path, as written, has a spelling `canon` reads differently from Win32: a `:` anywhere
-/// but the drive letter (a stream name, `::$INDEX_ALLOCATION`) or a `.` / `..` segment. A leading
+/// but the drive letter (a stream name, `::$INDEX_ALLOCATION`) or a segment that ends in `.` or a space (`.`, `..`, `...`, `foo.`, `foo `: Windows trims these, so the path judged is not the one moved). A leading
 /// `\\?\` is ignored here (it is judged elsewhere). Callers that act on the raw spelling refuse these.
 pub fn has_odd_spelling(p: &Path) -> bool {
     let raw = p.to_string_lossy();
@@ -34,7 +34,7 @@ pub fn has_odd_spelling(p: &Path) -> bool {
         [d, b':', ..] if d.is_ascii_alphabetic() => &rest[2..],
         _ => rest,
     };
-    after_drive.contains(':') || after_drive.split(['\\', '/']).any(|seg| seg == "." || seg == "..")
+    after_drive.contains(':') || after_drive.split(['\\', '/']).any(|seg| seg.ends_with('.') || seg.ends_with(' '))
 }
 
 /// Like `canon` but never touches the disk: 8.3 short names stay as written. For callers that

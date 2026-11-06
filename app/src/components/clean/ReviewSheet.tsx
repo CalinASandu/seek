@@ -213,7 +213,7 @@ export function ReviewSheet({ request, picked, contents, onProtect, onClose }: P
     let live = true;
     const bins = new Set(result.items.flatMap((i) => (i.outcome.kind === "moved" ? [i.outcome.binPath] : [])));
     api.cleanHistory().then(
-      (h) => live && setRecorded(h.filter((e) => e.putBackMs === null && e.binPath !== null && bins.has(e.binPath)).length),
+      (h) => live && setRecorded(h.filter((e) => e.putBackMs === null && !e.needsAdmin && e.binPath !== null && bins.has(e.binPath)).length),
       () => live && setRecorded(0),
     );
     return () => {

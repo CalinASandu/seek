@@ -136,6 +136,23 @@ describe("Recently removed", () => {
     expect(within(done).queryByRole("button", { name: "Open Recycle Bin" })).toBeNull();
   });
 
+  it("offers the Recycle Bin, not Put back, when every recorded item was moved by the admin step", async () => {
+    const said = "Moved to the Recycle Bin, but they weren't recorded. Access is denied. Put them back from the Recycle Bin if needed.";
+    const b = base();
+    let last: Awaited<ReturnType<SeekApi["cleanCommit"]>> | null = null;
+    const api: SeekApi = {
+      ...b,
+      cleanCommit: async (token, ids) => (last = { ...(await b.cleanCommit(token, ids)), historyError: said }),
+      cleanHistory: async () =>
+        (last?.items ?? []).flatMap((i) =>
+          i.outcome.kind === "moved" ? [entry({ id: "adm", originalPath: i.path, binPath: i.outcome.binPath, needsAdmin: true })] : [],
+        ),
+    };
+    const { done } = await reviewOne(api);
+    expect(await within(done).findByRole("button", { name: "Open Recycle Bin" })).toBeInTheDocument();
+    expect(within(done).queryByRole("button", { name: "Put back" })).toBeNull();
+  });
+
   it("keeps Put back for the items that were recorded when only the admin items failed to be, and still shows the error", async () => {
     const said = "Moved to the Recycle Bin, but they weren't recorded. Access is denied. Put them back from the Recycle Bin if needed.";
     const b = base();

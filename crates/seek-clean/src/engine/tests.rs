@@ -1158,6 +1158,10 @@ fn odd_spellings(env: &Env) -> Vec<(PathBuf, bool)> {
         (s(&file, "::$DATA"), false),
         (env.p("left").join(".").join("foo"), true),
         (env.p("left").join("foo").join("..").join("foo"), true),
+        // Windows trims trailing dots and spaces, so these name `foo` too
+        (s(&folder, "."), true),
+        (s(&folder, " "), true),
+        (s(&folder, "..."), true),
     ]
 }
 
