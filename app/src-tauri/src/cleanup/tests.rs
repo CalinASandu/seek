@@ -114,6 +114,8 @@ fn state_with(core: Arc<Core>) -> CleanState {
         uninstalls: Uninstalls::default(),
         shared: Arc::new(Shared::default()),
         emit: Mutex::new(None),
+        busy: Mutex::new(Default::default()),
+        idle: Default::default(),
     }
 }
 
@@ -1061,4 +1063,27 @@ fn real_leftovers_list_with_index() {
 fn the_real_core_keeps_its_claims_so_a_listing_can_refresh_them() {
     let places = Places::from_system().unwrap();
     assert!(Core::real(places).claims.is_some());
+}
+
+#[test]
+fn quit_waits_for_a_removal_in_flight_then_refuses_new_ones() {
+    let state = Arc::new(state_with(idle_core()));
+    let flying = state.begin().unwrap();
+    // Not finished in time: Quit gives up waiting (and says so), and from then on nothing new starts.
+    assert!(!state.finish_in_flight(Duration::from_millis(50)));
+    assert!(state.begin().is_err());
+    // The removal ends while Quit waits: it returns as soon as that happens, long before the limit.
+    let waiter = state.clone();
+    let t = std::thread::spawn(move || {
+        let started = Instant::now();
+        let idle = waiter.finish_in_flight(Duration::from_secs(30));
+        (idle, started.elapsed())
+    });
+    std::thread::sleep(Duration::from_millis(100));
+    drop(flying);
+    let (idle, took) = t.join().unwrap();
+    assert!(idle);
+    assert!(took < Duration::from_secs(10), "{took:?}");
+    // Nothing in flight at all: Quit does not wait.
+    assert!(state_with(idle_core()).finish_in_flight(Duration::from_secs(30)));
 }

@@ -1143,3 +1143,4 @@ fn a_stale_request_outside_seeks_data_folder_is_locked() {
 }
 
 mod uninstall;
+mod history;

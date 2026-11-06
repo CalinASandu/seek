@@ -272,9 +272,11 @@ export interface CommitResult {
   items: ItemOutcome[];
   movedBytes: number;
   stoppedEarly: string | null;
+  /** Why Recently removed couldn't record this commit (the items were moved all the same). */
+  historyError: string | null;
 }
 
-/** One past removal (Task 16 owns the Rust side; this is the shape the UI needs). */
+/** One past removal, or one item that was left in place. */
 export interface HistoryEntry {
   id: string;
   timeMs: number;
@@ -285,6 +287,8 @@ export interface HistoryEntry {
   binPath: string | null;
   /** Why an item was not moved; null when it was. */
   leftReason: string | null;
+  /** When it was put back (unix epoch ms); null if it hasn't been. */
+  putBackMs: number | null;
 }
 export interface PutBackResult {
   id: string;

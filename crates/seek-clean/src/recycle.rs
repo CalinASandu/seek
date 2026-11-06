@@ -401,36 +401,82 @@ fn bin_folder() -> Result<IShellItem, String> {
         .map_err(|e| format!("cannot open the Recycle Bin folder: {e}"))
 }
 
+/// The bin item whose file path is `bin_path`, if the bin still lists it. Must run on an STA thread.
+///
+/// # Safety
+/// COM objects returned stay on the calling thread.
+unsafe fn find_in_bin(bin_path: &str) -> Result<Option<IShellItem>, String> {
+    let folder = bin_folder()?;
+    let en: IEnumShellItems = folder
+        .BindToHandler(None, &BHID_EnumItems)
+        .map_err(|e| format!("cannot list the Recycle Bin: {e}"))?;
+    loop {
+        let mut batch: [Option<IShellItem>; 1] = [None];
+        let mut fetched = 0u32;
+        let _ = en.Next(&mut batch, Some(&mut fetched));
+        if fetched == 0 {
+            return Ok(None);
+        }
+        if let Some(it) = batch[0].take() {
+            let p = item_path(&it, SIGDN_FILESYSPATH);
+            if p.as_deref().is_some_and(|p| p.eq_ignore_ascii_case(bin_path)) {
+                return Ok(Some(it));
+            }
+        }
+    }
+}
+
+/// True when the Recycle Bin still lists an item whose file path is `bin_path`. A bin that can't
+/// be listed counts as "no".
+pub fn in_bin(bin_path: &str) -> bool {
+    let bin_path = bin_path.to_string();
+    // SAFETY: COM objects stay on the STA thread and drop before CoUninitialize.
+    on_sta(move || unsafe { find_in_bin(&bin_path).map(|i| i.is_some()) }).unwrap_or(false)
+}
+
+/// `System.Recycle.DateDeleted` (fmtid 9B174B33-..., pid 3) of a bin item, in unix epoch ms.
+fn deleted_ms(item2: &IShellItem2) -> Option<i64> {
+    let key = PROPERTYKEY {
+        fmtid: windows::core::GUID::from_u128(0x9B174B33_40FF_11D2_A27E_00C04FC30871),
+        pid: 3,
+    };
+    // SAFETY: plain COM call on a live item.
+    let ft = unsafe { item2.GetFileTime(&key) }.ok()?;
+    let ticks = (u64::from(ft.dwHighDateTime) << 32) | u64::from(ft.dwLowDateTime);
+    // FILETIME counts 100 ns from 1601; unix time from 1970 (116_444_736_000_000_000 ticks later).
+    (ticks as i64).checked_sub(116_444_736_000_000_000).map(|t| t / 10_000)
+}
+
+/// How long before the removal was recorded its deletion may have happened (a big batch takes a
+/// while), and how far after (clock jitter).
+pub const DELETED_BEFORE_MS: i64 = 30 * 60 * 1000;
+pub const DELETED_AFTER_MS: i64 = 2 * 60 * 1000;
+
+/// Whether a deletion date fits a removal recorded at `near_ms`.
+pub fn deletion_fits(deleted_ms: i64, near_ms: i64) -> bool {
+    deleted_ms >= near_ms - DELETED_BEFORE_MS && deleted_ms <= near_ms + DELETED_AFTER_MS
+}
+
 /// Restores the item whose Recycle Bin file path is `bin_path` through the bin's own `undelete`
 /// verb, then checks `original` exists again. Fails (without retrying) if the item is not in the
-/// bin or Windows refuses.
+/// bin or Windows refuses. The item's deletion date is not checked; see `restore_near`.
 pub fn restore(bin_path: &str, original: &Path) -> Result<(), String> {
+    restore_checked(bin_path, original, None)
+}
+
+/// `restore`, and the bin item must also have been deleted within [`deletion_fits`] of `near_ms`
+/// (the time the removal was recorded). An item whose date can't be read is refused.
+pub fn restore_near(bin_path: &str, original: &Path, near_ms: i64) -> Result<(), String> {
+    restore_checked(bin_path, original, Some(near_ms))
+}
+
+fn restore_checked(bin_path: &str, original: &Path, near_ms: Option<i64>) -> Result<(), String> {
     let bin_path = bin_path.to_string();
     let original = original.to_path_buf();
     on_sta(move || {
         // SAFETY: COM objects stay on this thread and drop before CoUninitialize.
         unsafe {
-            let folder = bin_folder()?;
-            let en: IEnumShellItems = folder
-                .BindToHandler(None, &BHID_EnumItems)
-                .map_err(|e| format!("cannot list the Recycle Bin: {e}"))?;
-            let mut found: Option<IShellItem> = None;
-            loop {
-                let mut batch: [Option<IShellItem>; 1] = [None];
-                let mut fetched = 0u32;
-                let _ = en.Next(&mut batch, Some(&mut fetched));
-                if fetched == 0 {
-                    break;
-                }
-                if let Some(it) = batch[0].take() {
-                    let p = item_path(&it, SIGDN_FILESYSPATH);
-                    if p.as_deref().is_some_and(|p| p.eq_ignore_ascii_case(&bin_path)) {
-                        found = Some(it);
-                        break;
-                    }
-                }
-            }
-            let item = found.ok_or_else(|| "No longer in the Recycle Bin".to_string())?;
+            let item = find_in_bin(&bin_path)?.ok_or_else(|| "No longer in the Recycle Bin".to_string())?;
             // Match on the full original path too, so a same-named file from another folder can
             // never be restored by mistake.
             let item2 = item
@@ -451,6 +497,15 @@ pub fn restore(bin_path: &str, original: &Path) -> Result<(), String> {
                     "bin item came from {dir} as {display}, which is not {}",
                     original.display()
                 ));
+            }
+            // The deletion date too: a same-path item from an older removal is another removal.
+            if let Some(near) = near_ms {
+                let when = deleted_ms(&item2).ok_or_else(|| {
+                    "Windows doesn't say when the item in the Recycle Bin was deleted, so it wasn't put back.".to_string()
+                })?;
+                if !deletion_fits(when, near) {
+                    return Err("The item in the Recycle Bin is from a different removal.".to_string());
+                }
             }
             let menu: IContextMenu = item
                 .BindToHandler(None, &BHID_SFUIObject)

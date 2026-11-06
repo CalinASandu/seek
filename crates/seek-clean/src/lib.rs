@@ -10,6 +10,7 @@ pub mod dupes;
 pub mod elevated;
 pub mod engine;
 pub mod facts;
+pub mod history;
 pub mod leftovers;
 pub mod model;
 pub mod paths;
