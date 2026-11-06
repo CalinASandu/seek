@@ -398,32 +398,41 @@ fn matches_original(deleted_from: &str, display_name: &str, bin_path: &str, orig
 fn bin_folder() -> Result<IShellItem, String> {
     // SAFETY: plain COM call.
     unsafe { SHGetKnownFolderItem(&FOLDERID_RecycleBinFolder, KF_FLAG_DEFAULT, None) }
-        .map_err(|e| format!("cannot open the Recycle Bin folder: {e}"))
+        .map_err(|e| format!("Couldn't read the Recycle Bin: {e}"))
 }
 
-/// The bin item whose file path is `bin_path`, if the bin still lists it. Must run on an STA thread.
+/// Every item the Recycle Bin lists that has a file path, in one pass. Must run on an STA thread.
 ///
 /// # Safety
 /// COM objects returned stay on the calling thread.
-unsafe fn find_in_bin(bin_path: &str) -> Result<Option<IShellItem>, String> {
+unsafe fn list_bin() -> Result<Vec<(String, IShellItem)>, String> {
     let folder = bin_folder()?;
     let en: IEnumShellItems = folder
         .BindToHandler(None, &BHID_EnumItems)
-        .map_err(|e| format!("cannot list the Recycle Bin: {e}"))?;
+        .map_err(|e| format!("Couldn't read the Recycle Bin: {e}"))?;
+    let mut all = Vec::new();
     loop {
         let mut batch: [Option<IShellItem>; 1] = [None];
         let mut fetched = 0u32;
         let _ = en.Next(&mut batch, Some(&mut fetched));
         if fetched == 0 {
-            return Ok(None);
+            return Ok(all);
         }
         if let Some(it) = batch[0].take() {
-            let p = item_path(&it, SIGDN_FILESYSPATH);
-            if p.as_deref().is_some_and(|p| p.eq_ignore_ascii_case(bin_path)) {
-                return Ok(Some(it));
+            if let Some(p) = item_path(&it, SIGDN_FILESYSPATH) {
+                all.push((p, it));
             }
         }
     }
+}
+
+/// The bin item whose file path is `bin_path`, if the bin still lists it. A bin that can't be
+/// listed is an error, never "not there". Must run on an STA thread.
+///
+/// # Safety
+/// COM objects returned stay on the calling thread.
+unsafe fn find_in_bin(bin_path: &str) -> Result<Option<IShellItem>, String> {
+    Ok(list_bin()?.into_iter().find(|(p, _)| p.eq_ignore_ascii_case(bin_path)).map(|(_, it)| it))
 }
 
 /// True when the Recycle Bin still lists an item whose file path is `bin_path`. A bin that can't
@@ -457,88 +466,231 @@ pub fn deletion_fits(deleted_ms: i64, near_ms: i64) -> bool {
     deleted_ms >= near_ms - DELETED_BEFORE_MS && deleted_ms <= near_ms + DELETED_AFTER_MS
 }
 
+/// What Seek says when the original path is taken. Restoring over it could lose it.
+pub fn something_new_at(original: &Path) -> String {
+    format!("Something new is at {}. Move it first.", original.display())
+}
+
+const NOT_IN_BIN: &str = "No longer in the Recycle Bin.";
+
+/// How long a put back waits for the next item's answer before it gives up on that item and the
+/// ones after it.
+pub const PUT_BACK_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+pub const PUT_BACK_STUCK: &str = "Windows didn't finish putting it back. Check the Recycle Bin and the original folder.";
+
+/// Runs `work` on a thread of its own, which reports each of the `n` answers through the callback
+/// as it has it, and collects them. Waits at most `deadline` for the next answer: when that passes,
+/// the item in progress and every item not yet answered get [`PUT_BACK_STUCK`] and this returns.
+///
+/// The stuck thread is detached, never joined: the `undelete` verb can block on a name conflict
+/// that appears between Seek's check and the verb (a Replace/Skip prompt that may not be seen), and
+/// a put back must never hang the command because of that.
+fn bounded<F>(n: usize, deadline: std::time::Duration, work: F) -> Vec<Result<(), String>>
+where
+    F: FnOnce(&mut dyn FnMut(usize, Result<(), String>)) + Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::channel::<(usize, Result<(), String>)>();
+    std::thread::spawn(move || work(&mut |i, r| {
+        let _ = tx.send((i, r));
+    }));
+    let mut out: Vec<Option<Result<(), String>>> = vec![None; n];
+    let mut got = 0;
+    let mut ended = PUT_BACK_STUCK;
+    while got < n {
+        match rx.recv_timeout(deadline) {
+            Ok((i, r)) => {
+                if i < n && out[i].is_none() {
+                    out[i] = Some(r);
+                    got += 1;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                ended = "Windows stopped while putting it back. Check the Recycle Bin and the original folder.";
+                break;
+            }
+        }
+    }
+    out.into_iter().map(|r| r.unwrap_or_else(|| Err(ended.to_string()))).collect()
+}
+
 /// Restores the item whose Recycle Bin file path is `bin_path` through the bin's own `undelete`
 /// verb, then checks `original` exists again. Fails (without retrying) if the item is not in the
 /// bin or Windows refuses. The item's deletion date is not checked; see `restore_near`.
 pub fn restore(bin_path: &str, original: &Path) -> Result<(), String> {
-    restore_checked(bin_path, original, None)
+    restore_many_checked(&[(bin_path.to_string(), original.to_path_buf(), None)], 0, PUT_BACK_DEADLINE).remove(0)
 }
 
 /// `restore`, and the bin item must also have been deleted within [`deletion_fits`] of `near_ms`
-/// (the time the removal was recorded). An item whose date can't be read is refused.
-pub fn restore_near(bin_path: &str, original: &Path, near_ms: i64) -> Result<(), String> {
-    restore_checked(bin_path, original, Some(near_ms))
+/// (the time the removal was recorded). An item whose date can't be read is refused. `owner` is
+/// the window any prompt of Windows opens over (0 for none).
+pub fn restore_near(bin_path: &str, original: &Path, near_ms: i64, owner: isize) -> Result<(), String> {
+    restore_many_checked(&[(bin_path.to_string(), original.to_path_buf(), Some(near_ms))], owner, PUT_BACK_DEADLINE).remove(0)
 }
 
-fn restore_checked(bin_path: &str, original: &Path, near_ms: Option<i64>) -> Result<(), String> {
-    let bin_path = bin_path.to_string();
-    let original = original.to_path_buf();
-    on_sta(move || {
+/// `restore_near` for a batch: the bin is listed once, then each item is restored from that
+/// listing. One answer per job, in order: (bin path, original path, time the removal was recorded).
+pub fn restore_many(jobs: &[(String, PathBuf, i64)], owner: isize) -> Vec<Result<(), String>> {
+    let jobs: Vec<_> = jobs.iter().map(|(b, o, t)| (b.clone(), o.clone(), Some(*t))).collect();
+    restore_many_checked(&jobs, owner, PUT_BACK_DEADLINE)
+}
+
+fn restore_many_checked(jobs: &[(String, PathBuf, Option<i64>)], owner: isize, deadline: std::time::Duration) -> Vec<Result<(), String>> {
+    let jobs = jobs.to_vec();
+    bounded(jobs.len(), deadline, move |answer| {
         // SAFETY: COM objects stay on this thread and drop before CoUninitialize.
-        unsafe {
-            let item = find_in_bin(&bin_path)?.ok_or_else(|| "No longer in the Recycle Bin".to_string())?;
-            // Match on the full original path too, so a same-named file from another folder can
-            // never be restored by mistake.
-            let item2 = item
-                .cast::<IShellItem2>()
-                .map_err(|e| format!("cannot read the bin item's properties: {e}"))?;
-            let key = PROPERTYKEY {
-                fmtid: windows::core::GUID::from_u128(0x9B174B33_40FF_11D2_A27E_00C04FC30871),
-                pid: 2, // System.Recycle.DeletedFrom
-            };
-            let dir = item2
-                .GetString(&key)
-                .ok()
-                .and_then(pwstr_to_string)
-                .ok_or_else(|| "the bin item does not say where it was deleted from".to_string())?;
-            let display = item_path(&item, SIGDN_NORMALDISPLAY).unwrap_or_default();
-            if !matches_original(&dir, &display, &bin_path, &original) {
-                return Err(format!(
-                    "bin item came from {dir} as {display}, which is not {}",
-                    original.display()
-                ));
+        let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+        if hr.is_err() {
+            for i in 0..jobs.len() {
+                answer(i, Err(format!("CoInitializeEx failed: {hr:?}")));
             }
-            // The deletion date too: a same-path item from an older removal is another removal.
-            if let Some(near) = near_ms {
-                let when = deleted_ms(&item2).ok_or_else(|| {
-                    "Windows doesn't say when the item in the Recycle Bin was deleted, so it wasn't put back.".to_string()
-                })?;
-                if !deletion_fits(when, near) {
-                    return Err("The item in the Recycle Bin is from a different removal.".to_string());
+            return;
+        }
+        // SAFETY: as above.
+        match unsafe { list_bin() } {
+            Err(e) => {
+                for i in 0..jobs.len() {
+                    answer(i, Err(e.clone()));
                 }
             }
-            let menu: IContextMenu = item
-                .BindToHandler(None, &BHID_SFUIObject)
-                .map_err(|e| format!("cannot get the item's menu: {e}"))?;
-            let hmenu = CreatePopupMenu().map_err(|e| format!("cannot create a menu: {e}"))?;
-            let q = menu.QueryContextMenu(hmenu, 0, 1, 0x7FFF, 0);
-            let invoked = if q.is_err() {
-                Err(format!("QueryContextMenu failed: {q:?}"))
-            } else {
-                let info = CMINVOKECOMMANDINFO {
-                    cbSize: std::mem::size_of::<CMINVOKECOMMANDINFO>() as u32,
-                    fMask: CMIC_MASK_FLAG_NO_UI,
-                    hwnd: HWND::default(),
-                    lpVerb: PCSTR(c"undelete".as_ptr().cast()),
-                    ..Default::default()
-                };
-                menu.InvokeCommand(&info).map_err(|e| format!("undelete verb failed: {e}"))
-            };
-            let _ = DestroyMenu(hmenu);
-            invoked?;
+            Ok(items) => {
+                let by_path: std::collections::HashMap<String, &IShellItem> =
+                    items.iter().map(|(p, it)| (p.to_ascii_lowercase(), it)).collect();
+                for (i, (bin_path, original, near)) in jobs.iter().enumerate() {
+                    answer(
+                        i,
+                        match by_path.get(&bin_path.to_ascii_lowercase()) {
+                            None => Err(NOT_IN_BIN.to_string()),
+                            // SAFETY: the item is live on this thread.
+                            Some(item) => unsafe { restore_item(item, bin_path, original, *near, owner) },
+                        },
+                    );
+                }
+            }
         }
-        if original.exists() {
-            Ok(())
-        } else {
-            Err(format!("restore ran but {} did not come back", original.display()))
+        // SAFETY: balanced with CoInitializeEx above.
+        unsafe { CoUninitialize() };
+    })
+}
+
+/// Checks that `item` is the removal of `original` (same folder and name, and with `near_ms` the
+/// same time), then restores it.
+///
+/// # Safety
+/// `item` must be live on the calling STA thread.
+unsafe fn restore_item(item: &IShellItem, bin_path: &str, original: &Path, near_ms: Option<i64>, owner: isize) -> Result<(), String> {
+    // Match on the full original path too, so a same-named file from another folder can
+    // never be restored by mistake.
+    let item2 = item
+        .cast::<IShellItem2>()
+        .map_err(|e| format!("cannot read the bin item's properties: {e}"))?;
+    let key = PROPERTYKEY {
+        fmtid: windows::core::GUID::from_u128(0x9B174B33_40FF_11D2_A27E_00C04FC30871),
+        pid: 2, // System.Recycle.DeletedFrom
+    };
+    let dir = item2
+        .GetString(&key)
+        .ok()
+        .and_then(pwstr_to_string)
+        .ok_or_else(|| "the bin item does not say where it was deleted from".to_string())?;
+    let display = item_path(item, SIGDN_NORMALDISPLAY).unwrap_or_default();
+    if !matches_original(&dir, &display, bin_path, original) {
+        return Err(format!(
+            "bin item came from {dir} as {display}, which is not {}",
+            original.display()
+        ));
+    }
+    // The deletion date too: a same-path item from an older removal is another removal.
+    if let Some(near) = near_ms {
+        let when = deleted_ms(&item2).ok_or_else(|| {
+            "Windows doesn't say when the item in the Recycle Bin was deleted, so it wasn't put back.".to_string()
+        })?;
+        if !deletion_fits(when, near) {
+            return Err("The item in the Recycle Bin is from a different removal.".to_string());
         }
+    }
+    invoke_undelete(item, Some(original), owner)?;
+    if original.exists() {
+        Ok(())
+    } else {
+        Err(format!("restore ran but {} did not come back", original.display()))
+    }
+}
+
+/// Runs the bin item's `undelete` verb. With `must_be_free`, the path is looked at once more
+/// right before the verb runs, and anything there stops it.
+///
+/// # Safety
+/// `item` must be live on the calling STA thread.
+unsafe fn invoke_undelete(item: &IShellItem, must_be_free: Option<&Path>, owner: isize) -> Result<(), String> {
+    let menu: IContextMenu = item
+        .BindToHandler(None, &BHID_SFUIObject)
+        .map_err(|e| format!("cannot get the item's menu: {e}"))?;
+    let hmenu = CreatePopupMenu().map_err(|e| format!("cannot create a menu: {e}"))?;
+    let q = menu.QueryContextMenu(hmenu, 0, 1, 0x7FFF, 0);
+    let invoked = if q.is_err() {
+        Err(format!("QueryContextMenu failed: {q:?}"))
+    } else if let Some(original) = must_be_free.filter(|o| std::fs::symlink_metadata(o).is_ok()) {
+        Err(something_new_at(original))
+    } else {
+        let info = CMINVOKECOMMANDINFO {
+            cbSize: std::mem::size_of::<CMINVOKECOMMANDINFO>() as u32,
+            fMask: CMIC_MASK_FLAG_NO_UI,
+            // Owned by Seek's window, so a prompt of Windows opens over it instead of nowhere.
+            hwnd: HWND(owner as *mut core::ffi::c_void),
+            lpVerb: PCSTR(c"undelete".as_ptr().cast()),
+            ..Default::default()
+        };
+        menu.InvokeCommand(&info).map_err(|e| format!("undelete verb failed: {e}"))
+    };
+    let _ = DestroyMenu(hmenu);
+    invoked
+}
+
+/// For the real spike test only: runs `undelete` on the bin item with no check of any kind, to
+/// see what Windows does when the original path is taken.
+#[cfg(feature = "spike")]
+pub fn undelete_unchecked(bin_path: &str) -> Result<(), String> {
+    let bin_path = bin_path.to_string();
+    // SAFETY: COM objects stay on the STA thread and drop before CoUninitialize.
+    on_sta(move || unsafe {
+        let item = find_in_bin(&bin_path)?.ok_or_else(|| NOT_IN_BIN.to_string())?;
+        invoke_undelete(&item, None, 0)
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{failure_text, is_plain_absolute, matches_original, recycle_in_order, recycle_one};
+    use super::{bounded, failure_text, is_plain_absolute, matches_original, recycle_in_order, recycle_one, PUT_BACK_STUCK};
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn a_put_back_that_blocks_returns_within_the_deadline_and_says_so_for_the_rest() {
+        let started = std::time::Instant::now();
+        let out = bounded(4, std::time::Duration::from_millis(300), |answer| {
+            answer(0, Ok(()));
+            answer(1, Err("No longer in the Recycle Bin.".into()));
+            // Item 2 blocks (a verb waiting on a prompt); item 3 is never started.
+            std::thread::sleep(std::time::Duration::from_secs(20));
+            answer(2, Ok(()));
+        });
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
+        assert_eq!(out[0], Ok(()));
+        assert_eq!(out[1], Err("No longer in the Recycle Bin.".to_string()));
+        assert_eq!(out[2], Err(PUT_BACK_STUCK.to_string()));
+        assert_eq!(out[3], Err(PUT_BACK_STUCK.to_string()));
+    }
+
+    #[test]
+    fn a_put_back_that_finishes_gets_every_answer_in_order() {
+        let out = bounded(3, std::time::Duration::from_secs(5), |answer| {
+            for i in 0..3 {
+                answer(i, if i == 1 { Err("x".into()) } else { Ok(()) });
+            }
+        });
+        assert_eq!(out, vec![Ok(()), Err("x".to_string()), Ok(())]);
+    }
 
     #[test]
     fn recycle_one_refuses_odd_paths_before_resolving_them() {

@@ -702,7 +702,7 @@ export function createMockClean(opts: MockCleanOptions): CleanApi {
         const e = history.find((h) => h.id === id);
         if (!e || e.binPath === null) return { id, restored: false, reason: "This item was not moved, so there is nothing to put back." };
         if (e.putBackMs !== null) return { id, restored: false, reason: "Already put back." };
-        if (e.id === "h-seed-5") return { id, restored: false, reason: "No longer in the Recycle Bin" };
+        if (e.id === "h-seed-5") return { id, restored: false, reason: "No longer in the Recycle Bin." };
         history = history.map((h) => (h.id === id ? { ...h, putBackMs: Date.now() } : h));
         return { id, restored: true, reason: null };
       });

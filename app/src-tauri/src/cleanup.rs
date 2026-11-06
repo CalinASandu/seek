@@ -1261,7 +1261,9 @@ pub async fn clean_put_back(clean: Clean<'_>, entry_ids: Vec<String>) -> Result<
     let state: Arc<CleanState> = (*clean).clone();
     tauri::async_runtime::spawn_blocking(move || {
         let _flying = state.begin()?;
-        Ok(history::put_back_ids(&History::open_default(), &ShellBin, &entry_ids))
+        // Windows' own prompt, if one ever shows, opens over Seek's window.
+        let bin = ShellBin { owner: MAIN_HWND.load(Ordering::Relaxed) };
+        Ok(history::put_back_ids(&History::open_default(), &bin, &entry_ids))
     })
     .await
     .map_err(|e| format!("Putting back stopped unexpectedly: {e}"))?

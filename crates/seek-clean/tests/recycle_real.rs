@@ -71,7 +71,7 @@ fn real_recycle_reports_a_location_and_restores() {
 #[test]
 #[ignore]
 fn real_put_back_restores_to_its_folder() {
-    use seek_clean::history::{now_ms, put_back, BinRestore, Entry, ShellBin};
+    use seek_clean::history::{now_ms, put_back, Entry, ShellBin};
     use seek_clean::model::Why;
 
     let dir = fixed_temp_dir();
@@ -82,7 +82,7 @@ fn real_put_back_restores_to_its_folder() {
     let report = recycle_one(&file).expect("recycle_one");
     let bin = report.bin_location().expect("sink gave no new location").to_string();
     assert!(!file.exists());
-    assert!(ShellBin.in_bin(&bin), "the bin does not list {bin}");
+    assert!(seek_clean::recycle::in_bin(&bin), "the bin does not list {bin}");
 
     let entry = Entry {
         id: "real-test".into(),
@@ -94,7 +94,7 @@ fn real_put_back_restores_to_its_folder() {
         left_reason: None,
         put_back_ms: None,
     };
-    let result = put_back(&entry, &ShellBin);
+    let result = put_back(&entry, &ShellBin { owner: 0 });
     assert!(
         result.restored,
         "PUT BACK FAILED, the test file is still in the Recycle Bin and must be restored or \
@@ -103,7 +103,64 @@ fn real_put_back_restores_to_its_folder() {
         result.reason
     );
     assert_eq!(std::fs::read(&file).unwrap(), body, "restored contents differ");
-    assert!(!ShellBin.in_bin(&bin), "still listed in the bin after the restore");
+    assert!(!seek_clean::recycle::in_bin(&bin), "still listed in the bin after the restore");
+}
+
+/// Spike: what does the bin's raw `undelete` verb do when a different file already sits at the
+/// original path? Bypasses Seek's own existence check on purpose, to record what Windows does.
+/// Needs `--features spike`. Only temp files this test made are involved.
+#[cfg(feature = "spike")]
+#[test]
+#[ignore]
+fn real_undelete_with_a_name_conflict() {
+    use seek_clean::recycle::undelete_unchecked;
+
+    let dir = fixed_temp_dir();
+    let a: PathBuf = dir.path().join(format!("seek-conflict-{}.txt", std::process::id()));
+    std::fs::write(&a, b"ORIGINAL").unwrap();
+    let report = recycle_one(&a).expect("recycle_one");
+    let bin = report.bin_location().expect("sink gave no new location").to_string();
+    assert!(!a.exists());
+    std::fs::write(&a, b"NEWER-FILE").unwrap();
+
+    // The verb may wait for a prompt that nobody sees: give it 20 seconds.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let bin_for_verb = bin.clone();
+    std::thread::spawn(move || {
+        let _ = tx.send(undelete_unchecked(&bin_for_verb));
+    });
+    let Ok(verb) = rx.recv_timeout(std::time::Duration::from_secs(20)) else {
+        println!("CONFLICT RESULT: HANGS (no answer in 20 s, even with CMIC_MASK_FLAG_NO_UI; the item is still in the bin and the verb is blocked)");
+        println!("CONFLICT: clean up by hand: temp file {} (newer) and the bin item {bin}", a.display());
+        std::mem::forget(dir);
+        return;
+    };
+    println!("CONFLICT: undelete verb returned {verb:?}");
+    let mut seen = Vec::new();
+    for e in std::fs::read_dir(dir.path()).unwrap() {
+        let e = e.unwrap();
+        let body = String::from_utf8_lossy(&std::fs::read(e.path()).unwrap_or_default()).to_string();
+        println!("CONFLICT: in the folder afterwards: {} = {body:?}", e.file_name().to_string_lossy());
+        seen.push((e.file_name().to_string_lossy().to_string(), body));
+    }
+    let still_in_bin = seek_clean::recycle::in_bin(&bin);
+    println!("CONFLICT: item still in the bin: {still_in_bin}");
+    let outcome = match (&verb, still_in_bin, std::fs::read(&a).ok().as_deref()) {
+        (Ok(()), false, Some(b"ORIGINAL")) => "OVERWROTE the newer file with the restored one",
+        (Ok(()), false, Some(b"NEWER-FILE")) => "RENAMED (restored copy went under another name; the newer file is untouched)",
+        (Ok(()), true, _) => "NO-OP (verb reported success, item still in the bin)",
+        (Err(_), true, _) => "REFUSED (verb failed, item still in the bin, newer file untouched)",
+        _ => "OTHER, see lines above",
+    };
+    println!("CONFLICT RESULT: {outcome}");
+
+    // Put things right: remove this test's own newer file, then bring back what is still in the bin.
+    let _ = std::fs::remove_file(&a);
+    if still_in_bin {
+        if let Err(e) = restore(&bin, &a) {
+            panic!("the test file is still in the Recycle Bin and must be removed by hand: {bin} ({e})");
+        }
+    }
 }
 
 /// MaxCapacity in MB for the volume holding `root`, from the user's bin settings (read only).

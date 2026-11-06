@@ -13,6 +13,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+use windows::core::HSTRING;
+use windows::Win32::Storage::FileSystem::{MoveFileExW, MOVE_FILE_FLAGS};
 
 use crate::model::Why;
 
@@ -22,8 +24,14 @@ pub const MAX_ENTRIES: usize = 10_000;
 /// How long a writer waits for another writer, and how often it looks again.
 const LOCK_WAIT: Duration = Duration::from_secs(3);
 const LOCK_RETRY: Duration = Duration::from_millis(20);
+/// How long the final rename keeps trying when something (a virus scanner, a reader) holds the file.
+const RENAME_WAIT: Duration = Duration::from_secs(1);
+const RENAME_RETRY: Duration = Duration::from_millis(50);
 
 const NO_APPDATA: &str = "Windows didn't say where Recently removed is kept (no APPDATA folder).";
+const NEWER_WRITE: &str = "Recently removed was written by a newer Seek, so this one won't change it.";
+const NEWER_READ: &str = "Recently removed was written by a newer Seek, so this one can't show it.";
+const DAMAGED: &str = "Recently removed is damaged and can't be read. It is set aside and started again the next time Seek removes something.";
 
 /// One removal, or one item that was asked for and left in place.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -31,7 +39,8 @@ const NO_APPDATA: &str = "Windows didn't say where Recently removed is kept (no 
 pub struct Entry {
     /// Unique across processes and runs: time, process id and a counter.
     pub id: String,
-    /// When the commit finished, unix epoch milliseconds.
+    /// When the item was moved (for an item left in place, when the commit ended), unix epoch
+    /// milliseconds. Put back expects the Recycle Bin's deletion date close to this.
     pub time_ms: i64,
     pub original_path: String,
     pub size: u64,
@@ -51,27 +60,39 @@ pub struct Entry {
 pub struct PutBackResult {
     pub id: String,
     pub restored: bool,
-    /// Plain-words reason when it could not be put back.
+    /// Plain-words reason when it could not be put back, or a note when it was put back but
+    /// Recently removed could not record that.
     pub reason: Option<String>,
 }
+
+/// One item to put back: its Recycle Bin file path, where it goes, and when it was removed.
+pub type RestoreJob = (String, PathBuf, i64);
 
 /// The Recycle Bin, as put back needs it. The real one is [`ShellBin`].
 pub trait BinRestore {
     /// Puts the bin item at `bin_path` back at `original`. `deleted_near_ms` is when the removal
-    /// was recorded: the item must have been deleted close to then.
+    /// was recorded: the item must have been deleted close to then. An item the bin no longer
+    /// lists is "No longer in the Recycle Bin."; a bin that can't be listed says so.
     fn restore(&self, bin_path: &str, original: &Path, deleted_near_ms: i64) -> Result<(), String>;
-    fn in_bin(&self, bin_path: &str) -> bool;
+
+    /// A batch, one answer per job in order. The real one lists the bin once for all of them.
+    fn restore_all(&self, jobs: &[RestoreJob]) -> Vec<Result<(), String>> {
+        jobs.iter().map(|(b, o, t)| self.restore(b, o, *t)).collect()
+    }
 }
 
 /// The real Recycle Bin, through the shell's own restore verb.
-pub struct ShellBin;
+pub struct ShellBin {
+    /// The window (an HWND as a number, 0 for none) any prompt of Windows opens over.
+    pub owner: isize,
+}
 
 impl BinRestore for ShellBin {
     fn restore(&self, bin_path: &str, original: &Path, deleted_near_ms: i64) -> Result<(), String> {
-        crate::recycle::restore_near(bin_path, original, deleted_near_ms)
+        crate::recycle::restore_near(bin_path, original, deleted_near_ms, self.owner)
     }
-    fn in_bin(&self, bin_path: &str) -> bool {
-        crate::recycle::in_bin(bin_path)
+    fn restore_all(&self, jobs: &[RestoreJob]) -> Vec<Result<(), String>> {
+        crate::recycle::restore_many(jobs, self.owner)
     }
 }
 
@@ -85,6 +106,15 @@ pub fn new_id() -> String {
     format!("{}-{}-{}", now_ms(), std::process::id(), COUNTER.fetch_add(1, Ordering::Relaxed))
 }
 
+/// An OS error in plain words: Rust's text without its trailing "(os error N)".
+pub fn plain_io(e: &std::io::Error) -> String {
+    let text = e.to_string();
+    match text.rfind(" (os error ") {
+        Some(i) if text.ends_with(')') => text[..i].to_string(),
+        _ => text,
+    }
+}
+
 #[derive(Serialize)]
 struct FileOut<'a> {
     version: u32,
@@ -93,18 +123,47 @@ struct FileOut<'a> {
 
 #[derive(Deserialize)]
 struct FileIn {
-    version: u32,
     entries: Vec<Entry>,
+}
+
+enum Parsed {
+    Entries(Vec<Entry>),
+    /// A version this Seek doesn't know: never read as damaged, never touched.
+    Newer,
+    Damaged,
+}
+
+fn parse(bytes: &[u8]) -> Parsed {
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return Parsed::Damaged;
+    };
+    match v.get("version").and_then(serde_json::Value::as_u64) {
+        Some(1) => serde_json::from_value::<FileIn>(v).map_or(Parsed::Damaged, |f| Parsed::Entries(f.entries)),
+        Some(n) if n > 1 => Parsed::Newer,
+        _ => Parsed::Damaged,
+    }
+}
+
+/// What a load is for.
+#[derive(Clone, Copy, PartialEq)]
+enum Load {
+    Read,
+    /// A change to the file; a file that isn't history is an error.
+    Write,
+    /// A change to the file; a file that isn't history is set aside and a new one started.
+    WriteSettingAside,
 }
 
 /// The history file. Holds only where the file is, so it is cheap to share.
 pub struct History {
     target: Result<PathBuf, String>,
+    /// How long a change waits for another writer.
+    wait: Duration,
 }
 
 impl History {
     pub fn open(path: impl Into<PathBuf>) -> History {
-        History { target: Ok(path.into()) }
+        History { target: Ok(path.into()), wait: LOCK_WAIT }
     }
 
     /// The history in `%APPDATA%\Seek`. With no APPDATA there is no history: every call says why.
@@ -113,7 +172,7 @@ impl History {
             .filter(|v| !v.is_empty())
             .map(|v| PathBuf::from(v).join("Seek").join("cleanup-history.json"))
             .ok_or_else(|| NO_APPDATA.to_string());
-        History { target }
+        History { target, wait: LOCK_WAIT }
     }
 
     fn path(&self) -> Result<&Path, String> {
@@ -121,21 +180,23 @@ impl History {
     }
 
     /// Adds entries (oldest first), keeping the newest [`MAX_ENTRIES`]. A file that can't be read
-    /// as history is set aside first and a new one started.
-    pub fn append(&self, entries: &[Entry]) -> Result<(), String> {
+    /// as history is set aside first and a new one started: the entries are still recorded and
+    /// the answer is a note saying so. A file from a newer Seek is never changed (an error).
+    pub fn append(&self, entries: &[Entry]) -> Result<Option<String>, String> {
         let path = self.path()?;
-        let _lock = lock(path)?;
-        let mut all = load(path, true)?;
+        let _lock = lock(path, self.wait)?;
+        let (mut all, note) = load(path, Load::WriteSettingAside)?;
         all.extend_from_slice(entries);
         if all.len() > MAX_ENTRIES {
             all.drain(..all.len() - MAX_ENTRIES);
         }
-        store(path, &all)
+        store(path, &all)?;
+        Ok(note)
     }
 
     /// Newest first. An error says why the history can't be read; the file is left alone.
     pub fn try_list(&self) -> Result<Vec<Entry>, String> {
-        let mut all = load(self.path()?, false)?;
+        let (mut all, _) = load(self.path()?, Load::Read)?;
         all.reverse();
         Ok(all)
     }
@@ -148,8 +209,8 @@ impl History {
     /// Records that the entry was put back.
     pub fn mark_put_back(&self, id: &str, when_ms: i64) -> Result<(), String> {
         let path = self.path()?;
-        let _lock = lock(path)?;
-        let mut all = load(path, false)?;
+        let _lock = lock(path, self.wait)?;
+        let (mut all, _) = load(path, Load::Write)?;
         let entry = all.iter_mut().find(|e| e.id == id).ok_or("That entry is no longer in Recently removed.")?;
         entry.put_back_ms = Some(when_ms);
         store(path, &all)
@@ -157,11 +218,12 @@ impl History {
 }
 
 /// Takes the lock file `cleanup-history.lock` beside the history, opened so nobody else can open it
-/// (share mode 0), and holds it until the returned file drops. Waits for up to [`LOCK_WAIT`]. The
+/// (share mode 0), and holds it until the returned file drops. Waits up to `wait` while someone
+/// else holds it (a sharing violation); any other failure, access denied included, is final. The
 /// lock file itself is never deleted: an empty file left behind is the point.
-fn lock(history: &Path) -> Result<std::fs::File, String> {
+fn lock(history: &Path, wait: Duration) -> Result<std::fs::File, String> {
     if let Some(dir) = history.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| format!("Recently removed's folder couldn't be made: {e}"))?;
+        std::fs::create_dir_all(dir).map_err(|e| format!("Recently removed's folder couldn't be made ({}).", plain_io(&e)))?;
     }
     let lock_path = history.with_extension("lock");
     let start = Instant::now();
@@ -169,55 +231,72 @@ fn lock(history: &Path) -> Result<std::fs::File, String> {
         let opened = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).share_mode(0).open(&lock_path);
         match opened {
             Ok(f) => return Ok(f),
-            // 32/33 sharing and lock violations, 5 access denied (another writer mid-open).
-            Err(e) if matches!(e.raw_os_error(), Some(32 | 33 | 5)) => {
-                if start.elapsed() >= LOCK_WAIT {
-                    return Err("Recently removed is busy: another Seek window is writing it. Try again in a moment.".into());
+            // 32 sharing violation, 33 lock violation: another writer has it.
+            Err(e) if matches!(e.raw_os_error(), Some(32 | 33)) => {
+                if start.elapsed() >= wait {
+                    return Err("Recently removed is busy: another Seek window is writing it.".into());
                 }
                 std::thread::sleep(LOCK_RETRY);
             }
-            Err(e) => return Err(format!("Recently removed couldn't be locked for writing: {e}")),
+            Err(e) => return Err(format!("Recently removed couldn't be locked for writing ({}).", plain_io(&e))),
         }
     }
 }
 
-fn parse(bytes: &[u8]) -> Option<Vec<Entry>> {
-    serde_json::from_slice::<FileIn>(bytes).ok().filter(|f| f.version == 1).map(|f| f.entries)
-}
-
-/// The entries on disk, oldest first. No file is none. A file that isn't history is an error, or
-/// with `set_aside` renamed to `cleanup-history.corrupt-<ms>.json` (never overwriting an earlier
-/// one) so a new one can start.
-fn load(path: &Path, set_aside: bool) -> Result<Vec<Entry>, String> {
+/// The entries on disk, oldest first, and a note when a damaged file was set aside. No file is no
+/// entries. See [`Load`] for what a file that isn't history comes to.
+fn load(path: &Path, mode: Load) -> Result<(Vec<Entry>, Option<String>), String> {
     let bytes = match std::fs::read(path) {
         Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
-        Err(e) => return Err(format!("Recently removed couldn't be read: {e}")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((vec![], None)),
+        Err(e) => return Err(format!("Recently removed couldn't be read ({}).", plain_io(&e))),
     };
-    if let Some(entries) = parse(&bytes) {
-        return Ok(entries);
+    match parse(&bytes) {
+        Parsed::Entries(entries) => Ok((entries, None)),
+        Parsed::Newer => Err(if mode == Load::Read { NEWER_READ } else { NEWER_WRITE }.into()),
+        Parsed::Damaged if mode != Load::WriteSettingAside => Err(DAMAGED.into()),
+        Parsed::Damaged => {
+            let name = set_aside(path)?;
+            Ok((vec![], Some(format!("Recently removed couldn't be read, so it was started again. The old file was kept as {name}."))))
+        }
     }
-    if !set_aside {
-        return Err("Recently removed is damaged and can't be read. It will be set aside and started again the next time Seek removes something.".into());
-    }
+}
+
+/// Renames the damaged file to `cleanup-history.corrupt-<ms>.json` and returns that name. The
+/// rename fails if the name is taken (no replace flag), and then the next millisecond is tried, so
+/// an earlier set-aside file is never overwritten.
+fn set_aside(path: &Path) -> Result<String, String> {
+    const EXISTS: [i32; 2] = [0x8007_0050_u32 as i32, 0x8007_00B7_u32 as i32]; // file exists, already exists
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let mut ms = now_ms();
-    let aside = loop {
-        let candidate = dir.join(format!("cleanup-history.corrupt-{ms}.json"));
-        if std::fs::symlink_metadata(&candidate).is_err() {
-            break candidate;
+    for _ in 0..1000 {
+        let name = format!("cleanup-history.corrupt-{ms}.json");
+        let (from, to) = (HSTRING::from(path.as_os_str()), HSTRING::from(dir.join(&name).as_os_str()));
+        // SAFETY: plain call on two NUL-terminated strings that live through it.
+        match unsafe { MoveFileExW(&from, &to, MOVE_FILE_FLAGS(0)) } {
+            Ok(()) => return Ok(name),
+            Err(e) if EXISTS.contains(&e.code().0) => ms += 1,
+            Err(e) => return Err(format!("Recently removed is damaged, and setting it aside failed ({}).", e.message().trim())),
         }
-        ms += 1;
-    };
-    std::fs::rename(path, &aside)
-        .map_err(|e| format!("Recently removed is damaged, and setting it aside failed: {e}"))?;
-    Ok(vec![])
+    }
+    Err("Recently removed is damaged, and no name was free to set it aside under.".into())
+}
+
+fn rename_retrying(from: &Path, to: &Path) -> std::io::Result<()> {
+    let start = Instant::now();
+    loop {
+        match std::fs::rename(from, to) {
+            // 32 sharing violation, 5 access denied: something holds the file for a moment.
+            Err(e) if matches!(e.raw_os_error(), Some(32 | 5)) && start.elapsed() < RENAME_WAIT => std::thread::sleep(RENAME_RETRY),
+            other => return other,
+        }
+    }
 }
 
 /// Writes the entries to the fixed temp file, flushes it to disk, then renames it over the history.
 fn store(path: &Path, entries: &[Entry]) -> Result<(), String> {
-    let bytes = serde_json::to_vec(&FileOut { version: 1, entries })
-        .map_err(|e| format!("Recently removed couldn't be written: {e}"))?;
+    let failed = |e: String| format!("Recently removed couldn't be written ({e}).");
+    let bytes = serde_json::to_vec(&FileOut { version: 1, entries }).map_err(|e| failed(e.to_string()))?;
     let tmp = path.with_extension("json.tmp");
     let write = || -> std::io::Result<()> {
         let mut f = std::fs::File::create(&tmp)?;
@@ -225,9 +304,9 @@ fn store(path: &Path, entries: &[Entry]) -> Result<(), String> {
         f.flush()?;
         f.sync_all()?;
         drop(f);
-        std::fs::rename(&tmp, path)
+        rename_retrying(&tmp, path)
     };
-    write().map_err(|e| format!("Recently removed couldn't be written: {e}"))
+    write().map_err(|e| failed(plain_io(&e)))
 }
 
 fn is_denied(text: &str) -> bool {
@@ -235,32 +314,43 @@ fn is_denied(text: &str) -> bool {
     ["access is denied", "0x80070005", "requires elevation", "0x800702e4"].iter().any(|m| t.contains(m))
 }
 
-/// Puts one entry back. Never touches the history; the caller records a success.
-pub fn put_back(entry: &Entry, bin: &dyn BinRestore) -> PutBackResult {
-    let say = |restored: bool, reason: Option<String>| PutBackResult { id: entry.id.clone(), restored, reason };
-    let no = |reason: String| say(false, Some(reason));
+fn refuse(entry: &Entry, reason: String) -> PutBackResult {
+    PutBackResult { id: entry.id.clone(), restored: false, reason: Some(reason) }
+}
+
+/// What can be said about an entry without asking the bin: `Ok` with what to restore, or the refusal.
+fn ready(entry: &Entry) -> Result<RestoreJob, PutBackResult> {
     let Some(bin_path) = entry.bin_path.as_deref() else {
-        return no("It was never moved.".into());
+        return Err(refuse(entry, "It was never moved.".into()));
     };
     if entry.put_back_ms.is_some() {
-        return no("Already put back.".into());
+        return Err(refuse(entry, "Already put back.".into()));
     }
     let original = Path::new(&entry.original_path);
     // Anything at all there, even a broken link: restoring over it could lose it.
     if std::fs::symlink_metadata(original).is_ok() {
-        return no(format!("Something new is at {}. Move it first.", original.display()));
+        return Err(refuse(entry, crate::recycle::something_new_at(original)));
     }
-    if !bin.in_bin(bin_path) {
-        return no("No longer in the Recycle Bin".into());
-    }
-    match bin.restore(bin_path, original, entry.time_ms) {
-        Ok(()) => say(true, None),
-        Err(e) if is_denied(&e) => no("Needs admin: restore it from the Recycle Bin.".into()),
-        Err(e) => no(e),
+    Ok((bin_path.to_string(), original.to_path_buf(), entry.time_ms))
+}
+
+fn answer(entry: &Entry, restored: Result<(), String>) -> PutBackResult {
+    match restored {
+        Ok(()) => PutBackResult { id: entry.id.clone(), restored: true, reason: None },
+        Err(e) if is_denied(&e) => refuse(entry, "Needs admin: restore it from the Recycle Bin.".into()),
+        Err(e) => refuse(entry, e),
     }
 }
 
-/// Puts back every listed entry, one at a time, and records each success.
+/// Puts one entry back. Never touches the history; the caller records a success.
+pub fn put_back(entry: &Entry, bin: &dyn BinRestore) -> PutBackResult {
+    match ready(entry) {
+        Err(refusal) => refusal,
+        Ok((bin_path, original, near)) => answer(entry, bin.restore(&bin_path, &original, near)),
+    }
+}
+
+/// Puts back every listed entry and records each success. The bin is listed once for the batch.
 pub fn put_back_ids(history: &History, bin: &dyn BinRestore, ids: &[String]) -> Vec<PutBackResult> {
     let entries = match history.try_list() {
         Ok(e) => e,
@@ -268,18 +358,30 @@ pub fn put_back_ids(history: &History, bin: &dyn BinRestore, ids: &[String]) -> 
             return ids.iter().map(|id| PutBackResult { id: id.clone(), restored: false, reason: Some(why.clone()) }).collect();
         }
     };
-    ids.iter()
-        .map(|id| {
-            let Some(entry) = entries.iter().find(|e| &e.id == id) else {
-                return PutBackResult { id: id.clone(), restored: false, reason: Some("That entry is no longer in Recently removed.".into()) };
-            };
-            let mut result = put_back(entry, bin);
-            if result.restored {
-                if let Err(e) = history.mark_put_back(id, now_ms()) {
-                    result.reason = Some(format!("Put back, but Recently removed couldn't record it: {e}"));
+    // Per id: the entry and what to restore, or the answer already.
+    type Step<'a> = Result<(&'a Entry, RestoreJob), PutBackResult>;
+    let mut plan: Vec<(String, Step)> = Vec::new();
+    for id in ids {
+        let step = match entries.iter().find(|e| &e.id == id) {
+            None => Err(PutBackResult { id: id.clone(), restored: false, reason: Some("That entry is no longer in Recently removed.".into()) }),
+            Some(entry) => ready(entry).map(|job| (entry, job)),
+        };
+        plan.push((id.clone(), step));
+    }
+    let jobs: Vec<RestoreJob> = plan.iter().filter_map(|(_, s)| s.as_ref().ok().map(|(_, j)| j.clone())).collect();
+    let mut restored = if jobs.is_empty() { vec![] } else { bin.restore_all(&jobs) }.into_iter();
+    plan.into_iter()
+        .map(|(id, step)| match step {
+            Err(refusal) => refusal,
+            Ok((entry, _)) => {
+                let mut result = answer(entry, restored.next().unwrap_or_else(|| Err("The Recycle Bin gave no answer.".into())));
+                if result.restored {
+                    if let Err(e) = history.mark_put_back(&id, now_ms()) {
+                        result.reason = Some(format!("Recently removed couldn't record it. {e}"));
+                    }
                 }
+                result
             }
-            result
         })
         .collect()
 }
