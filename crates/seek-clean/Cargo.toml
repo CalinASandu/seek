@@ -7,6 +7,10 @@ rust-version.workspace = true
 
 [dependencies]
 serde = { workspace = true }
+# The job and result files of the admin step. Was dev-only.
+serde_json = { workspace = true }
+# The elevated side reads devices.json with the service's own types (OS-agnostic crate).
+seek-core = { workspace = true }
 # Review tokens are random; already in the workspace (seek-hub, seek-sync).
 rand = { workspace = true }
 # Duplicate finder: equality is the full BLAKE3 hash of the whole file (named by the spec).
@@ -19,6 +23,7 @@ windows = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
     "Win32_Security",
+    "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
     "Win32_System_Com",
     "Win32_System_IO",
@@ -43,4 +48,3 @@ spike = []
 
 [dev-dependencies]
 tempfile = { workspace = true }
-serde_json = { workspace = true }

@@ -7,6 +7,7 @@ pub mod apps;
 pub mod claims;
 pub mod confidence;
 pub mod dupes;
+pub mod elevated;
 pub mod engine;
 pub mod facts;
 pub mod leftovers;

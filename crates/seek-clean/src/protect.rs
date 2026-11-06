@@ -152,6 +152,12 @@ impl Places {
         }
     }
 
+    /// `<ProgramData>\Seek` (in `canon` form): where the service keeps `devices.json`, the indexes
+    /// and the journals. `None` when ProgramData is unknown.
+    pub fn seek_data_dir(&self) -> Option<PathBuf> {
+        (!self.program_data.is_empty()).then(|| Path::new(&self.program_data).join("Seek"))
+    }
+
     /// True if `canon_path` (in `canon` form) is Program Files or inside it.
     pub fn in_program_files(&self, canon_path: &str) -> bool {
         self.program_files.iter().any(|p| is_inside(canon_path, p))
@@ -367,7 +373,7 @@ fn is_scan_root_child(places: &Places, p: &str) -> bool {
 
 /// True if `p` (in `canon` form) is one of Seek's own index or journal files: directly in
 /// `<ProgramData>\Seek\indexes` as `.seekidx`, or in `<ProgramData>\Seek\journal` as `.log`.
-fn is_seek_data_file(places: &Places, p: &str) -> bool {
+pub fn is_seek_data_file(places: &Places, p: &str) -> bool {
     if places.program_data.is_empty() {
         return false;
     }

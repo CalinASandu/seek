@@ -89,6 +89,20 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
+/// The first thing `main` does: `--clean-elevated <job file>` is the admin step of Cleanup, started
+/// behind one UAC prompt. It needs no Tauri, no window and no single-instance plugin, so it is
+/// handled here and the process exits with the returned code. Anything else after the flag, or
+/// less, is refused (non-zero). `None` means this is an ordinary start.
+pub fn clean_elevated_dispatch(args: &[std::ffi::OsString]) -> Option<i32> {
+    if args.first()? != "--clean-elevated" {
+        return None;
+    }
+    Some(match args {
+        [_, job_file] => seek_clean::elevated::run_main(std::path::Path::new(job_file), settings::protected_paths_strict()),
+        _ => 2,
+    })
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let link = Arc::new(ServiceLink::default());
@@ -170,4 +184,40 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running Seek");
+}
+
+#[cfg(test)]
+mod dispatch_tests {
+    use super::clean_elevated_dispatch;
+    use std::ffi::OsString;
+
+    fn args(a: &[&str]) -> Vec<OsString> {
+        a.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn ordinary_starts_are_not_the_admin_step() {
+        assert_eq!(clean_elevated_dispatch(&args(&[])), None);
+        assert_eq!(clean_elevated_dispatch(&args(&["--minimized"])), None);
+        assert_eq!(clean_elevated_dispatch(&args(&["x", "--clean-elevated"])), None);
+    }
+
+    #[test]
+    fn the_flag_with_anything_but_one_job_file_refuses_and_exits_non_zero() {
+        assert_eq!(clean_elevated_dispatch(&args(&["--clean-elevated"])), Some(2));
+        assert_eq!(clean_elevated_dispatch(&args(&["--clean-elevated", "a", "b"])), Some(2));
+        assert_eq!(clean_elevated_dispatch(&args(&["--clean-elevated", "a", "--minimized"])), Some(2));
+    }
+
+    #[test]
+    fn a_job_file_outside_the_run_folders_is_refused_before_anything_is_read() {
+        let dir = std::env::temp_dir().join(format!("seek-dispatch-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("job.json");
+        std::fs::write(&f, b"{}").unwrap();
+        let code = clean_elevated_dispatch(&args(&["--clean-elevated", f.to_str().unwrap()]));
+        assert_eq!(code, Some(2));
+        assert!(!dir.join("result.json").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
