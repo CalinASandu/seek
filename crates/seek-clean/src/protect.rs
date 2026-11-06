@@ -9,7 +9,7 @@ use windows::Win32::UI::Shell::{
     SHGetKnownFolderPath, FOLDERID_LocalAppData, FOLDERID_LocalAppDataLow, FOLDERID_ProgramData,
     FOLDERID_CommonPrograms, FOLDERID_Desktop, FOLDERID_Documents, FOLDERID_Downloads, FOLDERID_Favorites, FOLDERID_Music,
     FOLDERID_Pictures, FOLDERID_Programs, FOLDERID_SavedGames, FOLDERID_Videos, FOLDERID_ProgramFiles, FOLDERID_ProgramFilesX86,
-    FOLDERID_Profile, FOLDERID_RoamingAppData, FOLDERID_UserProfiles, FOLDERID_Windows, KF_FLAG_DEFAULT,
+    FOLDERID_Profile, FOLDERID_ProgramFilesCommon, FOLDERID_ProgramFilesCommonX86, FOLDERID_RoamingAppData, FOLDERID_UserProfiles, FOLDERID_Windows, KF_FLAG_DEFAULT,
 };
 
 use crate::model::{Lock, Why};
@@ -47,6 +47,38 @@ pub struct Places {
     /// Where Windows says Desktop, Documents, Downloads, Pictures, Music, Videos, Saved Games and
     /// Favorites are, which may not be in the profile (`D:\Documents`, a OneDrive move).
     known_dirs: Vec<String>,
+}
+
+/// What Windows says a folder-valued environment variable is, for the variables a program could
+/// poison to make a claim point somewhere else: Program Files, Common Files, ProgramData,
+/// the Windows folder and its drive. Read from the system, never from the environment. `None` for
+/// any other name.
+pub fn trusted_folder_env(name: &str) -> Option<String> {
+    let n = name.to_ascii_lowercase();
+    match n.as_str() {
+        "programfiles" | "programw6432" => known_raw(&FOLDERID_ProgramFiles),
+        "programfiles(x86)" => known_raw(&FOLDERID_ProgramFilesX86),
+        "commonprogramfiles" | "commonprogramw6432" => known_raw(&FOLDERID_ProgramFilesCommon),
+        "commonprogramfiles(x86)" => known_raw(&FOLDERID_ProgramFilesCommonX86),
+        "programdata" | "allusersprofile" => known_raw(&FOLDERID_ProgramData),
+        "systemroot" | "windir" => windows_dir_trusted(),
+        "systemdrive" => windows_dir_trusted().map(|w| w.chars().take(2).collect()),
+        _ => None,
+    }
+}
+
+/// True for the names `trusted_folder_env` answers for.
+pub fn is_trusted_env_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "programfiles" | "programw6432" | "programfiles(x86)" | "commonprogramfiles" | "commonprogramw6432" | "commonprogramfiles(x86)"
+            | "programdata" | "allusersprofile" | "systemroot" | "windir" | "systemdrive"
+    )
+}
+
+/// The Windows folder from Windows itself, never the environment.
+fn windows_dir_trusted() -> Option<String> {
+    known_raw(&FOLDERID_Windows)
 }
 
 /// The Windows folder as Windows spells it (`C:\Windows`). The uninstall launcher builds the path
@@ -156,6 +188,19 @@ impl Places {
     /// and the journals. `None` when ProgramData is unknown.
     pub fn seek_data_dir(&self) -> Option<PathBuf> {
         (!self.program_data.is_empty()).then(|| Path::new(&self.program_data).join("Seek"))
+    }
+
+    /// The roots whose contents the elevated process removes from, in `canon` form: Program Files
+    /// and the Start Menu `Programs` folders. The folders above an item in one of them are held
+    /// while it is recycled.
+    pub fn guarded_roots(&self) -> Vec<String> {
+        self.program_files.iter().cloned().chain(self.start_menus.iter().map(|m| canon(m))).collect()
+    }
+
+    /// True if `canon_path` (in `canon` form) is inside a Start Menu `Programs` folder that lives
+    /// in ProgramData: the all-users one (`FOLDERID_CommonPrograms`).
+    pub fn in_all_users_start_menu(&self, canon_path: &str) -> bool {
+        self.start_menus.iter().map(|m| canon(m)).any(|m| is_inside(&m, &self.program_data) && is_inside(canon_path, &m))
     }
 
     /// True if `canon_path` (in `canon` form) is Program Files or inside it.

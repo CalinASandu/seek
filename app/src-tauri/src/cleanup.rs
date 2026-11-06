@@ -799,15 +799,22 @@ impl Core {
     }
 }
 
-/// Asks Windows for admin, once, to run `seek-app.exe --clean-elevated <job file>`. Built only in
-/// `Core::real`. Everything else about the admin step (the job and result files, matching the
-/// answers, cleaning up) is `seek_clean::elevated`.
+/// Asks Windows for admin, once, to run `seek-app.exe --clean-elevated <pipe name>`. Built only in
+/// `Core::real`. Everything else about the admin step (the pipe, matching the answers) is
+/// `seek_clean::elevated`.
 pub struct UacElevator;
 
 impl Elevator for UacElevator {
-    fn run(&self, items: &[seek_clean::model::JobItem]) -> Result<Vec<seek_clean::model::ItemOutcome>, String> {
-        JobElevator { launcher: Arc::new(ShellLaunch), base: None }.run(items)
+    fn run(&self, items: &[seek_clean::model::JobItem]) -> Result<seek_clean::facts::AdminAnswer, String> {
+        JobElevator { launcher: Arc::new(ShellLaunch) }.run(items)
     }
+}
+
+/// The main window's handle, so the UAC prompt opens in front of it. 0 until the window exists.
+static MAIN_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+
+pub fn set_main_hwnd(hwnd: isize) {
+    MAIN_HWND.store(hwnd, Ordering::Relaxed);
 }
 
 /// `ShellExecuteExW` with the `runas` verb, then waits for the elevated copy to exit.
@@ -823,26 +830,45 @@ impl Drop for ProcessHandle {
     }
 }
 
+/// COM on the launching thread, as ShellExecute asks; balanced on every path.
+struct ComApartment(bool);
+
+impl ComApartment {
+    fn enter() -> ComApartment {
+        use windows_sys::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
+        // SAFETY: balanced by the CoUninitialize in Drop, on this same thread, only if this succeeded.
+        ComApartment(unsafe { CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED as u32) } >= 0)
+    }
+}
+
+impl Drop for ComApartment {
+    fn drop(&mut self) {
+        if self.0 {
+            // SAFETY: the CoInitializeEx in `enter` succeeded on this thread.
+            unsafe { windows_sys::Win32::System::Com::CoUninitialize() };
+        }
+    }
+}
+
 impl Launcher for ShellLaunch {
-    fn launch_and_wait(&self, job_file: &Path) -> Result<(), LaunchError> {
+    fn launch_and_wait(&self, pipe_name: &str) -> Result<u32, LaunchError> {
         use std::os::windows::ffi::OsStrExt;
         use windows_sys::Win32::Foundation::{GetLastError, ERROR_CANCELLED};
-        use windows_sys::Win32::System::Threading::{WaitForSingleObject, INFINITE};
+        use windows_sys::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject, INFINITE};
         use windows_sys::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
         use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
 
+        let _com = ComApartment::enter();
         let wide = |s: &std::ffi::OsStr| -> Vec<u16> { s.encode_wide().chain(std::iter::once(0)).collect() };
         let exe = std::env::current_exe().map_err(|e| LaunchError::Failed(e.to_string()))?;
         let file = wide(exe.as_os_str());
         let verb = wide(std::ffi::OsStr::new("runas"));
-        let mut params = std::ffi::OsString::from("--clean-elevated \"");
-        params.push(job_file);
-        params.push("\"");
-        let params = wide(&params);
+        let params = wide(std::ffi::OsStr::new(&format!("--clean-elevated \"{pipe_name}\"")));
         // SAFETY: an all-zero SHELLEXECUTEINFOW is valid (null pointers, zero flags); fields are set below.
         let mut info: SHELLEXECUTEINFOW = unsafe { std::mem::zeroed() };
         info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
         info.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_FLAG_NO_UI | SEE_MASK_NOASYNC;
+        info.hwnd = MAIN_HWND.load(Ordering::Relaxed) as _;
         info.lpVerb = verb.as_ptr();
         info.lpFile = file.as_ptr();
         info.lpParameters = params.as_ptr();
@@ -860,7 +886,13 @@ impl Launcher for ShellLaunch {
         // No timeout: the prompt can stay open as long as the user likes.
         // SAFETY: a valid process handle owned by the guard.
         unsafe { WaitForSingleObject(process.0, INFINITE) };
-        Ok(())
+        let mut code = 0u32;
+        // SAFETY: a valid process handle and out pointer.
+        if unsafe { GetExitCodeProcess(process.0, &mut code) } == 0 {
+            // It ran, and it may have moved things: an unknown code is read as "something went wrong".
+            return Ok(u32::MAX);
+        }
+        Ok(code)
     }
 }
 

@@ -14,13 +14,16 @@ pub(super) fn run_admin(
     jobs: &[JobItem],
     out: &mut Vec<ItemOutcome>,
     moved_bytes: &mut u64,
-    stopped: bool,
+    stopped: &mut Option<String>,
 ) {
-    let (answers, why) = if stopped {
+    let (answers, why) = if stopped.is_some() {
         (vec![], STOPPED.to_string())
     } else {
         match e.run(jobs) {
-            Ok(a) => (a, ADMIN_SILENT.to_string()),
+            Ok(a) => {
+                *stopped = a.stopped_early;
+                (a.items, ADMIN_SILENT.to_string())
+            }
             Err(e) => (
                 vec![],
                 format!("The admin step failed ({e}). It may have removed some items first, so check the Recycle Bin."),

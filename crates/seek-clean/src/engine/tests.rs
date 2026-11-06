@@ -104,9 +104,10 @@ enum ElevMode {
 struct FakeElevator {
     calls: Mutex<Vec<Vec<JobItem>>>,
     mode: Mutex<ElevMode>,
+    stop: Mutex<Option<String>>,
 }
 impl Elevator for FakeElevator {
-    fn run(&self, items: &[JobItem]) -> Result<Vec<ItemOutcome>, String> {
+    fn run(&self, items: &[JobItem]) -> Result<crate::facts::AdminAnswer, String> {
         self.calls.lock().unwrap().push(items.to_vec());
         let mode = *self.mode.lock().unwrap();
         if mode == ElevMode::Fail {
@@ -117,7 +118,7 @@ impl Elevator for FakeElevator {
         } else {
             items.len()
         };
-        Ok(items
+        let answered = items
             .iter()
             .take(take)
             .map(|j| ItemOutcome {
@@ -128,7 +129,8 @@ impl Elevator for FakeElevator {
                     bin_path: "bin".into(),
                 },
             })
-            .collect())
+            .collect();
+        Ok(crate::facts::AdminAnswer { items: answered, stopped_early: self.stop.lock().unwrap().clone() })
     }
 }
 
@@ -1037,6 +1039,15 @@ fn a_failed_elevator_run_does_not_claim_everything_stayed() {
         );
     }
     assert_eq!(r.moved_bytes, 0);
+}
+
+#[test]
+fn an_elevators_early_stop_reaches_the_commit_result() {
+    let env = Env::new(true);
+    *env.elev.stop.lock().unwrap() = Some("A.b could not be confirmed".into());
+    let prep = env.engine.prepare(vec![env.folder("pf/one")], &[]);
+    let r = env.engine.commit(&prep.token, &[0], &[]).unwrap();
+    assert_eq!(r.stopped_early.as_deref(), Some("A.b could not be confirmed"));
 }
 
 #[test]

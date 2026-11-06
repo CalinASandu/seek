@@ -26,7 +26,14 @@ pub trait Recycler: Send + Sync {
 pub trait Elevator: Send + Sync {
     /// Removes these items with admin rights, one prompt for the whole call. The real elevator
     /// adds the user's SID itself.
-    fn run(&self, items: &[JobItem]) -> Result<Vec<ItemOutcome>, String>;
+    fn run(&self, items: &[JobItem]) -> Result<AdminAnswer, String>;
+}
+
+/// What the admin step reports: an outcome per item it answered for, and why it stopped early.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AdminAnswer {
+    pub items: Vec<ItemOutcome>,
+    pub stopped_early: Option<String>,
 }
 
 pub trait FileFacts: Send + Sync {
