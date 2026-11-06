@@ -57,6 +57,11 @@ pub struct Places {
 /// the Windows folder and its drive. Read from the system, never from the environment. `None` for
 /// any other name.
 pub fn trusted_folder_env(name: &str) -> Option<String> {
+    // The elevated process has settled on these (from HKLM and GetWindowsDirectoryW) before it
+    // reads anything: they, not the known-folder calls, which follow the environment.
+    if let Some(t) = crate::elevated::trust::global() {
+        return t.get(name);
+    }
     let n = name.to_ascii_lowercase();
     match n.as_str() {
         "programfiles" | "programw6432" => known_raw(&FOLDERID_ProgramFiles),
@@ -72,6 +77,9 @@ pub fn trusted_folder_env(name: &str) -> Option<String> {
 
 /// The users folder (`C:\Users`) from Windows.
 pub fn users_folder() -> Option<String> {
+    if let Some(t) = crate::elevated::trust::global() {
+        return Some(t.profiles_dir.clone());
+    }
     known_raw(&FOLDERID_UserProfiles)
 }
 
@@ -210,7 +218,32 @@ impl Places {
     /// True if `canon_path` (in `canon` form) is inside the all-users Start Menu `Programs`
     /// folder, which is `FOLDERID_CommonPrograms` and nothing else.
     pub fn in_all_users_start_menu(&self, canon_path: &str) -> bool {
-        self.common_programs.as_ref().is_some_and(|m| is_inside(canon_path, &canon(m)))
+        self.common_programs_canon().is_some_and(|m| is_inside(&m, &self.program_data) && is_inside(canon_path, &m))
+    }
+
+    /// The all-users Start Menu `Programs` folder, in `canon` form.
+    pub fn common_programs_canon(&self) -> Option<String> {
+        self.common_programs.as_ref().map(|m| canon(m))
+    }
+
+    /// The Windows folder, in `canon` form.
+    pub fn windows_canon(&self) -> &str {
+        &self.windows
+    }
+
+    /// ProgramData, in `canon` form.
+    pub fn program_data_canon(&self) -> &str {
+        &self.program_data
+    }
+
+    /// The folder the profiles are in, in `canon` form.
+    pub fn users_root_canon(&self) -> &str {
+        &self.users_root
+    }
+
+    /// Program Files and its x86 twin, in `canon` form.
+    pub fn program_files_canon(&self) -> &[String] {
+        &self.program_files
     }
 
     /// Tests only: where the user's and the all-users Start Menu `Programs` folders are.

@@ -27,6 +27,7 @@ use crate::recycle::ShellRecycler;
 pub mod account;
 pub mod guard;
 pub mod pipe;
+pub mod trust;
 
 /// A job bigger than this is refused unread.
 pub const MAX_JOB_BYTES: u64 = 1 << 20;
@@ -319,15 +320,18 @@ fn refuse(client: pipe::Client, note: String, items: Vec<ItemOutcome>) -> i32 {
 
 /// `seek-app.exe --clean-elevated <pipe name>`. `protected` is the user's "Always protect" list as
 /// read by the same strict reader the window uses (an error means nothing is removed).
-pub fn run_main(pipe_name: &str, protected: Result<Vec<String>, String>) -> i32 {
-    run_main_with(pipe_name, &|job| real_context(job, protected.clone()))
+pub fn run_main(pipe_name: &str, protected: Result<Vec<String>, String>, trusted: Result<trust::TrustedFolders, String>) -> i32 {
+    run_main_with(pipe_name, &|job| real_context(job, protected.clone(), trusted.clone()))
 }
 
 /// The one place the elevated side builds its real pieces: the disk's own facts, the Recycle Bin
 /// recycler, and fresh claims read now (never a cache) that take the system folders from Windows
 /// and not from the environment.
-fn real_context(job: &ElevatedJob, protected: Result<Vec<String>, String>) -> Result<ElevatedContext, String> {
+fn real_context(job: &ElevatedJob, protected: Result<Vec<String>, String>, trusted: Result<trust::TrustedFolders, String>) -> Result<ElevatedContext, String> {
+    let trusted = trusted?;
     let places = Places::from_system().map_err(|e| format!("The admin step can't run safely on this PC: {e}"))?;
+    // What Windows named must be what HKLM says; otherwise something moved the system folders.
+    trust::check_places(&places, &trusted)?;
     let devices = places
         .seek_data_dir()
         .ok_or_else(|| "Windows didn't say where Seek's data is kept.".to_string())
