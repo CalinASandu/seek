@@ -35,6 +35,10 @@ pub const MAX_JOB_ITEMS: usize = 10_000;
 const MAX_RESULT_BYTES: u64 = 16 << 20;
 /// How long the elevated copy waits for the job to arrive.
 const JOB_TIMEOUT: Duration = Duration::from_secs(30);
+/// Once the elevated process has exited, its serving thread has this long to end by itself, then
+/// is cancelled, and is let go after the deadline: the window never waits longer than that.
+const SERVE_GRACE: Duration = Duration::from_millis(500);
+const SERVE_DEADLINE: Duration = Duration::from_secs(5);
 
 pub const DECLINED: &str = "Windows asked for admin and it was declined.";
 /// The exit code of a run that refused the job as a whole and did nothing.
@@ -293,7 +297,13 @@ pub fn run_main_with(pipe_name: &str, context: &dyn Fn(&ElevatedJob) -> Result<E
         Err(note) => return refuse(client, note.clone(), refuse_items(&note)),
     };
     let result = process_job(&job, &ctx);
-    match serde_json::to_vec(&result).map_err(|e| e.to_string()).and_then(|b| client.reply(&b)) {
+    let mut bytes = serde_json::to_vec(&result).unwrap_or_default();
+    if bytes.len() as u64 > MAX_RESULT_BYTES {
+        // More than the window reads: say so, without the items.
+        let note = "The answer was too big to send, so check the Recycle Bin.".to_string();
+        bytes = serde_json::to_vec(&ElevatedResult { note: Some(note), ..ElevatedResult::default() }).unwrap_or_default();
+    }
+    match client.reply_within(&bytes, MAX_RESULT_BYTES, pipe::REPLY_TIMEOUT) {
         Ok(()) => 0,
         Err(_) => EXIT_NO_RESULT,
     }
@@ -302,7 +312,7 @@ pub fn run_main_with(pipe_name: &str, context: &dyn Fn(&ElevatedJob) -> Result<E
 /// Sends a result that says everything was refused, if it can.
 fn refuse(client: pipe::Client, note: String, items: Vec<ItemOutcome>) -> i32 {
     if let Ok(b) = serde_json::to_vec(&ElevatedResult { items, note: Some(note), stopped_early: None }) {
-        let _ = client.reply(&b);
+        let _ = client.reply_within(&b, MAX_RESULT_BYTES, pipe::REPLY_TIMEOUT);
     }
     EXIT_REFUSED
 }
@@ -346,10 +356,11 @@ pub enum LaunchError {
     Failed(String),
 }
 
-/// Starts the elevated copy on `pipe_name`, waits for it to exit and returns its exit code. The
-/// real one is `cleanup::ShellLaunch`; tests use fakes.
+/// Starts the elevated copy on `pipe_name`, tells `started` its process id as soon as it exists
+/// (before anything else: the pipe serves no one else), waits for it to exit and returns its exit
+/// code. The real one is `cleanup::ShellLaunch`; tests use fakes.
 pub trait Launcher: Send + Sync {
-    fn launch_and_wait(&self, pipe_name: &str) -> Result<u32, LaunchError>;
+    fn launch_and_wait(&self, pipe_name: &str, started: &dyn Fn(u32)) -> Result<u32, LaunchError>;
 }
 
 /// Every item, left in place for one reason.
@@ -375,13 +386,15 @@ pub fn run_elevated(items: &[JobItem], user_sid: &str, window_pid: u32, launcher
         Ok(s) => s,
         Err(e) => return prepare_failed(e.to_string()),
     };
-    let serving = std::thread::spawn(move || server.serve(&bytes, MAX_RESULT_BYTES));
-    let launched = launcher.launch_and_wait(&name);
-    // Whatever happened, a server still waiting for a client that never came is let go.
-    if !serving.is_finished() {
-        pipe::release(&name);
-    }
-    let reply = serving.join().ok().and_then(Result::ok);
+    let (tell, started) = std::sync::mpsc::channel();
+    let serving = std::thread::spawn(move || server.serve(&bytes, MAX_RESULT_BYTES, started));
+    let launched = launcher.launch_and_wait(&name, &|pid| {
+        let _ = tell.send(pid);
+    });
+    drop(tell);
+    // The process has exited (or never started): the serving thread ends now, or is cancelled, or
+    // is let go. This never blocks for long, and never holds up the commit.
+    let reply = pipe::finish(serving, SERVE_GRACE, SERVE_DEADLINE).and_then(Result::ok);
     match launched {
         Err(LaunchError::Declined) => all_left(items, DECLINED),
         Err(LaunchError::Failed(e)) => all_left(items, &format!("Windows couldn't start the admin step ({e}), so this was left in place.")),
@@ -395,9 +408,11 @@ pub fn run_elevated(items: &[JobItem], user_sid: &str, window_pid: u32, launcher
 /// other exit code an item without an answer may have been moved before the process ended, so it
 /// gets the engine's "check the Recycle Bin" outcome and never one that says it was left alone.
 pub fn match_results(sent: &[JobItem], result: Option<&[u8]>, exit_code: u32) -> AdminAnswer {
-    let parsed: Option<ElevatedResult> = result.and_then(|b| serde_json::from_slice(b).ok());
+    let mut parsed: Option<ElevatedResult> = result.and_then(|b| serde_json::from_slice(b).ok());
     let silent = if exit_code == EXIT_REFUSED as u32 {
-        parsed.as_ref().and_then(|r| r.note.clone()).unwrap_or_else(|| REFUSED_RUN.to_string())
+        // Nothing was done, so nothing in the reply but its reason counts.
+        let note = parsed.take().and_then(|r| r.note);
+        note.unwrap_or_else(|| REFUSED_RUN.to_string())
     } else {
         ADMIN_SILENT.to_string()
     };

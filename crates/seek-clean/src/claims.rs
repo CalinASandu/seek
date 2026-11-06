@@ -389,6 +389,39 @@ pub fn trusted_env(
     }
 }
 
+/// The folders a claim may sit at or above without being specific (drive roots, Windows, Program
+/// Files, ProgramData, the user's profile and AppData). In trusted mode (the elevated process)
+/// none of it comes from the environment, and none from per-user known folders either, since
+/// those follow `USERPROFILE`: only the drive roots, the system folders `known` gives, and the
+/// users folder. So a poisoned `LOCALAPPDATA` can't make a claim look broad, which would stop it
+/// claiming the folders under it.
+pub fn broad_roots_for(
+    drives: &[String],
+    trusted: bool,
+    env: &dyn Fn(&str) -> Option<String>,
+    known: &dyn Fn(&str) -> Option<String>,
+    users_folder: Option<String>,
+) -> Vec<String> {
+    let mut roots = drives.to_vec();
+    if trusted {
+        for var in ["SystemRoot", "ProgramFiles", "ProgramFiles(x86)", "ProgramW6432", "ProgramData"] {
+            roots.extend(known(var));
+        }
+        roots.extend(users_folder);
+        return roots;
+    }
+    for var in ["SystemRoot", "ProgramFiles", "ProgramFiles(x86)", "ProgramW6432", "ProgramData", "USERPROFILE", "LOCALAPPDATA", "APPDATA"] {
+        roots.extend(env(var));
+    }
+    if let Some(profile) = env("USERPROFILE") {
+        let p = Path::new(&profile);
+        roots.extend(p.parent().map(|u| u.to_string_lossy().into_owned()));
+        roots.push(p.join(r"AppData\LocalLow").to_string_lossy().into_owned());
+        roots.push(p.join("AppData").to_string_lossy().into_owned());
+    }
+    roots
+}
+
 /// Replaces `%NAME%` with the value `env` gives. Unknown names and stray `%` stay as they are.
 pub fn expand_env(s: &str, env: &dyn Fn(&str) -> Option<String>) -> String {
     let mut out = String::with_capacity(s.len());
@@ -1321,24 +1354,17 @@ mod real {
     }
 
     fn broad_roots() -> Vec<String> {
-        let mut roots = Vec::new();
+        let mut drives = Vec::new();
         // SAFETY: no arguments.
         let mask = unsafe { GetLogicalDrives() };
         for i in 0..26u32 {
             if mask & (1 << i) != 0 {
-                roots.push(format!("{}:\\", (b'A' + i as u8) as char));
+                drives.push(format!("{}:\\", (b'A' + i as u8) as char));
             }
         }
-        for var in ["SystemRoot", "ProgramFiles", "ProgramFiles(x86)", "ProgramW6432", "ProgramData", "USERPROFILE", "LOCALAPPDATA", "APPDATA"] {
-            roots.extend(env(var));
-        }
-        if let Some(profile) = env("USERPROFILE") {
-            let p = Path::new(&profile);
-            roots.extend(p.parent().map(|u| u.to_string_lossy().into_owned()));
-            roots.push(p.join(r"AppData\LocalLow").to_string_lossy().into_owned());
-            roots.push(p.join("AppData").to_string_lossy().into_owned());
-        }
-        roots
+        let base = |n: &str| std::env::var(n).ok().filter(|v| !v.is_empty());
+        let trusted = TRUSTED_ENV.load(std::sync::atomic::Ordering::Relaxed);
+        broad_roots_for(&drives, trusted, &base, &crate::protect::trusted_folder_env, crate::protect::users_folder())
     }
 
     /// The uninstall lists alone.

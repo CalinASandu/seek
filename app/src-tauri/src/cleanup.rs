@@ -851,10 +851,10 @@ impl Drop for ComApartment {
 }
 
 impl Launcher for ShellLaunch {
-    fn launch_and_wait(&self, pipe_name: &str) -> Result<u32, LaunchError> {
+    fn launch_and_wait(&self, pipe_name: &str, started: &dyn Fn(u32)) -> Result<u32, LaunchError> {
         use std::os::windows::ffi::OsStrExt;
         use windows_sys::Win32::Foundation::{GetLastError, ERROR_CANCELLED};
-        use windows_sys::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject, INFINITE};
+        use windows_sys::Win32::System::Threading::{GetExitCodeProcess, GetProcessId, WaitForSingleObject, INFINITE};
         use windows_sys::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
         use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
 
@@ -883,6 +883,9 @@ impl Launcher for ShellLaunch {
             return Err(LaunchError::Failed("Windows did not give a process to wait for".into()));
         }
         let process = ProcessHandle(info.hProcess);
+        // The pipe serves this process and no other.
+        // SAFETY: a valid process handle owned by the guard.
+        started(unsafe { GetProcessId(process.0) });
         // No timeout: the prompt can stay open as long as the user likes.
         // SAFETY: a valid process handle owned by the guard.
         unsafe { WaitForSingleObject(process.0, INFINITE) };

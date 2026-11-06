@@ -655,9 +655,28 @@ fn a_pipe_name_of_the_wrong_shape_is_refused() {
 struct ClientLauncher(Box<dyn Fn(&str) -> u32 + Send + Sync>);
 
 impl Launcher for ClientLauncher {
-    fn launch_and_wait(&self, name: &str) -> Result<u32, LaunchError> {
+    fn launch_and_wait(&self, name: &str, started: &dyn Fn(u32)) -> Result<u32, LaunchError> {
+        // The process this test "starts" is this one: it is the one that connects.
+        started(std::process::id());
         Ok((self.0)(name))
     }
+}
+
+/// Reports a different process id than the one that connects.
+struct ImpostorLauncher(Box<dyn Fn(&str) -> u32 + Send + Sync>);
+
+impl Launcher for ImpostorLauncher {
+    fn launch_and_wait(&self, name: &str, started: &dyn Fn(u32)) -> Result<u32, LaunchError> {
+        started(std::process::id().wrapping_add(4));
+        Ok((self.0)(name))
+    }
+}
+
+/// A channel that already holds the pid of this process, for `Server::serve` in a test.
+fn this_pid() -> std::sync::mpsc::Receiver<u32> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    tx.send(std::process::id()).unwrap();
+    rx
 }
 
 fn client_of(env: &Arc<Env>) -> ClientLauncher {
@@ -696,7 +715,7 @@ fn a_server_pid_that_is_not_the_jobs_window_pid_refuses_everything() {
 fn serve_raw(env: &Arc<Env>, job: Vec<u8>) -> (i32, ElevatedResult) {
     let name = pipe::new_name();
     let server = pipe::Server::create(&name).unwrap();
-    let serving = std::thread::spawn(move || server.serve(&job, MAX_RESULT_BYTES));
+    let serving = std::thread::spawn(move || server.serve(&job, MAX_RESULT_BYTES, this_pid()));
     let code = run_main_with(&name, &|_| Ok(env.ctx()));
     let reply = serving.join().unwrap().unwrap();
     (code, serde_json::from_slice(&reply).unwrap())
@@ -733,7 +752,7 @@ fn a_context_that_cannot_be_built_refuses_every_item_with_its_reason() {
     let job = serde_json::to_vec(&ElevatedJob { user_sid: SID.into(), window_pid: std::process::id(), items }).unwrap();
     let name = pipe::new_name();
     let server = pipe::Server::create(&name).unwrap();
-    let serving = std::thread::spawn(move || server.serve(&job, MAX_RESULT_BYTES));
+    let serving = std::thread::spawn(move || server.serve(&job, MAX_RESULT_BYTES, this_pid()));
     let code = run_main_with(&name, &|_| Err("Windows can't name its folders.".into()));
     let reply: ElevatedResult = serde_json::from_slice(&serving.join().unwrap().unwrap()).unwrap();
     assert_eq!(code, EXIT_REFUSED);
@@ -803,7 +822,7 @@ fn a_stop_reported_by_the_elevated_side_reaches_the_answer() {
 struct FailingLauncher(LaunchError);
 
 impl Launcher for FailingLauncher {
-    fn launch_and_wait(&self, _name: &str) -> Result<u32, LaunchError> {
+    fn launch_and_wait(&self, _name: &str, _started: &dyn Fn(u32)) -> Result<u32, LaunchError> {
         Err(self.0.clone())
     }
 }
@@ -846,14 +865,26 @@ fn every_run_uses_its_own_pipe_and_makes_one_launch() {
 #[test]
 fn the_job_elevator_makes_one_launch_for_a_whole_batch() {
     let calls = Arc::new(Mutex::new(0u32));
-    let c = calls.clone();
-    let e = JobElevator { launcher: Arc::new(ClientLauncher(Box::new(move |_| {
-        *c.lock().unwrap() += 1;
-        1
-    }))) };
+    let seen_job = Arc::new(Mutex::new(None::<ElevatedJob>));
+    let (c, j) = (calls.clone(), seen_job.clone());
+    let e = JobElevator {
+        launcher: Arc::new(ClientLauncher(Box::new(move |name| {
+            *c.lock().unwrap() += 1;
+            // Act as the elevated copy: take the job off the pipe and answer with nothing.
+            let client = pipe::Client::connect(name).unwrap();
+            let bytes = client.read_job(MAX_JOB_BYTES, Duration::from_secs(5)).unwrap();
+            *j.lock().unwrap() = Some(serde_json::from_slice(&bytes).unwrap());
+            client.reply_within(b"", MAX_RESULT_BYTES, Duration::from_secs(5)).unwrap();
+            1
+        }))),
+    };
     let out = e.run(&sent(3)).unwrap();
     assert_eq!(*calls.lock().unwrap(), 1);
     assert_eq!(out.items.len(), 3);
+    let job = seen_job.lock().unwrap().clone().expect("the job reached the pipe");
+    assert_eq!(job.window_pid, std::process::id());
+    assert_eq!(job.user_sid, current_user_sid().unwrap());
+    assert_eq!(job.items, sent(3));
 }
 
 #[test]
@@ -863,3 +894,162 @@ fn the_pipe_cannot_be_made_twice() {
     assert!(pipe::Server::create(&name).is_err(), "FILE_FLAG_FIRST_PIPE_INSTANCE: no squatting before the window");
 }
 
+
+// ---- N1: the pipe is locked down and every wait is bounded ---------------------------------------------
+
+#[test]
+fn the_pipe_grants_the_current_user_and_no_one_else() {
+    let name = pipe::new_name();
+    let server = pipe::Server::create(&name).unwrap();
+    let (sids, count) = server.dacl().unwrap();
+    assert_eq!(count, 1, "one entry in the DACL, for no one but the user");
+    assert_eq!(sids, vec![current_user_sid().unwrap()]);
+    // Not Everyone (S-1-1-0), not Anonymous (S-1-5-7), not Authenticated Users (S-1-5-11).
+    assert!(sids.iter().all(|s| !["S-1-1-0", "S-1-5-7", "S-1-5-11"].contains(&s.as_str())));
+}
+
+#[test]
+fn a_client_from_another_pid_gets_nothing_and_the_server_does_not_hang() {
+    let env = Arc::new(Env::new());
+    let app = env.folder("pf/App");
+    let items = vec![env.item(0, &app, Why::Leftover)];
+    let got_job = Arc::new(Mutex::new(false));
+    let g = got_job.clone();
+    let e2 = env.clone();
+    // The window started another process than the one that connects here.
+    let l = ImpostorLauncher(Box::new(move |name| {
+        let client = pipe::Client::connect(name).unwrap();
+        *g.lock().unwrap() = client.read_job(MAX_JOB_BYTES, Duration::from_secs(5)).is_ok();
+        let _ = e2.ctx();
+        2
+    }));
+    let t = std::time::Instant::now();
+    let out = run_elevated(&items, SID, std::process::id(), &l);
+    assert!(!*got_job.lock().unwrap(), "the job was sent to the wrong process");
+    assert!(t.elapsed() < Duration::from_secs(8), "the server hung: {:?}", t.elapsed());
+    assert!(!is_moved(&out.items[0]) && app.exists());
+}
+
+#[test]
+fn the_serving_thread_ends_after_the_launched_process_exits_with_no_client() {
+    let name = pipe::new_name();
+    let server = pipe::Server::create(&name).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    tx.send(std::process::id()).unwrap();
+    let serving = std::thread::spawn(move || server.serve(b"job", 1024, rx));
+    std::thread::sleep(Duration::from_millis(100)); // it is now waiting for a client that never comes
+    let t = std::time::Instant::now();
+    let ended = pipe::finish(serving, Duration::from_millis(100), Duration::from_secs(5));
+    assert!(ended.is_some(), "the thread was let go instead of ending");
+    assert!(ended.unwrap().is_err());
+    assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+    drop(tx);
+}
+
+#[test]
+fn a_thread_that_cannot_be_stopped_is_let_go_at_the_deadline() {
+    let (hold, release) = std::sync::mpsc::channel::<()>();
+    let stuck = std::thread::spawn(move || {
+        let _ = release.recv();
+    });
+    let t = std::time::Instant::now();
+    assert!(pipe::finish(stuck, Duration::from_millis(50), Duration::from_millis(300)).is_none());
+    assert!(t.elapsed() < Duration::from_secs(2));
+    drop(hold);
+}
+
+#[test]
+fn a_launch_that_never_starts_a_process_does_not_wait_for_a_client() {
+    // Declined: no pid is ever reported; the serving thread ends without waiting for one.
+    let t = std::time::Instant::now();
+    let out = run_elevated(&sent(1), SID, 1, &FailingLauncher(LaunchError::Declined));
+    assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+    assert_eq!(reason(&out.items[0]), DECLINED);
+}
+
+// ---- N2: broad roots ---------------------------------------------------------------------------------------
+
+#[test]
+fn a_poisoned_local_app_data_does_not_make_a_claim_broad_in_trusted_mode() {
+    use crate::claims::{broad_roots_for, ClaimParts, PathClaim};
+    let poisoned = |n: &str| match n {
+        "LOCALAPPDATA" | "APPDATA" | "USERPROFILE" => Some(r"C:\Program Files\Victim".to_string()),
+        _ => None,
+    };
+    let known = |n: &str| match n {
+        "ProgramFiles" => Some(r"C:\Program Files".to_string()),
+        "SystemRoot" => Some(r"C:\Windows".to_string()),
+        _ => None,
+    };
+    let drives = vec![r"C:\".to_string()];
+    let claim = |roots: Vec<String>| {
+        let parts = ClaimParts {
+            broad_roots: roots,
+            paths: vec![PathClaim { path: r"C:\Program Files\Victim".into(), who: "an app".into(), source: "test" }],
+            ..ClaimParts::default()
+        };
+        SystemClaims::from_parts(parts).is_claimed(Path::new(r"C:\Program Files\Victim\Data"))
+    };
+    // Untrusted, the environment decides: the claim is broad and no longer claims what is under it.
+    let loose = broad_roots_for(&drives, false, &poisoned, &known, Some(r"C:\Users".into()));
+    assert!(loose.contains(&r"C:\Program Files\Victim".to_string()));
+    assert_eq!(claim(loose), None);
+    // Trusted: only drive roots, system folders and the users folder.
+    let tight = broad_roots_for(&drives, true, &poisoned, &known, Some(r"C:\Users".into()));
+    assert_eq!(tight, vec![r"C:\".to_string(), r"C:\Windows".to_string(), r"C:\Program Files".to_string(), r"C:\Users".to_string()]);
+    assert!(claim(tight).is_some(), "the claim still claims the folder under it");
+}
+
+// ---- N3: the all-users Start Menu only ---------------------------------------------------------------------
+
+#[test]
+fn a_user_programs_folder_moved_into_program_data_does_not_widen_what_is_accepted() {
+    let env = Env::new();
+    let moved_user_menu = env.p("pd/MovedUserPrograms");
+    let places = env.places.clone().with_start_menus_for_tests(&moved_user_menu.to_string_lossy(), &env.p(r"pd\Microsoft\Windows\Start Menu\Programs").to_string_lossy());
+    let theirs = env.file(r"pd\MovedUserPrograms\Mine.lnk", b"lnk");
+    let common = env.file(r"pd\Microsoft\Windows\Start Menu\Programs\Shared.lnk", b"lnk");
+    let check = |p: &Path| check_item(&env.item(0, p, Why::Uninstall), &places, env.claims.as_ref(), &HashSet::new());
+    assert!(check(&theirs).is_err(), "the user's own Programs folder is not the all-users one, wherever it is");
+    assert_eq!(check(&common), Ok(()));
+    assert!(!places.in_all_users_start_menu(&crate::paths::canon(&theirs)));
+}
+
+// ---- N4: exit 2 ignores the reply except its note -----------------------------------------------------------
+
+#[test]
+fn with_exit_code_2_only_the_note_of_the_reply_counts() {
+    let sent = sent(2);
+    let reply = serde_json::to_vec(&ElevatedResult {
+        items: vec![answer(0, Outcome::Moved { bin_path: "bin".into() }), answer(1, Outcome::Moved { bin_path: "bin".into() })],
+        note: Some("The job is malformed, so nothing was removed.".into()),
+        stopped_early: Some("x".into()),
+    })
+    .unwrap();
+    let out = match_results(&sent, Some(&reply), 2);
+    assert!(out.items.iter().all(|o| reason(o).contains("malformed")), "{out:?}");
+    assert_eq!(out.stopped_early, None);
+    // The same reply with any other exit code is believed item by item.
+    assert!(is_moved(&match_results(&sent, Some(&reply), 0).items[0]));
+}
+
+// ---- N5: the elevated copy never blocks forever on its reply -----------------------------------------------
+
+#[test]
+fn a_reply_to_a_server_that_never_reads_gives_up() {
+    let name = pipe::new_name();
+    let _server = pipe::Server::create(&name).unwrap(); // never connects, never reads
+    let client = pipe::Client::connect(&name).unwrap();
+    let t = std::time::Instant::now();
+    let r = client.reply_within(&vec![7u8; 4 << 20], 8 << 20, Duration::from_millis(300));
+    assert!(r.unwrap_err().contains("did not read"));
+    assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+}
+
+#[test]
+fn a_reply_over_the_cap_is_refused_unsent() {
+    let name = pipe::new_name();
+    let _server = pipe::Server::create(&name).unwrap();
+    let client = pipe::Client::connect(&name).unwrap();
+    assert!(client.reply_within(&[0u8; 11], 10, Duration::from_secs(1)).unwrap_err().contains("too big"));
+}
