@@ -36,6 +36,7 @@
 ;    "current". So ProgramData is read under "all", the user's folder under "current", and the context
 ;    it had before is put back (Tauri's template switches to "current" itself in one branch).
 ;  - Neither folder is touched if $APPDATA comes back empty, so RmDir can't be handed a bare "\Seek".
+;  - A folder that is a junction or symlink (reparse point) is left alone, quietly.
 !macro NSIS_HOOK_POSTUNINSTALL
   ${If} ${Silent}
   ${OrIf} $PassiveMode = 1
@@ -46,20 +47,36 @@
       Push $0
       Push $1
       Push $2
+      Push $3
       StrCpy $0 "$APPDATA" ; what $APPDATA means now, so the context can be put back
       SetShellVarContext current
       StrCpy $1 "$APPDATA" ; this user's Roaming folder
       SetShellVarContext all
       StrCpy $2 "$APPDATA" ; ProgramData
+      ; A folder that is a junction or symlink (reparse point, 0x400) is skipped, so RmDir can't be led
+      ; somewhere else; a missing folder (INVALID_FILE_ATTRIBUTES, -1) has nothing to delete.
       ${If} $2 != ""
-        RmDir /r "$2\Seek"
+        System::Call 'kernel32::GetFileAttributesW(w "$2\Seek") i .r3'
+        ${If} $3 != -1
+          IntOp $3 $3 & 0x400
+          ${If} $3 = 0
+            RmDir /r "$2\Seek"
+          ${EndIf}
+        ${EndIf}
       ${EndIf}
       ${If} $1 != ""
-        RmDir /r "$1\Seek"
+        System::Call 'kernel32::GetFileAttributesW(w "$1\Seek") i .r3'
+        ${If} $3 != -1
+          IntOp $3 $3 & 0x400
+          ${If} $3 = 0
+            RmDir /r "$1\Seek"
+          ${EndIf}
+        ${EndIf}
       ${EndIf}
       ${If} $0 == $1
         SetShellVarContext current
       ${EndIf}
+      Pop $3
       Pop $2
       Pop $1
       Pop $0

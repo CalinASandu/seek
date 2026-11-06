@@ -81,20 +81,18 @@ function Shell() {
   const { devices, status, progress, peers, hub, refresh } = useDevices();
   const remotePc = useMemo(() => remotePcNames(devices, peers), [devices, peers]);
   const { settings, problem: settingsProblem, update } = useSettings();
-  const settingsRef = useRef(settings);
-  settingsRef.current = settings;
   // Both save first and only then change the list the rows are judged by, so a failed save never shows as protected.
+  // Each adds or removes relative to the list when its turn in the save queue comes, so quick choices all survive.
   const protectPath = useCallback(
-    async (path: string): Promise<void> => {
-      const cur = settingsRef.current.protectedPaths;
-      if (!cur.some((p) => p.toLowerCase() === path.toLowerCase())) await update({ protectedPaths: [...cur, path] }, { saveFirst: true });
-    },
+    (path: string): Promise<void> =>
+      update(
+        (s) => (s.protectedPaths.some((p) => p.toLowerCase() === path.toLowerCase()) ? {} : { protectedPaths: [...s.protectedPaths, path] }),
+        { saveFirst: true },
+      ),
     [update],
   );
   const unprotectPath = useCallback(
-    async (entry: string): Promise<void> => {
-      await update({ protectedPaths: settingsRef.current.protectedPaths.filter((p) => p !== entry) }, { saveFirst: true });
-    },
+    (entry: string): Promise<void> => update((s) => ({ protectedPaths: s.protectedPaths.filter((p) => p !== entry) }), { saveFirst: true }),
     [update],
   );
   const scanDeviceIds = useMemo(
@@ -118,10 +116,10 @@ function Shell() {
     };
   }, [api]);
 
-  const notify = useCallback((message: string) => {
+  const notify = useCallback((message: string, ms = 1800) => {
     setToast(message);
     clearTimeout(toastTimer.current);
-    toastTimer.current = setTimeout(() => setToast(null), 1800);
+    toastTimer.current = setTimeout(() => setToast(null), ms);
   }, []);
 
   const onSort = useCallback(

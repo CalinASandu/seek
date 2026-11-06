@@ -9,6 +9,8 @@ export interface MenuItem {
   disabled?: boolean;
   danger?: boolean;
   title?: string;
+  /** Visible small text under the item, e.g. why it is disabled. */
+  note?: ReactNode;
   separatorBefore?: boolean;
   onSelect: () => void;
 }
@@ -104,6 +106,7 @@ export function ContextMenu({ x, y, items, label, onClose }: Props) {
             <span className="menu-label">{item.label}</span>
             {item.shortcut && <kbd className="menu-kbd">{item.shortcut}</kbd>}
           </button>
+          {item.note && <div className="menu-note">{item.note}</div>}
         </div>
       ))}
     </div>,

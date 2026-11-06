@@ -2,6 +2,7 @@ import { createContext, useCallback, useContext, useMemo, useRef, useState, type
 import { FolderOpen, ShieldCheck, ShieldOff } from "lucide-react";
 import { isProtectedPath, normPath } from "../../lib/clean";
 import { ContextMenu, type MenuItem } from "../ContextMenu";
+import { MidPath } from "./parts";
 
 /** What a Cleanup row's menu needs from the app: the saved protected list and the three things it can do. */
 export interface RowActions {
@@ -34,8 +35,13 @@ export function useRowMenu(path: string, label: string) {
   const [at, setAt] = useState<{ x: number; y: number } | null>(null);
   const opener = useRef<HTMLElement | null>(null);
 
-  const open = useCallback((x: number, y: number) => {
-    opener.current = document.activeElement as HTMLElement | null;
+  const open = useCallback((x: number, y: number, row: HTMLElement) => {
+    // After a mouse click nothing in the row may have focus; Escape then returns to the row itself.
+    const at = document.activeElement as HTMLElement | null;
+    if (!at || at === document.body) {
+      if (!row.hasAttribute("tabindex")) row.tabIndex = -1;
+      opener.current = row;
+    } else opener.current = at;
     setAt({ x, y });
   }, []);
   const close = useCallback(() => {
@@ -52,7 +58,7 @@ export function useRowMenu(path: string, label: string) {
       if (!e.currentTarget.contains(e.target as Node)) return;
       e.preventDefault();
       e.stopPropagation();
-      open(e.clientX, e.clientY);
+      open(e.clientX, e.clientY, e.currentTarget);
     },
     onKeyDown: (e: KeyboardEvent<HTMLElement>) => {
       if (!e.currentTarget.contains(e.target as Node)) return;
@@ -60,7 +66,7 @@ export function useRowMenu(path: string, label: string) {
       e.preventDefault();
       e.stopPropagation();
       const r = e.currentTarget.getBoundingClientRect();
-      open(r.left + 24, r.bottom - 8);
+      open(r.left + 24, r.bottom - 8, e.currentTarget);
     },
   };
 
@@ -71,7 +77,7 @@ export function useRowMenu(path: string, label: string) {
       exact !== undefined
         ? { id: "protect", label: "Stop protecting", icon: <ShieldOff size={14} />, onSelect: () => void a.unprotect(exact) }
         : inherited !== undefined
-          ? { id: "protect", label: "Stop protecting", icon: <ShieldOff size={14} />, disabled: true, title: `Protected through ${inherited}. Stop protecting that instead.`, onSelect: () => undefined }
+          ? { id: "protect", label: "Stop protecting", icon: <ShieldOff size={14} />, disabled: true, title: `Protected through ${inherited}. Stop protecting that folder instead.`, note: <><div>Protected through <MidPath path={inherited} />.</div><div>Stop protecting that folder instead.</div></>, onSelect: () => undefined }
           : { id: "protect", label: "Always protect", icon: <ShieldCheck size={14} />, onSelect: () => void a.protect(path) },
       { id: "reveal", label: "Reveal in Explorer", icon: <FolderOpen size={14} />, onSelect: () => void a.reveal(path) },
     ],

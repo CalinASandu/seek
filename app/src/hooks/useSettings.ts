@@ -40,33 +40,41 @@ export function useSettings() {
     else root.setAttribute("data-theme", settings.theme);
   }, [settings.theme]);
 
+  /** One save at a time, in the order asked; a failed one never blocks the next. */
+  const queue = useRef<Promise<unknown>>(Promise.resolve());
+
   /**
    * Applies a change at once and saves it. If it can't be saved the change is taken back and this rejects.
    * With `saveFirst` nothing changes on screen until the save went through: for the protected list, where a
    * row must never show as protected when the file doesn't say so.
+   * Changes run one after another, each worked out from the settings as they are when its turn comes
+   * (pass a function to add or remove something relative to them), so two quick changes never overwrite each other.
    */
   const update = useCallback(
-    async (patch: Partial<Settings>, opts?: { saveFirst?: boolean }): Promise<void> => {
-      if (!loaded.current) throw new Error("Your settings haven't loaded yet, so nothing was saved.");
-      const prev = latest.current;
-      const next = { ...prev, ...patch };
-      if (opts?.saveFirst) {
-        await api.setSettings(next);
+    (patch: Partial<Settings> | ((s: Settings) => Partial<Settings>), opts?: { saveFirst?: boolean }): Promise<void> => {
+      const run = async (): Promise<void> => {
+        if (!loaded.current) throw new Error("Your settings haven't loaded yet, so nothing was saved.");
+        const prev = latest.current;
+        const next = { ...prev, ...(typeof patch === "function" ? patch(prev) : patch) };
+        if (opts?.saveFirst) {
+          await api.setSettings(next);
+          latest.current = next;
+          setLocal(next);
+          return;
+        }
         latest.current = next;
         setLocal(next);
-        return;
-      }
-      latest.current = next;
-      setLocal(next);
-      try {
-        await api.setSettings(next);
-      } catch (e) {
-        if (latest.current === next) {
+        try {
+          await api.setSettings(next);
+        } catch (e) {
           latest.current = prev;
           setLocal(prev);
+          throw e;
         }
-        throw e;
-      }
+      };
+      const done = queue.current.then(run);
+      queue.current = done.catch(() => undefined);
+      return done;
     },
     [api],
   );

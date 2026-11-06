@@ -660,6 +660,11 @@ describe("Always protect and Reveal from the row menu", () => {
     const item = screen.getByRole("menuitem", { name: "Stop protecting" });
     expect(item).toBeDisabled();
     expect(item).toHaveAttribute("title", expect.stringContaining("C:\\Users\\Calin\\Downloads"));
+    // the reason is visible text under the item, not only a tooltip
+    const note = item.parentElement!.querySelector(".menu-note")!;
+    expect(note).toHaveTextContent("Protected through");
+    expect(note).toHaveTextContent("C:\\Users\\Calin\\Downloads");
+    expect(note).toHaveTextContent("Stop protecting that folder instead.");
     expect(screen.getByRole("menuitem", { name: "Reveal in Explorer" })).toBeEnabled();
   });
 
@@ -677,6 +682,9 @@ describe("Always protect and Reveal from the row menu", () => {
     fail(new Error("disk is full"));
     expect(await screen.findByText(/"Always protect" could not be saved\. disk is full/)).toBeInTheDocument();
     expect(setSettings).toHaveBeenCalled();
+    // an error stays longer than the 1.8 s of an ordinary message
+    await new Promise((r) => setTimeout(r, 2200));
+    expect(screen.getByText(/could not be saved\. disk is full/)).toBeInTheDocument();
     const row = rowOf("Battle.net Launcher");
     expect(row).not.toHaveTextContent("Protected");
     expect(within(row).getByRole("checkbox")).toBeInTheDocument();
@@ -706,6 +714,44 @@ describe("Always protect and Reveal from the row menu", () => {
     box.focus();
     await user.keyboard("{ContextMenu}");
     expect(screen.getByRole("menu", { name: "Copy actions" })).toBeInTheDocument();
+  });
+
+  it("after a mouse right-click, Escape puts focus back on the row", async () => {
+    const user = await openClean();
+    await toLeftovers(user);
+    const li = rowOf("Battle.net Launcher");
+    await rightClick(user, li);
+    expect(screen.getByRole("menu")).toBeInTheDocument();
+    await user.keyboard("{Escape}");
+    expect(screen.queryByRole("menu")).toBeNull();
+    expect(li).toHaveFocus();
+  });
+
+  it("two rows protected before the first save finishes both end up protected, in the file and on screen", async () => {
+    const base = makeApi();
+    const gates: Array<() => void> = [];
+    const setSettings = vi.fn(
+      (s: Parameters<SeekApi["setSettings"]>[0]) =>
+        new Promise<void>((resolve) => gates.push(resolve)).then(() => base.setSettings(s)),
+    );
+    const user = await openClean({ ...base, setSettings });
+    await toLeftovers(user);
+    const VPN = "OldVPNClient";
+    await rightClick(user, rowOf("Battle.net Launcher"));
+    await user.click(screen.getByRole("menuitem", { name: "Always protect" }));
+    await rightClick(user, rowOf(VPN));
+    await user.click(screen.getByRole("menuitem", { name: "Always protect" }));
+    await waitFor(() => expect(gates).toHaveLength(1));
+    gates[0]!();
+    await waitFor(() => expect(gates).toHaveLength(2)); // the second save starts after the first
+    gates[1]!();
+    await waitFor(() => expect(rowOf(VPN)).toHaveTextContent("Protected"));
+    expect(rowOf("Battle.net Launcher")).toHaveTextContent("Protected");
+    const saved = setSettings.mock.calls.at(-1)![0].protectedPaths;
+    expect(saved).toHaveLength(2);
+    expect(saved).toContain(PF);
+    expect(saved.some((p) => p.endsWith("\\" + VPN))).toBe(true);
+    expect((await base.getSettings()).protectedPaths).toEqual(saved);
   });
 
   it("Reveal in Explorer uses revealPath with the row's path", async () => {
