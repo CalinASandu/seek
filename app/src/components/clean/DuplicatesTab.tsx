@@ -8,6 +8,7 @@ import { formatInt, formatModified, formatSize, pluralize } from "../../lib/form
 import { useStore } from "../../lib/store";
 import { Collapse, LockNote, MidName, MidPath, Placeholder, SelBar, SkeletonRows, Tick } from "./parts";
 import type { SheetSpec } from "./CleanView";
+import { useRowMenu } from "./rowMenu";
 
 const FIRST_COPIES = 40;
 const NO_CONTENTS: ReadonlyMap<string, string[]> = new Map();
@@ -184,8 +185,10 @@ const CopyRow = memo(function CopyRow({
   group: DupGroup;
 }) {
   const leave = useStore(ctl.leaving, (m) => m.get(copy.path));
+  const { rowProps, menu } = useRowMenu(copy.path, "Copy actions");
   return (
     <li
+      {...rowProps}
       className={`copy${lock ? " is-locked" : ""}${leave !== undefined ? " is-leaving" : ""}`}
       style={leave !== undefined ? ({ "--i": leave } as CSSProperties) : undefined}
       data-key={copy.path}
@@ -211,6 +214,7 @@ const CopyRow = memo(function CopyRow({
         </div>
         {lock && <div className="copy-why">{lockText(lock)}</div>}
       </div>
+      {menu}
     </li>
   );
 });

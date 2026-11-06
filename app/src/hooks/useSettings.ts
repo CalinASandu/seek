@@ -40,12 +40,22 @@ export function useSettings() {
     else root.setAttribute("data-theme", settings.theme);
   }, [settings.theme]);
 
-  /** Applies a change at once and saves it. If it can't be saved the change is taken back and this rejects. */
+  /**
+   * Applies a change at once and saves it. If it can't be saved the change is taken back and this rejects.
+   * With `saveFirst` nothing changes on screen until the save went through: for the protected list, where a
+   * row must never show as protected when the file doesn't say so.
+   */
   const update = useCallback(
-    async (patch: Partial<Settings>): Promise<void> => {
+    async (patch: Partial<Settings>, opts?: { saveFirst?: boolean }): Promise<void> => {
       if (!loaded.current) throw new Error("Your settings haven't loaded yet, so nothing was saved.");
       const prev = latest.current;
       const next = { ...prev, ...patch };
+      if (opts?.saveFirst) {
+        await api.setSettings(next);
+        latest.current = next;
+        setLocal(next);
+        return;
+      }
       latest.current = next;
       setLocal(next);
       try {

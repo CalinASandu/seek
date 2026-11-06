@@ -83,11 +83,17 @@ function Shell() {
   const { settings, problem: settingsProblem, update } = useSettings();
   const settingsRef = useRef(settings);
   settingsRef.current = settings;
+  // Both save first and only then change the list the rows are judged by, so a failed save never shows as protected.
   const protectPath = useCallback(
     async (path: string): Promise<void> => {
       const cur = settingsRef.current.protectedPaths;
-      // rejects when it can't be saved: the review sheet says so and keeps the row
-      if (!cur.some((p) => p.toLowerCase() === path.toLowerCase())) await update({ protectedPaths: [...cur, path] });
+      if (!cur.some((p) => p.toLowerCase() === path.toLowerCase())) await update({ protectedPaths: [...cur, path] }, { saveFirst: true });
+    },
+    [update],
+  );
+  const unprotectPath = useCallback(
+    async (entry: string): Promise<void> => {
+      await update({ protectedPaths: settingsRef.current.protectedPaths.filter((p) => p !== entry) }, { saveFirst: true });
     },
     [update],
   );
@@ -253,6 +259,7 @@ function Shell() {
           scanDeviceIds={scanDeviceIds}
           protectedPaths={settings.protectedPaths}
           onProtect={protectPath}
+          onUnprotect={unprotectPath}
           notify={notify}
         />
       )}

@@ -232,7 +232,7 @@ export function SettingsPanel({ settings, version, peers, hub, problem, onChange
                 ))}
               </ul>
             ) : (
-              <p className="setting-desc">Nothing is protected yet. In a Cleanup review, choose Always protect on anything you want kept.</p>
+              <p className="setting-desc">Nothing is protected yet. In Cleanup, right-click a row or a review item and choose Always protect on anything you want kept.</p>
             )}
           </section>
         </div>

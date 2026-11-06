@@ -12,6 +12,7 @@ import { DuplicatesTab } from "./DuplicatesTab";
 import { LeftoversTab } from "./LeftoversTab";
 import { MidPath } from "./parts";
 import { RemovedSheet } from "./RemovedSheet";
+import { RowActionsProvider, type RowActions } from "./rowMenu";
 import { ReviewSheet } from "./ReviewSheet";
 import { UninstallSheet } from "./UninstallSheet";
 
@@ -42,10 +43,12 @@ interface Props {
   scanDeviceIds: string[];
   protectedPaths: string[];
   onProtect: (path: string) => Promise<void>;
+  /** Takes one entry off the protected list (the entry itself, not a path inside it). */
+  onUnprotect: (entry: string) => Promise<void>;
   notify: (message: string) => void;
 }
 
-export const CleanView = memo(function CleanView({ active, deviceId, deviceName, scanDeviceIds, protectedPaths, onProtect, notify }: Props) {
+export const CleanView = memo(function CleanView({ active, deviceId, deviceName, scanDeviceIds, protectedPaths, onProtect, onUnprotect, notify }: Props) {
   const api = useApi();
   const ctl = useCleanup(api, active);
   const [tab, setTab] = useState<CleanTab>("duplicates");
@@ -90,59 +93,72 @@ export const CleanView = memo(function CleanView({ active, deviceId, deviceName,
     done?.after?.(moved);
   };
 
+  // The row menus: a save that fails is said out loud and the row is not shown as protected.
+  const rowActions = useMemo<RowActions>(() => {
+    const say = (what: string) => (e: unknown) => notify(`${what} ${e instanceof Error ? e.message : String(e)}`);
+    return {
+      protectedPaths,
+      protect: (path) => onProtect(path).catch(say('"Always protect" could not be saved.')),
+      unprotect: (entry) => onUnprotect(entry).catch(say("The protected list could not be saved.")),
+      reveal: (path) => api.revealPath(path).catch(say("Explorer could not show it.")),
+    };
+  }, [api, notify, onProtect, onUnprotect, protectedPaths]);
+
   const scan = () => ctl.scanStart(deviceId ? [deviceId] : scanDeviceIds);
 
   return (
-    <main className="main clean" hidden={!active}>
-      <header className="clean-head">
-        <div className="clean-top" ref={top}>
-          <Segmented items={TABS} value={tab} onChange={setTab} label="Cleanup" kind="tab" />
-          <button className="clean-recent" onClick={() => setRemovedOpen(true)}>
-            <History size={14} aria-hidden="true" />
-            Recently removed
-          </button>
-        </div>
-        {tab === "duplicates" && <DuplicatesHead ctl={ctl} deviceId={deviceId} deviceName={deviceName} onScan={scan} />}
-        {tab === "leftovers" && <LeftoversHead ctl={ctl} onScan={() => ctl.loadLeftovers()} />}
-        {tab === "apps" && <AppsHead ctl={ctl} onScan={() => ctl.loadApps()} />}
-      </header>
-
-      <div className="clean-body" ref={body}>
-        <div className="clean-panel" hidden={tab !== "duplicates"}>
-          <DuplicatesTab ctl={ctl} deviceId={deviceId} deviceName={deviceName} onReview={openSheet} />
-        </div>
-        {seen.leftovers && (
-          <div className="clean-panel" hidden={tab !== "leftovers"}>
-            <LeftoversTab ctl={ctl} onReview={openSheet} />
+    <RowActionsProvider value={rowActions}>
+      <main className="main clean" hidden={!active}>
+        <header className="clean-head">
+          <div className="clean-top" ref={top}>
+            <Segmented items={TABS} value={tab} onChange={setTab} label="Cleanup" kind="tab" />
+            <button className="clean-recent" onClick={() => setRemovedOpen(true)}>
+              <History size={14} aria-hidden="true" />
+              Recently removed
+            </button>
           </div>
-        )}
-        {seen.apps && (
-          <div className="clean-panel" hidden={tab !== "apps"}>
-            <AppsTab ctl={ctl} onUninstall={setUninstalling} />
-          </div>
-        )}
-      </div>
+          {tab === "duplicates" && <DuplicatesHead ctl={ctl} deviceId={deviceId} deviceName={deviceName} onScan={scan} />}
+          {tab === "leftovers" && <LeftoversHead ctl={ctl} onScan={() => ctl.loadLeftovers()} />}
+          {tab === "apps" && <AppsHead ctl={ctl} onScan={() => ctl.loadApps()} />}
+        </header>
 
-      {uninstalling && (
-        <UninstallSheet
-          app={uninstalling}
-          protectedPaths={protectedPaths}
-          onReview={openSheet}
-          onUninstalled={() => ctl.loadApps()}
-          onClose={() => setUninstalling(null)}
-        />
-      )}
-      {removedOpen && <RemovedSheet onClose={() => setRemovedOpen(false)} notify={notify} />}
-      {sheet && (
-        <ReviewSheet
-          request={sheet.request}
-          picked={sheet.picked}
-          contents={sheet.contents}
-          onProtect={onProtect}
-          onClose={closeSheet}
-        />
-      )}
-    </main>
+        <div className="clean-body" ref={body}>
+          <div className="clean-panel" hidden={tab !== "duplicates"}>
+            <DuplicatesTab ctl={ctl} deviceId={deviceId} deviceName={deviceName} onReview={openSheet} />
+          </div>
+          {seen.leftovers && (
+            <div className="clean-panel" hidden={tab !== "leftovers"}>
+              <LeftoversTab ctl={ctl} onReview={openSheet} />
+            </div>
+          )}
+          {seen.apps && (
+            <div className="clean-panel" hidden={tab !== "apps"}>
+              <AppsTab ctl={ctl} onUninstall={setUninstalling} />
+            </div>
+          )}
+        </div>
+
+        {uninstalling && (
+          <UninstallSheet
+            app={uninstalling}
+            protectedPaths={protectedPaths}
+            onReview={openSheet}
+            onUninstalled={() => ctl.loadApps()}
+            onClose={() => setUninstalling(null)}
+          />
+        )}
+        {removedOpen && <RemovedSheet onClose={() => setRemovedOpen(false)} notify={notify} />}
+        {sheet && (
+          <ReviewSheet
+            request={sheet.request}
+            picked={sheet.picked}
+            contents={sheet.contents}
+            onProtect={onProtect}
+            onClose={closeSheet}
+          />
+        )}
+      </main>
+    </RowActionsProvider>
   );
 });
 
