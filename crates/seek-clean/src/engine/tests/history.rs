@@ -117,3 +117,72 @@ fn admin_items_are_recorded_after_the_prompt_and_what_moved_before_it_is_kept_fi
     let plain = got.iter().find(|e| e.original_path == a.to_string_lossy()).unwrap();
     assert!(admin.time_ms >= plain.time_ms, "each item has its own time, the admin one stamped when the answer came back");
 }
+
+#[test]
+fn only_the_items_the_admin_step_moved_are_marked_needs_admin() {
+    let mut env = Env::new(true);
+    let dir = tempfile::tempdir().unwrap();
+    let hist = Arc::new(History::open(dir.path().join("cleanup-history.json")));
+    env.engine = env.engine.with_history(hist.clone());
+    let a = env.file("users/me/docs/a.bin", b"aa");
+    let b = env.file("users/me/docs/b.bin", b"aa");
+    let admin_folder = env.folder("pf/OldApp");
+    let admin_path = env.p("pf/OldApp");
+    let prep = env.engine.prepare(vec![dups(&[&a, &b]), admin_folder], &[]);
+    env.engine.commit(&prep.token, &[0, 2], &[]).unwrap();
+    let got = hist.list();
+    assert_eq!(got.len(), 2);
+    for e in &got {
+        assert_eq!(e.needs_admin, e.original_path == admin_path.to_string_lossy(), "{}", e.original_path);
+    }
+}
+
+#[test]
+fn a_damaged_history_set_aside_is_a_note_not_an_error() {
+    let mut env = Env::new(false);
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("cleanup-history.json");
+    std::fs::write(&file, b"this is not json").unwrap();
+    env.engine = env.engine.with_history(Arc::new(History::open(&file)));
+    let a = env.file("users/me/docs/a.bin", b"aa");
+    let b = env.file("users/me/docs/b.bin", b"aa");
+    let prep = env.engine.prepare(vec![dups(&[&a, &b])], &[]);
+    let r = env.engine.commit(&prep.token, &[0], &[]).unwrap();
+    assert!(is_moved(&r, 0));
+    assert_eq!(r.history_error, None, "the removal was recorded");
+    assert!(r.history_note.as_deref().unwrap().contains("started again"), "{:?}", r.history_note);
+}
+
+/// An elevator that makes the history unwritable (a newer Seek's file) before it answers.
+struct Spoiling {
+    file: std::path::PathBuf,
+}
+
+impl Elevator for Spoiling {
+    fn run(&self, items: &[JobItem]) -> Result<crate::facts::AdminAnswer, String> {
+        std::fs::write(&self.file, br#"{"version":2,"entries":[]}"#).unwrap();
+        let answered = items
+            .iter()
+            .map(|j| ItemOutcome { id: j.id, path: j.path.clone(), size: j.size, outcome: Outcome::Moved { bin_path: "bin".into() } })
+            .collect();
+        Ok(crate::facts::AdminAnswer { items: answered, stopped_early: None })
+    }
+}
+
+#[test]
+fn a_failed_admin_only_append_is_an_error_and_leaves_the_ordinary_entries_in_the_history() {
+    let mut env = Env::new(true);
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("cleanup-history.json");
+    let hist = Arc::new(History::open(&file));
+    env.engine = env.engine.with_history(hist.clone());
+    env.engine.elevator = Some(Arc::new(Spoiling { file: file.clone() }));
+    let a = env.file("users/me/docs/a.bin", b"aa");
+    let b = env.file("users/me/docs/b.bin", b"aa");
+    let admin_folder = env.folder("pf/OldApp");
+    let prep = env.engine.prepare(vec![dups(&[&a, &b]), admin_folder], &[]);
+    let r = env.engine.commit(&prep.token, &[0, 2], &[]).unwrap();
+    assert!(is_moved(&r, 0) && is_moved(&r, 2));
+    assert!(r.history_error.as_deref().unwrap().contains("weren't recorded"), "{:?}", r.history_error);
+    assert_eq!(r.history_note, None);
+}

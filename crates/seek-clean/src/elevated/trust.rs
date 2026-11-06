@@ -73,22 +73,30 @@ impl TrustedFolders {
     }
 }
 
-/// Replaces `%SystemDrive%` (any case) with `drive` and nothing else. Any other `%` is an error:
-/// a value that needs the environment is not one to trust.
-pub fn expand_system_drive(raw: &str, drive: &str) -> Result<String, String> {
-    let lower = raw.to_ascii_lowercase();
+/// Expands the `%Name%` variables of a registry value (a `REG_EXPAND_SZ`) from `known`, pairs of a
+/// name (compared without case) and its trusted value, and from nothing else. Any other variable,
+/// an empty `%%` or an unfinished `%` is an error: a value that needs the environment is not one
+/// to trust. A value without variables comes back as it is.
+pub fn expand_trusted(raw: &str, known: &[(&str, &str)]) -> Result<String, String> {
+    let refuse = || format!("{raw} needs the environment to be read");
     let mut out = String::new();
-    let mut at = 0;
-    while let Some(i) = lower[at..].find("%systemdrive%") {
-        out.push_str(&raw[at..at + i]);
-        out.push_str(drive);
-        at += i + "%systemdrive%".len();
+    let mut rest = raw;
+    while let Some(start) = rest.find('%') {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 1..];
+        let end = after.find('%').ok_or_else(refuse)?;
+        let name = &after[..end];
+        let value = known.iter().find(|(n, _)| !name.is_empty() && n.eq_ignore_ascii_case(name)).ok_or_else(refuse)?;
+        out.push_str(value.1);
+        rest = &after[end + 1..];
     }
-    out.push_str(&raw[at..]);
-    if out.contains('%') {
-        return Err(format!("{raw} needs the environment to be read"));
-    }
+    out.push_str(rest);
     Ok(out)
+}
+
+/// `expand_trusted` with `%SystemDrive%` alone.
+pub fn expand_system_drive(raw: &str, drive: &str) -> Result<String, String> {
+    expand_trusted(raw, &[("SystemDrive", drive)])
 }
 
 /// Works out the trusted folders from what Windows and HKLM gave. Pure: the readers are passed in.
@@ -103,21 +111,32 @@ pub fn derive(
         return Err("the Windows folder is not on a drive letter".into());
     }
     let system_drive = windows_dir[..2].to_string();
-    let profile = |name: &str| profile_list(name).map(|v| expand_system_drive(&v, &system_drive)).transpose();
-    let version = |name: &str| current_version(name).filter(|v| !v.is_empty());
+    // What a `REG_EXPAND_SZ` value may use: the drive and the Windows folder, then each Program Files
+    // folder once it has been read. Never the environment.
+    let system = [("SystemDrive", system_drive.as_str()), ("SystemRoot", windows_dir)];
+    let profile = |name: &str| profile_list(name).map(|v| expand_trusted(&v, &system)).transpose();
     let need = |what: &str, v: Option<String>| v.filter(|v| !v.is_empty()).ok_or_else(|| format!("{what} could not be read"));
-    let program_files = need("Program Files", version("ProgramFilesDir"))?;
+
+    let version = |name: &str, known: &[(&str, &str)]| current_version(name).map(|v| expand_trusted(&v, known)).transpose();
+    let present = |v: Option<String>| v.filter(|v| !v.is_empty());
+    let program_files = need("Program Files", version("ProgramFilesDir", &system)?)?;
+    let program_files_x86 = present(version("ProgramFilesDir (x86)", &system)?);
+    let mut known = system.to_vec();
+    known.push(("ProgramFiles", program_files.as_str()));
+    if let Some(x86) = program_files_x86.as_deref() {
+        known.push(("ProgramFiles(x86)", x86));
+    }
     Ok(TrustedFolders {
         windows_dir: windows_dir.to_string(),
         program_data: need("ProgramData", profile("ProgramData")?)?,
         profiles_dir: need("the profiles folder", profile("ProfilesDirectory")?)?,
         public: profile("Public")?,
-        program_w6432: version("ProgramW6432Dir").unwrap_or_else(|| program_files.clone()),
+        program_w6432: present(version("ProgramW6432Dir", &known)?).unwrap_or_else(|| program_files.clone()),
+        common_files: present(version("CommonFilesDir", &known)?),
+        common_files_x86: present(version("CommonFilesDir (x86)", &known)?),
+        common_w6432: present(version("CommonW6432Dir", &known)?),
+        program_files_x86,
         program_files,
-        program_files_x86: version("ProgramFilesDir (x86)"),
-        common_files: version("CommonFilesDir"),
-        common_files_x86: version("CommonFilesDir (x86)"),
-        common_w6432: version("CommonW6432Dir"),
         system_drive,
     })
 }

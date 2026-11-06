@@ -96,6 +96,10 @@ export function RemovedSheet({ onClose, notify }: { onClose: () => void; notify:
                         </span>
                       )}
                     </>
+                  ) : e.needsAdmin ? (
+                    <span className="removed-left" title="Needs admin: restore it from the Recycle Bin.">
+                      Needs admin: restore it from the Recycle Bin.
+                    </span>
                   ) : done ? (
                     <span className="removed-left" title={done.reason ?? undefined}>
                       {done.reason}

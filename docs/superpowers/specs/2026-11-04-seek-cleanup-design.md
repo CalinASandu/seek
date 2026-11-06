@@ -168,6 +168,7 @@ This can't be exact. Portable tools have folders in AppData with no uninstall en
 | Many files | -2 | Both |
 | The publisher still has an app installed | -4 | Both |
 | Changed in the last 30 days | -3 | Both |
+| Outside the usual program folders (not under Program Files, Program Files (x86), ProgramData or the user's AppData) | -3 | Both (added in final review) |
 
 Names of 4 letters or fewer never count as a match. That rule and the "similar name" penalty come from BCU, which guards against `AppX Extended` being matched as junk from `AppX`.
 
@@ -177,6 +178,8 @@ Names of 4 letters or fewer never count as a match. That rule and the "similar n
 | 2 to 4 | Likely left over | 3 of 4 |
 | 0 to 1 | Not sure | 2 of 4 |
 | Below 0 | Probably still in use | 1 of 4 |
+
+A row outside the usual program folders is never shown as Very likely (added in final review).
 
 - Rows are sorted by confidence. "Probably still in use" starts collapsed under its own heading.
 - The level is always written out, never colour alone. Hovering the meter, or expanding the row, lists the reasons in plain sentences with their direction, for example "Contains programs" or "Nothing inside changed for a year".

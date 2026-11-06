@@ -31,6 +31,8 @@ const RENAME_RETRY: Duration = Duration::from_millis(50);
 const NO_APPDATA: &str = "Windows didn't say where Recently removed is kept (no APPDATA folder).";
 const NEWER_WRITE: &str = "Recently removed was written by a newer Seek, so this one won't change it.";
 const NEWER_READ: &str = "Recently removed was written by a newer Seek, so this one can't show it.";
+const NEEDS_ADMIN: &str = "Needs admin: restore it from the Recycle Bin.";
+const BACK_IN_FOLDER: &str = "It's back in its folder.";
 const DAMAGED: &str = "Recently removed is damaged and can't be read. It is set aside and started again the next time Seek removes something.";
 
 /// One removal, or one item that was asked for and left in place.
@@ -52,6 +54,10 @@ pub struct Entry {
     /// When it was put back, if it was.
     #[serde(default)]
     pub put_back_ms: Option<i64>,
+    /// The admin step moved it. The restore verb can't be trusted to do that without a Windows
+    /// prompt, so Put back refuses it and points at the Recycle Bin.
+    #[serde(default)]
+    pub needs_admin: bool,
 }
 
 /// What putting one entry back came to.
@@ -75,6 +81,13 @@ pub trait BinRestore {
     /// lists is "No longer in the Recycle Bin."; a bin that can't be listed says so.
     fn restore(&self, bin_path: &str, original: &Path, deleted_near_ms: i64) -> Result<(), String>;
 
+    /// For each bin path, whether the bin still lists it, from one listing of the bin. Asked only
+    /// for entries whose original path is taken: an item the bin no longer lists is back in its
+    /// folder. The default says "listed", which keeps the refusal.
+    fn listed(&self, bin_paths: &[String]) -> Result<Vec<bool>, String> {
+        Ok(vec![true; bin_paths.len()])
+    }
+
     /// A batch, one answer per job in order. The real one lists the bin once for all of them.
     fn restore_all(&self, jobs: &[RestoreJob]) -> Vec<Result<(), String>> {
         jobs.iter().map(|(b, o, t)| self.restore(b, o, *t)).collect()
@@ -93,6 +106,9 @@ impl BinRestore for ShellBin {
     }
     fn restore_all(&self, jobs: &[RestoreJob]) -> Vec<Result<(), String>> {
         crate::recycle::restore_many(jobs, self.owner)
+    }
+    fn listed(&self, bin_paths: &[String]) -> Result<Vec<bool>, String> {
+        crate::recycle::bin_lists(bin_paths)
     }
 }
 
@@ -309,6 +325,21 @@ fn store(path: &Path, entries: &[Entry]) -> Result<(), String> {
     write().map_err(|e| failed(plain_io(&e)))
 }
 
+/// An error as the user reads it: without the raw code Windows ends its messages with
+/// (`... is not ready. (0x80070015)` becomes `... is not ready.`). Text that doesn't end that way is as it was.
+pub fn plain_hresult(text: &str) -> String {
+    let trimmed = text.trim_end();
+    if let Some(open) = trimmed.rfind(" (0x") {
+        let code = &trimmed[open + 4..];
+        if let Some(hex) = code.strip_suffix(')') {
+            if hex.len() == 8 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return trimmed[..open].to_string();
+            }
+        }
+    }
+    text.to_string()
+}
+
 fn is_denied(text: &str) -> bool {
     let t = text.to_lowercase();
     ["access is denied", "0x80070005", "requires elevation", "0x800702e4"].iter().any(|m| t.contains(m))
@@ -318,35 +349,60 @@ fn refuse(entry: &Entry, reason: String) -> PutBackResult {
     PutBackResult { id: entry.id.clone(), restored: false, reason: Some(reason) }
 }
 
-/// What can be said about an entry without asking the bin: `Ok` with what to restore, or the refusal.
-fn ready(entry: &Entry) -> Result<RestoreJob, PutBackResult> {
+/// What can be said about an entry without asking the bin.
+enum Ready {
+    /// What to restore.
+    Go(RestoreJob),
+    /// The answer already.
+    Refused(PutBackResult),
+    /// Something is at the original path. If the entry's bin item is gone too, it is back in its
+    /// folder (a put back that finished after its deadline); otherwise it is something new.
+    Taken(String),
+}
+
+fn ready(entry: &Entry) -> Ready {
     let Some(bin_path) = entry.bin_path.as_deref() else {
-        return Err(refuse(entry, "It was never moved.".into()));
+        return Ready::Refused(refuse(entry, "It was never moved.".into()));
     };
     if entry.put_back_ms.is_some() {
-        return Err(refuse(entry, "Already put back.".into()));
+        return Ready::Refused(refuse(entry, "Already put back.".into()));
+    }
+    if entry.needs_admin {
+        return Ready::Refused(refuse(entry, NEEDS_ADMIN.into()));
     }
     let original = Path::new(&entry.original_path);
     // Anything at all there, even a broken link: restoring over it could lose it.
     if std::fs::symlink_metadata(original).is_ok() {
-        return Err(refuse(entry, crate::recycle::something_new_at(original)));
+        return Ready::Taken(bin_path.to_string());
     }
-    Ok((bin_path.to_string(), original.to_path_buf(), entry.time_ms))
+    Ready::Go((bin_path.to_string(), original.to_path_buf(), entry.time_ms))
+}
+
+fn something_new(entry: &Entry) -> PutBackResult {
+    refuse(entry, crate::recycle::something_new_at(Path::new(&entry.original_path)))
+}
+
+fn back_in_folder(entry: &Entry) -> PutBackResult {
+    PutBackResult { id: entry.id.clone(), restored: true, reason: Some(BACK_IN_FOLDER.into()) }
 }
 
 fn answer(entry: &Entry, restored: Result<(), String>) -> PutBackResult {
     match restored {
         Ok(()) => PutBackResult { id: entry.id.clone(), restored: true, reason: None },
-        Err(e) if is_denied(&e) => refuse(entry, "Needs admin: restore it from the Recycle Bin.".into()),
-        Err(e) => refuse(entry, e),
+        Err(e) if is_denied(&e) => refuse(entry, NEEDS_ADMIN.into()),
+        Err(e) => refuse(entry, plain_hresult(&e)),
     }
 }
 
 /// Puts one entry back. Never touches the history; the caller records a success.
 pub fn put_back(entry: &Entry, bin: &dyn BinRestore) -> PutBackResult {
     match ready(entry) {
-        Err(refusal) => refusal,
-        Ok((bin_path, original, near)) => answer(entry, bin.restore(&bin_path, &original, near)),
+        Ready::Refused(refusal) => refusal,
+        Ready::Taken(bin_path) => match bin.listed(&[bin_path]) {
+            Ok(listed) if listed == [false] => back_in_folder(entry),
+            _ => something_new(entry),
+        },
+        Ready::Go((bin_path, original, near)) => answer(entry, bin.restore(&bin_path, &original, near)),
     }
 }
 
@@ -358,30 +414,41 @@ pub fn put_back_ids(history: &History, bin: &dyn BinRestore, ids: &[String]) -> 
             return ids.iter().map(|id| PutBackResult { id: id.clone(), restored: false, reason: Some(why.clone()) }).collect();
         }
     };
-    // Per id: the entry and what to restore, or the answer already.
-    type Step<'a> = Result<(&'a Entry, RestoreJob), PutBackResult>;
-    let mut plan: Vec<(String, Step)> = Vec::new();
+    // Per id: the entry (if it is still there) and what to do with it.
+    let mut plan: Vec<(String, Option<&Entry>, Ready)> = Vec::new();
     for id in ids {
-        let step = match entries.iter().find(|e| &e.id == id) {
-            None => Err(PutBackResult { id: id.clone(), restored: false, reason: Some("That entry is no longer in Recently removed.".into()) }),
-            Some(entry) => ready(entry).map(|job| (entry, job)),
-        };
-        plan.push((id.clone(), step));
-    }
-    let jobs: Vec<RestoreJob> = plan.iter().filter_map(|(_, s)| s.as_ref().ok().map(|(_, j)| j.clone())).collect();
-    let mut restored = if jobs.is_empty() { vec![] } else { bin.restore_all(&jobs) }.into_iter();
-    plan.into_iter()
-        .map(|(id, step)| match step {
-            Err(refusal) => refusal,
-            Ok((entry, _)) => {
-                let mut result = answer(entry, restored.next().unwrap_or_else(|| Err("The Recycle Bin gave no answer.".into())));
-                if result.restored {
-                    if let Err(e) = history.mark_put_back(&id, now_ms()) {
-                        result.reason = Some(format!("Recently removed couldn't record it. {e}"));
-                    }
-                }
-                result
+        plan.push(match entries.iter().find(|e| &e.id == id) {
+            None => {
+                let gone = PutBackResult { id: id.clone(), restored: false, reason: Some("That entry is no longer in Recently removed.".into()) };
+                (id.clone(), None, Ready::Refused(gone))
             }
+            Some(entry) => (id.clone(), Some(entry), ready(entry)),
+        });
+    }
+    // Entries whose original path is taken: one listing of the bin settles which are back in their folder.
+    let taken: Vec<String> = plan.iter().filter_map(|(_, _, r)| if let Ready::Taken(b) = r { Some(b.clone()) } else { None }).collect();
+    let mut listed = if taken.is_empty() { vec![].into_iter() } else { bin.listed(&taken).unwrap_or_default().into_iter() };
+    let jobs: Vec<RestoreJob> = plan.iter().filter_map(|(_, _, r)| if let Ready::Go(j) = r { Some(j.clone()) } else { None }).collect();
+    let mut restored = if jobs.is_empty() { vec![] } else { bin.restore_all(&jobs) }.into_iter();
+    let record = |id: &str, mut result: PutBackResult| {
+        if result.restored {
+            if let Err(e) = history.mark_put_back(id, now_ms()) {
+                result.reason = Some(format!("Recently removed couldn't record it. {e}"));
+            }
+        }
+        result
+    };
+    plan.into_iter()
+        .map(|(id, entry, step)| match (entry, step) {
+            (_, Ready::Refused(refusal)) => refusal,
+            (Some(entry), Ready::Taken(_)) => match listed.next() {
+                Some(false) => record(&id, back_in_folder(entry)),
+                _ => something_new(entry),
+            },
+            (Some(entry), Ready::Go(_)) => {
+                record(&id, answer(entry, restored.next().unwrap_or_else(|| Err("The Recycle Bin gave no answer.".into()))))
+            }
+            (None, _) => PutBackResult { id, restored: false, reason: Some("That entry is no longer in Recently removed.".into()) },
         })
         .collect()
 }

@@ -142,12 +142,16 @@ struct Wrap {
     /// The `batch_bytes` each `recycle_block` call was given.
     batches: Mutex<Vec<u64>>,
     same_bytes_fails: AtomicBool,
+    /// `stat` says these folders have something inside it can't read.
+    unreadable: Mutex<HashSet<PathBuf>>,
     after_compare: Mutex<Option<Box<dyn Fn() + Send>>>,
 }
 
 impl FileFacts for Wrap {
     fn stat(&self, p: &Path) -> Option<Stat> {
-        RealFacts.stat(p)
+        let mut s = RealFacts.stat(p)?;
+        s.unreadable = self.unreadable.lock().unwrap().contains(p);
+        Some(s)
     }
     fn same_bytes(&self, a: &Path, b: &Path) -> Result<bool, String> {
         if self.same_bytes_fails.load(Ordering::SeqCst) {
@@ -1140,6 +1144,82 @@ fn a_stale_request_outside_seeks_data_folder_is_locked() {
     assert_eq!(locks[0], None);
     assert_eq!(locks[1], None);
     assert_eq!(&locks[2..], &[bad; 5], "{locks:?}");
+}
+
+/// Spellings Win32 reads differently from `canon`: a named stream and `.`/`..` segments.
+fn odd_spellings(env: &Env) -> Vec<(PathBuf, bool)> {
+    let folder = env.p("left/foo");
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(folder.join("data.bin"), b"x").unwrap();
+    let file = env.file("users/me/docs/a.iso", b"x");
+    let s = |p: &Path, tail: &str| PathBuf::from(format!("{}{tail}", p.display()));
+    vec![
+        (s(&folder, "::$INDEX_ALLOCATION"), true),
+        (s(&file, "::$DATA"), false),
+        (env.p("left").join(".").join("foo"), true),
+        (env.p("left").join("foo").join("..").join("foo"), true),
+    ]
+}
+
+fn odd_candidate(env: &Env, path: &Path, is_dir: bool) -> Candidate {
+    if is_dir {
+        Candidate::Folder { path: path.to_path_buf(), why: Why::Leftover, level: None, reasons: vec![] }
+    } else {
+        Candidate::Duplicates { copies: vec![path.to_path_buf(), env.file("users/me/docs/b.iso", b"x")] }
+    }
+}
+
+#[test]
+fn stream_names_and_dot_segments_are_locked_unsupported_at_prepare() {
+    let env = Env::new(false);
+    for (path, is_dir) in odd_spellings(&env) {
+        let prep = env.engine.prepare(vec![odd_candidate(&env, &path, is_dir)], &[]);
+        assert_eq!(prep.items[0].lock, Some(Lock::UnsupportedPath), "{}", path.display());
+    }
+}
+
+#[test]
+fn stream_names_and_dot_segments_are_refused_at_commit_and_never_recycled() {
+    let env = Env::new(false);
+    for (path, is_dir) in odd_spellings(&env) {
+        let prep = env.engine.prepare(vec![odd_candidate(&env, &path, is_dir)], &[]);
+        let r = env.engine.commit(&prep.token, &[0], &[]).unwrap();
+        assert!(!is_moved(&r, 0), "{}", path.display());
+    }
+    assert!(env.rec.calls().is_empty());
+}
+
+#[test]
+fn judging_refuses_an_odd_spelling_on_its_own() {
+    // The commit-time judge sees only the path it kept: the same refusal has to come from there.
+    let env = Env::new(false);
+    for (path, _) in odd_spellings(&env) {
+        let stat = env.wrap.stat(&path).expect("exists");
+        let (lock, _, _) = env.engine.judge(&path, &canon(&path), Why::Leftover, &stat, &Ctx::new(&[]));
+        assert_eq!(lock, Some(Lock::UnsupportedPath), "{}", path.display());
+    }
+}
+
+#[test]
+fn a_folder_with_something_unreadable_inside_is_locked_unreadable_not_dropped_as_missing() {
+    for admin in [false, true] {
+        let env = Env::new(admin);
+        let readable = env.folder("left/readable");
+        let blocked = env.folder("pf/blocked");
+        let gone = env.folder("left/vanished");
+        env.wrap.unreadable.lock().unwrap().insert(env.p("pf/blocked"));
+        std::fs::remove_dir_all(env.p("left/vanished")).unwrap();
+        let prep = env.engine.prepare(vec![readable, blocked, gone], &[]);
+        // the item that really vanished is still dropped; the unreadable one is listed, locked, with its reason
+        assert_eq!(prep.items.len(), 2, "{:?}", prep.items.iter().map(|i| &i.path).collect::<Vec<_>>());
+        assert_eq!(prep.items[0].lock, None);
+        assert_eq!(prep.items[1].lock, Some(Lock::Unreadable));
+        let r = env.engine.commit(&prep.token, &[0, 1], &[]).unwrap();
+        assert!(is_moved(&r, 0));
+        assert!(!is_moved(&r, 1));
+        assert_eq!(left(&r, 1), crate::reasons::lock_reason(Lock::Unreadable));
+        assert!(env.p("pf/blocked").exists());
+    }
 }
 
 mod uninstall;

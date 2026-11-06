@@ -81,6 +81,9 @@ export function ReviewSheet({ request, picked, contents, onProtect, onClose }: P
   const [result, setResult] = useState<CommitResult | null>(null);
   const [putBack, setPutBack] = useState<{ busy: boolean; done: number; failed: string[]; notes: string[] } | null>(null);
   const [binProblem, setBinProblem] = useState<string | null>(null);
+  // When Recently removed could not record everything: how many of this batch's moved items it does hold
+  // (null while that is being looked up). Put back is offered when any are there.
+  const [recorded, setRecorded] = useState<number | null>(null);
   const [restored, setRestored] = useState<ReadonlySet<string>>(new Set());
   const root = useRef<HTMLDivElement>(null);
   const listRef = useRef<HTMLDivElement | null>(null);
@@ -205,6 +208,22 @@ export function ReviewSheet({ request, picked, contents, onProtect, onClose }: P
     onClose(movedPaths.filter((p) => !restored.has(p)), result !== null);
   };
 
+  useEffect(() => {
+    if (phase !== "done" || !result?.historyError) return;
+    let live = true;
+    const bins = new Set(result.items.flatMap((i) => (i.outcome.kind === "moved" ? [i.outcome.binPath] : [])));
+    api.cleanHistory().then(
+      (h) => live && setRecorded(h.filter((e) => e.putBackMs === null && e.binPath !== null && bins.has(e.binPath)).length),
+      () => live && setRecorded(0),
+    );
+    return () => {
+      live = false;
+    };
+  }, [api, phase, result]);
+  // Nothing to put back from here only when it is known that none of the moved items are in the history.
+  const lookingUp = !!result?.historyError && recorded === null;
+  const canPutBack = !result?.historyError || (recorded ?? 0) > 0;
+
   // Where the result or an error shows, focus goes to its Done or Close button (Esc still works); Put back never gets it.
   useEffect(() => {
     if (phase === "done" || phase === "failed") {
@@ -285,7 +304,8 @@ export function ReviewSheet({ request, picked, contents, onProtect, onClose }: P
     phase === "done" ? (
       <>
         {movedPaths.length > 0 &&
-          (result?.historyError ? (
+          !lookingUp &&
+          (!canPutBack ? (
             // Nothing was recorded to put back from here: the Recycle Bin is the way.
             <button className="btn" onClick={() => void api.openRecycleBin().catch(() => setBinProblem("Couldn't open the Recycle Bin."))}>
               Open Recycle Bin
@@ -320,7 +340,7 @@ export function ReviewSheet({ request, picked, contents, onProtect, onClose }: P
           <p className="review-note">
             {movedPaths.length > 0
               ? `${plural(movedPaths.length)} ${movedPaths.length === 1 ? "is" : "are"} in the Recycle Bin. ${
-                  result.historyError ? "" : `You can put ${movedPaths.length === 1 ? "it" : "them"} back from there, or here.`
+                  !canPutBack ? "" : `You can put ${movedPaths.length === 1 ? "it" : "them"} back from there, or here.`
                 }`.trim()
               : "Everything was left where it was."}
           </p>
@@ -330,6 +350,7 @@ export function ReviewSheet({ request, picked, contents, onProtect, onClose }: P
               {result.historyError}
             </p>
           )}
+          {result.historyNote && <p className="review-note">{result.historyNote}</p>}
           {binProblem && <p className="review-warn">{binProblem}</p>}
           {putBack && !putBack.busy && (
             <p className="review-note" role="status">

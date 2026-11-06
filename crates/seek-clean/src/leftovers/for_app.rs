@@ -19,7 +19,7 @@ use super::{evidence, kind_of, unix_now_ms, walk, IndexFacts, Kind, Summary};
 use crate::claims::{expand_env, link_targets, target_present, whole_words_match, words, InstalledNames};
 use crate::confidence::{is_publisher_name, name_len, names_are_similar, same_publisher, score, Evidence, MAX_DEPTH};
 use crate::facts::{modified_ms, ClaimCheck};
-use crate::model::{AppRow, FolderSource, LeftoverRow};
+use crate::model::{AppRow, FolderSource, Level, LeftoverRow};
 use crate::paths::{canon, is_inside};
 use crate::protect::{never_listed, uninstall_blocked, Places};
 
@@ -310,9 +310,17 @@ pub(crate) fn for_app_with(
         let Some(s) = summary else { continue };
         let name = hit.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         let mut ev = hit.found.clone();
+        let outside = !places.in_usual_program_folders(&hit.canon);
+        if outside {
+            ev.push(Evidence::OutsideProgramFolders);
+        }
         ev.extend(evidence(&name, &s, hit.modified_ms, now_ms, installed));
         add_publisher_still_installed(&mut ev, app, installed);
-        let (total, level, reasons) = score(&ev);
+        let (total, mut level, reasons) = score(&ev);
+        // A row outside the usual program folders is never shown as Very likely, whatever its total.
+        if outside && level == Level::VeryLikely {
+            level = Level::Likely;
+        }
         scored.push((
             total,
             LeftoverRow {

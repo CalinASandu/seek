@@ -42,6 +42,8 @@ pub enum Lock {
     Claimed,
     /// Inside a folder Windows and other apps share (Microsoft, Common Files...). Never removed by an uninstall.
     SharedFolder,
+    /// A folder with something inside Seek can't read, so what is in it is unknown.
+    Unreadable,
 }
 
 /// How sure Seek is that a leftover folder is dead.
@@ -141,6 +143,10 @@ pub struct CommitResult {
     /// Why Recently removed couldn't record this commit; the items were moved all the same.
     #[serde(default)]
     pub history_error: Option<String>,
+    /// A notice about Recently removed that is not a failure: a damaged file was set aside and a new
+    /// one started. Everything was recorded; Put back is unaffected.
+    #[serde(default)]
+    pub history_note: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -236,6 +242,7 @@ mod tests {
         assert_eq!(serde_json::to_string(&Lock::NoRecycleBin).unwrap(), "\"noRecycleBin\"");
         assert_eq!(serde_json::to_string(&Lock::BinFull).unwrap(), "\"binFull\"");
         assert_eq!(serde_json::to_string(&Lock::SharedFolder).unwrap(), "\"sharedFolder\"");
+        assert_eq!(serde_json::to_string(&Lock::Unreadable).unwrap(), "\"unreadable\"");
         assert_eq!(serde_json::to_string(&Lock::PathTooLong).unwrap(), "\"pathTooLong\"");
         assert_eq!(serde_json::to_string(&Level::ProbablyInUse).unwrap(), "\"probablyInUse\"");
         assert_eq!(serde_json::to_string(&Why::StaleData).unwrap(), "\"staleData\"");

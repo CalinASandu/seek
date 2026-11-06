@@ -157,7 +157,8 @@ export type Lock =
   | "unsupportedPath"
   | "reparsePoint"
   | "claimed"
-  | "sharedFolder";
+  | "sharedFolder"
+  | "unreadable";
 
 /** How sure Seek is that a leftover folder is dead. */
 export type Level = "veryLikely" | "likely" | "notSure" | "probablyInUse";
@@ -274,6 +275,8 @@ export interface CommitResult {
   stoppedEarly: string | null;
   /** Why Recently removed couldn't record this commit (the items were moved all the same). */
   historyError: string | null;
+  /** A plain notice about Recently removed (a damaged file was set aside and started again). Put back still works. */
+  historyNote: string | null;
 }
 
 /** One past removal, or one item that was left in place. */
@@ -289,6 +292,8 @@ export interface HistoryEntry {
   leftReason: string | null;
   /** When it was put back (unix epoch ms); null if it hasn't been. */
   putBackMs: number | null;
+  /** The admin step moved it, so Put back can't do it: it is restored from the Recycle Bin. */
+  needsAdmin: boolean;
 }
 export interface PutBackResult {
   id: string;

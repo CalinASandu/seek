@@ -407,3 +407,32 @@ fn a_shortcut_that_looks_dead_only_by_the_claims_rule_is_not_listed() {
 fn here(target: &str) -> bool {
     crate::claims::target_looks_present(target, &|_| None, &|_| true, &|p| Path::new(p).exists())
 }
+
+#[test]
+fn an_install_folder_in_the_users_documents_is_not_very_likely_left_over() {
+    let w = world();
+    // Where the app says it lives, though it is the user's own folder, outside every program folder.
+    let docs = w.base.join("users").join("me").join("Documents").join("Arduino");
+    put(&docs, "notes.txt", 20);
+    let a = app("Arduino IDE", "Arduino SA", Some(&docs), Some(FolderSource::InstallLocation));
+    let rows = after(&w, &a, &Claims::default(), &unreadable);
+    let row = rows.iter().find(|r| r.path.eq_ignore_ascii_case(&docs.to_string_lossy())).expect("it is still shown, for the user to judge");
+    assert_ne!(row.level, Level::VeryLikely, "{row:?}");
+    assert!(has_reason(row, "Outside the usual program folders"), "{row:?}");
+    // Even with a total of 6 after the -3 (9 before; flat folder, exact name): capped at Likely, the reason still listed.
+    let flat = w.base.join("users").join("me").join("Documents").join("Arduino Flat");
+    put(&flat, "notes.txt", 20);
+    let c = app("Arduino Flat", "Arduino SA", Some(&flat), Some(FolderSource::InstallLocation));
+    let rows = after(&w, &c, &Claims::default(), &unreadable);
+    let row = rows.iter().find(|r| r.path.eq_ignore_ascii_case(&flat.to_string_lossy())).unwrap();
+    assert_eq!(total(row), 6, "{row:?}"); // 9 before the -3, still Very likely by total
+    assert_eq!(row.level, Level::Likely, "{row:?}");
+    assert!(has_reason(row, "Outside the usual program folders"));
+    // A folder in the usual places carries no such reason.
+    let usual = w.pf.join("Acme Editor");
+    put(&usual, "a.txt", 5);
+    let b = app("Acme Editor", "Initech", Some(&usual), Some(FolderSource::InstallLocation));
+    let rows = after(&w, &b, &Claims::default(), &unreadable);
+    let row = rows.iter().find(|r| r.path.eq_ignore_ascii_case(&usual.to_string_lossy())).unwrap();
+    assert!(!has_reason(row, "Outside the usual program folders"), "{row:?}");
+}

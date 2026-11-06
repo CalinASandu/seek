@@ -34,6 +34,7 @@ export function lockText(lock: Lock): string {
     case "reparsePoint": return "A link to somewhere else, so it stays.";
     case "claimed": return "An app or a running program is using it, so it stays.";
     case "sharedFolder": return "Inside a folder Windows and other apps share, so it stays.";
+    case "unreadable": return "Seek can't read everything inside, so it won't remove it.";
   }
 }
 

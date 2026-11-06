@@ -32,6 +32,7 @@ pub(crate) fn lock_reason(l: Lock) -> &'static str {
         Lock::ReparsePoint => "This is a link to somewhere else, so it was left in place.",
         Lock::Claimed => "An app or a running program is using this folder, so it was left in place.",
         Lock::SharedFolder => "Inside a folder Windows and other apps share, so Seek doesn't remove anything in it.",
+        Lock::Unreadable => "Seek can't read everything inside, so it won't remove it.",
     }
 }
 
@@ -58,13 +59,15 @@ mod tests {
             Lock::ReparsePoint,
             Lock::Claimed,
             Lock::SharedFolder,
+            Lock::Unreadable,
         ];
         for l in all {
             match l {
                 Lock::SystemFolder | Lock::ProgramFiles | Lock::OtherUser | Lock::AppData
                 | Lock::ToolFolder | Lock::NoRecycleBin | Lock::BinFull | Lock::PathTooLong
                 | Lock::CloudPlaceholder | Lock::Protected | Lock::LinkedPc
-                | Lock::UnsupportedPath | Lock::ReparsePoint | Lock::Claimed | Lock::SharedFolder => {}
+                | Lock::UnsupportedPath | Lock::ReparsePoint | Lock::Claimed | Lock::SharedFolder
+                | Lock::Unreadable => {}
             }
             assert!(lock_reason(l).len() > 20, "{l:?}");
         }

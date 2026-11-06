@@ -4,6 +4,7 @@
 //! can decide what counts as proof that an item reached the bin.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::facts::Recycler;
@@ -243,7 +244,11 @@ pub fn recycle_one(path: &Path) -> Result<RecycleReport, String> {
 fn is_plain_absolute(path: &Path) -> bool {
     let s = path.to_string_lossy();
     let b = s.as_bytes();
-    b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/')
+    b.len() >= 3
+        && b[0].is_ascii_alphabetic()
+        && b[1] == b':'
+        && (b[2] == b'\\' || b[2] == b'/')
+        && !crate::paths::has_odd_spelling(path)
 }
 
 /// The real recycler: one `IFileOperation` per path, in order.
@@ -443,6 +448,17 @@ pub fn in_bin(bin_path: &str) -> bool {
     on_sta(move || unsafe { find_in_bin(&bin_path).map(|i| i.is_some()) }).unwrap_or(false)
 }
 
+/// For each bin path, whether the Recycle Bin still lists it: one listing for all of them. A bin
+/// that can't be listed is an error, never "not there".
+pub fn bin_lists(bin_paths: &[String]) -> Result<Vec<bool>, String> {
+    let wanted = bin_paths.to_vec();
+    // SAFETY: COM objects stay on the STA thread and drop before CoUninitialize.
+    on_sta(move || unsafe {
+        let listed: std::collections::HashSet<String> = list_bin()?.into_iter().map(|(p, _)| p.to_ascii_lowercase()).collect();
+        Ok(wanted.iter().map(|p| listed.contains(&p.to_ascii_lowercase())).collect())
+    })
+}
+
 /// `System.Recycle.DateDeleted` (fmtid 9B174B33-..., pid 3) of a bin item, in unix epoch ms.
 fn deleted_ms(item2: &IShellItem2) -> Option<i64> {
     let key = PROPERTYKEY {
@@ -486,14 +502,24 @@ pub const PUT_BACK_STUCK: &str = "Windows didn't finish putting it back. Check t
 /// The stuck thread is detached, never joined: the `undelete` verb can block on a name conflict
 /// that appears between Seek's check and the verb (a Replace/Skip prompt that may not be seen), and
 /// a put back must never hang the command because of that.
+///
+/// `work` also gets a cancel flag, set when the deadline passes. It must look at it before starting
+/// each next item, so a stuck thread that wakes up later starts nothing new (see [`restore_each`]).
 fn bounded<F>(n: usize, deadline: std::time::Duration, work: F) -> Vec<Result<(), String>>
 where
-    F: FnOnce(&mut dyn FnMut(usize, Result<(), String>)) + Send + 'static,
+    F: FnOnce(&mut dyn FnMut(usize, Result<(), String>), &AtomicBool) + Send + 'static,
 {
     let (tx, rx) = std::sync::mpsc::channel::<(usize, Result<(), String>)>();
-    std::thread::spawn(move || work(&mut |i, r| {
-        let _ = tx.send((i, r));
-    }));
+    let cancel = Arc::new(AtomicBool::new(false));
+    let thread_cancel = cancel.clone();
+    std::thread::spawn(move || {
+        work(
+            &mut |i, r| {
+                let _ = tx.send((i, r));
+            },
+            &thread_cancel,
+        )
+    });
     let mut out: Vec<Option<Result<(), String>>> = vec![None; n];
     let mut got = 0;
     let mut ended = PUT_BACK_STUCK;
@@ -505,7 +531,10 @@ where
                     got += 1;
                 }
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                cancel.store(true, Ordering::SeqCst);
+                break;
+            }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 ended = "Windows stopped while putting it back. Check the Recycle Bin and the original folder.";
                 break;
@@ -536,9 +565,61 @@ pub fn restore_many(jobs: &[(String, PathBuf, i64)], owner: isize) -> Vec<Result
     restore_many_checked(&jobs, owner, PUT_BACK_DEADLINE)
 }
 
-fn restore_many_checked(jobs: &[(String, PathBuf, Option<i64>)], owner: isize, deadline: std::time::Duration) -> Vec<Result<(), String>> {
+/// One item to restore: bin path, original path, and the time the removal was recorded (if checked).
+type Job = (String, PathBuf, Option<i64>);
+
+pub const STILL_WAITING: &str = "Still waiting for Windows on this one. Check the Recycle Bin.";
+
+/// Bin paths (lowercase) whose `undelete` verb is running right now, in any put back of this
+/// process. A verb that outlives its deadline stays here until it returns, so asking again for the
+/// same item never starts a second verb on it.
+static IN_VERB: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+struct InVerb(String);
+
+impl InVerb {
+    fn enter(bin_path: &str) -> Option<InVerb> {
+        let key = bin_path.to_ascii_lowercase();
+        let mut held = IN_VERB.lock().unwrap_or_else(|e| e.into_inner());
+        if held.contains(&key) {
+            return None;
+        }
+        held.push(key.clone());
+        Some(InVerb(key))
+    }
+}
+
+impl Drop for InVerb {
+    fn drop(&mut self) {
+        let mut held = IN_VERB.lock().unwrap_or_else(|e| e.into_inner());
+        held.retain(|k| k != &self.0);
+    }
+}
+
+/// Runs `one` for each job in order and answers each. Checks `cancel` before each item (once the
+/// deadline passed nothing new is started) and answers [`STILL_WAITING`] without running `one` for
+/// a bin path that is still inside a verb.
+fn restore_each(
+    jobs: &[Job],
+    cancel: &AtomicBool,
+    answer: &mut dyn FnMut(usize, Result<(), String>),
+    mut one: impl FnMut(&Job) -> Result<(), String>,
+) {
+    for (i, job) in jobs.iter().enumerate() {
+        if cancel.load(Ordering::SeqCst) {
+            return;
+        }
+        let Some(_in_verb) = InVerb::enter(&job.0) else {
+            answer(i, Err(STILL_WAITING.to_string()));
+            continue;
+        };
+        answer(i, one(job));
+    }
+}
+
+fn restore_many_checked(jobs: &[Job], owner: isize, deadline: std::time::Duration) -> Vec<Result<(), String>> {
     let jobs = jobs.to_vec();
-    bounded(jobs.len(), deadline, move |answer| {
+    bounded(jobs.len(), deadline, move |answer, cancel| {
         // SAFETY: COM objects stay on this thread and drop before CoUninitialize.
         let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
         if hr.is_err() {
@@ -557,16 +638,13 @@ fn restore_many_checked(jobs: &[(String, PathBuf, Option<i64>)], owner: isize, d
             Ok(items) => {
                 let by_path: std::collections::HashMap<String, &IShellItem> =
                     items.iter().map(|(p, it)| (p.to_ascii_lowercase(), it)).collect();
-                for (i, (bin_path, original, near)) in jobs.iter().enumerate() {
-                    answer(
-                        i,
-                        match by_path.get(&bin_path.to_ascii_lowercase()) {
-                            None => Err(NOT_IN_BIN.to_string()),
-                            // SAFETY: the item is live on this thread.
-                            Some(item) => unsafe { restore_item(item, bin_path, original, *near, owner) },
-                        },
-                    );
-                }
+                restore_each(&jobs, cancel, answer, |(bin_path, original, near)| {
+                    match by_path.get(&bin_path.to_ascii_lowercase()) {
+                        None => Err(NOT_IN_BIN.to_string()),
+                        // SAFETY: the item is live on this thread.
+                        Some(item) => unsafe { restore_item(item, bin_path, original, *near, owner) },
+                    }
+                });
             }
         }
         // SAFETY: balanced with CoInitializeEx above.
@@ -662,13 +740,13 @@ pub fn undelete_unchecked(bin_path: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{bounded, failure_text, is_plain_absolute, matches_original, recycle_in_order, recycle_one, PUT_BACK_STUCK};
+    use super::{bounded, failure_text, is_plain_absolute, matches_original, recycle_in_order, recycle_one, restore_each, Job, PUT_BACK_STUCK, STILL_WAITING};
     use std::path::{Path, PathBuf};
 
     #[test]
     fn a_put_back_that_blocks_returns_within_the_deadline_and_says_so_for_the_rest() {
         let started = std::time::Instant::now();
-        let out = bounded(4, std::time::Duration::from_millis(300), |answer| {
+        let out = bounded(4, std::time::Duration::from_millis(300), |answer, _cancel| {
             answer(0, Ok(()));
             answer(1, Err("No longer in the Recycle Bin.".into()));
             // Item 2 blocks (a verb waiting on a prompt); item 3 is never started.
@@ -682,9 +760,77 @@ mod tests {
         assert_eq!(out[3], Err(PUT_BACK_STUCK.to_string()));
     }
 
+    fn jobs(paths: &[&str]) -> Vec<Job> {
+        paths.iter().map(|p| (p.to_string(), PathBuf::from("C:/x/f.txt"), None)).collect()
+    }
+
+    #[test]
+    fn after_the_deadline_the_put_back_thread_starts_no_new_item() {
+        let started = std::sync::Arc::new(std::sync::Mutex::new(Vec::<usize>::new()));
+        let seen = started.clone();
+        let list = jobs(&["bin-after-1", "bin-after-2", "bin-after-3"]);
+        let out = bounded(3, std::time::Duration::from_millis(150), move |answer, cancel| {
+            let mut n = 0;
+            restore_each(&list, cancel, answer, |_| {
+                seen.lock().unwrap().push(n);
+                n += 1;
+                // item 1 is the stuck one: it outlives the deadline
+                if n == 2 {
+                    std::thread::sleep(std::time::Duration::from_millis(700));
+                }
+                Ok(())
+            });
+        });
+        assert_eq!(out[0], Ok(()));
+        assert_eq!(out[1], Err(PUT_BACK_STUCK.to_string()));
+        assert_eq!(out[2], Err(PUT_BACK_STUCK.to_string()));
+        std::thread::sleep(std::time::Duration::from_millis(1000));
+        assert_eq!(*started.lock().unwrap(), vec![0, 1], "item 2 must never start");
+    }
+
+    #[test]
+    fn a_retry_of_a_bin_path_still_inside_the_verb_starts_no_verb() {
+        let verbs = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = verbs.clone();
+        let list = jobs(&["bin-retry-stuck"]);
+        let out = bounded(1, std::time::Duration::from_millis(100), move |answer, cancel| {
+            restore_each(&list, cancel, answer, |_| {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(800));
+                Ok(())
+            });
+        });
+        assert_eq!(out[0], Err(PUT_BACK_STUCK.to_string()));
+        // the first verb is still blocked; asking again for the same item (any spelling of the case)
+        let again = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = again.clone();
+        let list = jobs(&["BIN-RETRY-STUCK"]);
+        let out = bounded(1, std::time::Duration::from_secs(5), move |answer, cancel| {
+            restore_each(&list, cancel, answer, |_| {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            });
+        });
+        assert_eq!(out[0], Err(STILL_WAITING.to_string()));
+        assert_eq!(STILL_WAITING, "Still waiting for Windows on this one. Check the Recycle Bin.");
+        assert_eq!(again.load(std::sync::atomic::Ordering::SeqCst), 0, "no verb may start");
+        // once the first one has ended, the path is free again
+        std::thread::sleep(std::time::Duration::from_millis(1000));
+        let counted = again.clone();
+        let list = jobs(&["bin-retry-stuck"]);
+        let out = bounded(1, std::time::Duration::from_secs(5), move |answer, cancel| {
+            restore_each(&list, cancel, answer, |_| {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            });
+        });
+        assert_eq!(out[0], Ok(()));
+        assert_eq!(again.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
     #[test]
     fn a_put_back_that_finishes_gets_every_answer_in_order() {
-        let out = bounded(3, std::time::Duration::from_secs(5), |answer| {
+        let out = bounded(3, std::time::Duration::from_secs(5), |answer, _cancel| {
             for i in 0..3 {
                 answer(i, if i == 1 { Err("x".into()) } else { Ok(()) });
             }
@@ -710,6 +856,22 @@ mod tests {
         }
         assert!(is_plain_absolute(Path::new(r"C:\a\b.txt")));
         assert!(is_plain_absolute(Path::new("d:/a/b.txt")));
+    }
+
+    #[test]
+    fn stream_names_and_dot_segments_are_not_plain_paths() {
+        for bad in [
+            r"C:\x\Foo::$INDEX_ALLOCATION",
+            r"D:\x\a.iso:s",
+            r"C:\x\.\y",
+            r"C:\x\..\y",
+            "C:/x/../y",
+            r"C:\x\y\..",
+        ] {
+            assert!(!is_plain_absolute(Path::new(bad)), "{bad}");
+            assert!(recycle_one(Path::new(bad)).is_err(), "{bad}");
+        }
+        assert!(is_plain_absolute(Path::new(r"C:\x\.hidden\a..b.txt")));
     }
 
     #[test]

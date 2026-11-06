@@ -41,6 +41,9 @@ pub enum Evidence {
     PublisherStillInstalled,
     /// Changed in the last 30 days.
     RecentlyChanged,
+    /// Not under Program Files, Program Files (x86), ProgramData or the user's AppData: an install
+    /// folder there may be the user's own (added in final review).
+    OutsideProgramFolders,
 }
 
 /// Evidence, points, and the sentence the window shows. Sentences say what was seen, not what to do.
@@ -60,6 +63,7 @@ pub const POINTS: &[(Evidence, i32, &str)] = &[
     (Evidence::ManyFiles, -2, "Contains many files"),
     (Evidence::PublisherStillInstalled, -4, "The publisher still has an app installed"),
     (Evidence::RecentlyChanged, -3, "Changed in the last 30 days"),
+    (Evidence::OutsideProgramFolders, -3, "Outside the usual program folders"),
 ];
 
 /// Level boundaries, from the spec: 5 or more, 2 to 4, 0 to 1, below 0.
@@ -160,7 +164,7 @@ mod tests {
 
     #[test]
     fn the_table_has_every_spec_row_once() {
-        assert_eq!(POINTS.len(), 15);
+        assert_eq!(POINTS.len(), 16);
         for (i, (e, _, _)) in POINTS.iter().enumerate() {
             assert!(POINTS[i + 1..].iter().all(|(o, _, _)| o != e), "{e:?} twice");
         }
@@ -185,6 +189,7 @@ mod tests {
             (Evidence::ManyFiles, -2),
             (Evidence::PublisherStillInstalled, -4),
             (Evidence::RecentlyChanged, -3),
+            (Evidence::OutsideProgramFolders, -3),
         ];
         assert_eq!(spec.len(), POINTS.len());
         for (ev, points) in spec {
