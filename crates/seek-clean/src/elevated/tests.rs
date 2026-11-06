@@ -1107,6 +1107,47 @@ fn a_value_that_needs_the_environment_or_is_missing_is_not_trusted() {
 }
 
 #[test]
+fn a_registry_value_with_variables_is_expanded_from_trusted_values_only() {
+    let known = [("SystemDrive", "C:"), ("SystemRoot", r"C:\WINDOWS"), ("ProgramFiles", r"C:\Program Files"), ("ProgramFiles(x86)", r"C:\Program Files (x86)")];
+    let ex = |raw: &str| trust::expand_trusted(raw, &known);
+    // without variables: as it is
+    assert_eq!(ex(r"C:\Program Files").unwrap(), r"C:\Program Files");
+    // with them, in any case, more than once
+    assert_eq!(ex(r"%SystemDrive%\Program Files").unwrap(), r"C:\Program Files");
+    assert_eq!(ex(r"%systemroot%\x").unwrap(), r"C:\WINDOWS\x");
+    assert_eq!(ex(r"%ProgramFiles%\Common Files").unwrap(), r"C:\Program Files\Common Files");
+    assert_eq!(ex(r"%PROGRAMFILES(X86)%\Common Files").unwrap(), r"C:\Program Files (x86)\Common Files");
+    assert_eq!(ex(r"%SystemDrive%\a\%SystemDrive%").unwrap(), r"C:\a\C:");
+    // any other variable, an unfinished or empty one: refused, never read from the environment
+    for bad in [r"%ProgramData%\x", r"%USERPROFILE%", r"%SystemDrive\x", "100%", "%%", r"%SystemDrive%\%Temp%"] {
+        assert!(ex(bad).is_err(), "{bad}");
+    }
+    // an empty value stays empty (the caller treats it as missing)
+    assert_eq!(ex("").unwrap(), "");
+    // what is not known yet is not available: ProgramFiles can't be used to work out ProgramFiles
+    assert!(trust::expand_trusted(r"%ProgramFiles%\x", &known[..2]).is_err());
+}
+
+#[test]
+fn registry_expand_sz_values_for_the_program_folders_are_expanded_not_refused() {
+    let profile = map_reader(&[("ProgramData", r"%SystemDrive%\ProgramData"), ("ProfilesDirectory", r"%SystemDrive%\Users")]);
+    let version = map_reader(&[
+        ("ProgramFilesDir", r"%SystemDrive%\Program Files"),
+        ("ProgramFilesDir (x86)", r"%SystemDrive%\Program Files (x86)"),
+        ("CommonFilesDir", r"%ProgramFiles%\Common Files"),
+        ("CommonFilesDir (x86)", r"%ProgramFiles(x86)%\Common Files"),
+    ]);
+    let t = trust::derive(r"C:\WINDOWS", &profile, &version).unwrap();
+    assert_eq!(t.program_files, r"C:\Program Files");
+    assert_eq!(t.program_files_x86.as_deref(), Some(r"C:\Program Files (x86)"));
+    assert_eq!(t.common_files.as_deref(), Some(r"C:\Program Files\Common Files"));
+    assert_eq!(t.common_files_x86.as_deref(), Some(r"C:\Program Files (x86)\Common Files"));
+    // an unknown variable in any of them refuses the whole thing
+    let bad = map_reader(&[("ProgramFilesDir", r"C:\Program Files"), ("CommonFilesDir", r"%CommonProgramFiles%\x")]);
+    assert!(trust::derive(r"C:\WINDOWS", &profile, &bad).is_err());
+}
+
+#[test]
 fn an_environment_that_disagrees_is_detected_and_one_that_agrees_is_not() {
     let t = trusted_sample();
     let env = |pairs: Vec<(&'static str, &'static str)>| {

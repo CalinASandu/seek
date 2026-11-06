@@ -24,6 +24,19 @@ pub fn canon(p: &Path) -> String {
     expanded.to_lowercase()
 }
 
+/// True when the path, as written, has a spelling `canon` reads differently from Win32: a `:` anywhere
+/// but the drive letter (a stream name, `::$INDEX_ALLOCATION`) or a `.` / `..` segment. A leading
+/// `\\?\` is ignored here (it is judged elsewhere). Callers that act on the raw spelling refuse these.
+pub fn has_odd_spelling(p: &Path) -> bool {
+    let raw = p.to_string_lossy();
+    let rest = raw.strip_prefix(r"\\?\").unwrap_or(&raw);
+    let after_drive = match rest.as_bytes() {
+        [d, b':', ..] if d.is_ascii_alphabetic() => &rest[2..],
+        _ => rest,
+    };
+    after_drive.contains(':') || after_drive.split(['\\', '/']).any(|seg| seg == "." || seg == "..")
+}
+
 /// Like `canon` but never touches the disk: 8.3 short names stay as written. For callers that
 /// must not wait on a drive that may be gone.
 pub fn canon_lexical(p: &Path) -> String {

@@ -29,6 +29,7 @@ base64.workspace = true
 tracing.workspace = true
 windows-service.workspace = true
 windows-sys.workspace = true
+tauri-plugin-single-instance = "2"
 
 [dev-dependencies]
 tempfile.workspace = true

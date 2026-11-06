@@ -42,9 +42,12 @@ if (-not (Test-ServicePipe)) {
 }
 
 # 3. Open the window (or bring the running one to the front).
-$running = Get-Process seek-app -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 }
+# A copy hidden in the tray has no window handle, so look for the process. Starting the app again
+# is safe: a second launch shows the first window and exits (single instance).
+$running = Get-Process seek-app -ErrorAction SilentlyContinue
 if ($running) {
-    (New-Object -ComObject WScript.Shell).AppActivate($running[0].Id) | Out-Null
+    $env:SEEK_SERVICE_PATH = $service
+    Start-Process $app
 } else {
     $env:SEEK_SERVICE_PATH = $service
     Start-Process $app

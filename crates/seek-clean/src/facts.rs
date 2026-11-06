@@ -63,6 +63,9 @@ pub struct Stat {
     pub files: u32,
     pub reparse: bool,
     pub cloud: bool,
+    /// A folder (not a link) with something inside that could not be read. Its size and file count
+    /// are then partial, and an unknown folder is not one to remove: the engine locks it.
+    pub unreadable: bool,
 }
 
 pub(crate) const ATTR_DIRECTORY: u32 = 0x10;
@@ -97,9 +100,12 @@ impl FileFacts for RealFacts {
             files: 1,
             reparse,
             cloud: is_cloud(attrs),
+            unreadable: false,
         };
-        if is_dir && !reparse {
-            walk(path, &mut s)?;
+        if is_dir && !reparse && walk(path, &mut s).is_none() {
+            // Gone while it was being read is gone; anything else is a folder that can't be read in full.
+            std::fs::symlink_metadata(path).ok()?;
+            s.unreadable = true;
         }
         Some(s)
     }

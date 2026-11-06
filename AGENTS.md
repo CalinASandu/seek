@@ -10,6 +10,7 @@ Design: `docs/superpowers/specs/2026-10-04-seek-local-design.md`. Plan: `docs/su
 - Ask all clarifying questions at once, numbered, with suggested defaults.
 - `seek-core` must stay free of Windows dependencies. Timestamps are unix epoch **milliseconds** everywhere.
 - After running agents, delete stray empty files they leave in the repo root (from bad shell redirects).
+- x64 only (seek-clean refuses to build for 32-bit).
 
 ## Commands
 - `cargo test --workspace` · `cargo clippy --workspace --all-targets -- -D warnings`

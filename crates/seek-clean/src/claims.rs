@@ -833,6 +833,11 @@ impl LiveClaims {
         }
     }
 
+    /// True while a snapshot of installed apps or running programs is held in memory.
+    pub fn holds_snapshots(&self) -> bool {
+        [&self.installed, &self.running].iter().any(|l| l.slot.lock().unwrap_or_else(|e| e.into_inner()).is_some())
+    }
+
     #[cfg(test)]
     fn poison_for_test(&self) {
         let _guard = self.running.slot.lock();

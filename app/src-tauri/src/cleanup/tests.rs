@@ -250,9 +250,8 @@ fn leftover_and_stale_requests_are_read_as_the_window_sends_them() {
     assert_eq!(why, Why::Leftover);
     assert_eq!(app_id, None, "a leftovers request names no app");
     assert_eq!(folders.len(), 2);
-    assert_eq!(folders[0].level, Some(Level::Likely));
-    assert_eq!(folders[0].reasons, vec![Reason { text: "t".into(), points: 3 }]);
-    assert_eq!(folders[1].level, None);
+    // The window's own level and reasons are not read: they come from the list Seek made.
+    assert_eq!(folders[0].path, r"C:\x");
     let stale = r#"{"kind":"stale","files":["C:\\ProgramData\\Seek\\indexes\\a.seekidx"]}"#;
     let PrepareRequest::Stale { files } = serde_json::from_str(stale).unwrap() else { panic!("not stale") };
     assert_eq!(files, vec![r"C:\ProgramData\Seek\indexes\a.seekidx".to_string()]);
@@ -289,12 +288,14 @@ fn stale_data_rows_join_the_list_needing_admin() {
 
 #[test]
 fn folder_and_stale_requests_become_candidates() {
-    let f = |path: &str| ReqFolder { path: path.into(), level: Some(Level::Likely), reasons: vec![] };
+    let f = |path: &str| ReqFolder { path: path.into() };
     let listed = [stale(r"C:\ProgramData\Seek\indexes\old.seekidx")];
+    let shown = listing_of(&[folder_row(r"C:\Users\me\AppData\Local\Old", Level::Likely)]);
     let cands = folder_candidates(
         Why::Leftover,
         vec![f(r"C:\Users\me\AppData\Local\Old"), f(r"c:\programdata\seek\INDEXES\old.seekidx"), f(r"C:\Users\me\AppData\Local\backup.log")],
         &listed,
+        &shown,
     )
     .unwrap();
     assert_eq!(cands.len(), 3);
@@ -303,8 +304,8 @@ fn folder_and_stale_requests_become_candidates() {
     // A folder that merely looks like a log file, and that the service does not list, stays a folder.
     assert!(matches!(&cands[2], Candidate::Folder { .. }));
     // Only leftover folders are removed this way.
-    assert!(folder_candidates(Why::Duplicate, vec![f(r"C:\x")], &[]).is_err());
-    assert!(folder_candidates(Why::StaleData, vec![f(r"C:\x")], &[]).is_err());
+    assert!(folder_candidates(Why::Duplicate, vec![f(r"C:\x")], &[], &shown).is_err());
+    assert!(folder_candidates(Why::StaleData, vec![f(r"C:\x")], &[], &shown).is_err());
     // A stale request keeps only what the service still calls stale.
     let wanted = vec![r"C:\ProgramData\Seek\indexes\old.seekidx".to_string(), r"C:\ProgramData\Seek\indexes\live.seekidx".to_string()];
     let cands = stale_candidates(wanted, &listed);
@@ -339,16 +340,18 @@ fn leftover_rows_go_through_the_engines_rules_and_admin_rows_are_left_without_an
     let facts: Arc<dyn FileFacts> = Arc::new(DiskOnly);
     let engine = Engine::new(places, Arc::new(NeverRecycles), None, facts, Arc::new(ClaimsNothing));
 
-    let tab = |p: String| ReqFolder {
-        path: p,
-        level: Some(Level::VeryLikely),
+    let tab = |p: String| ReqFolder { path: p };
+    let shown_row = |p: String| LeftoverRow {
         reasons: vec![Reason { text: "Empty, or nothing left but empty folders".into(), points: 4 }],
+        ..folder_row(&p, Level::VeryLikely)
     };
+    let shown = listing_of(&[shown_row(s("pf/Old Vendor")), shown_row(s("users/me/appdata/Old App"))]);
     let listed = [stale(&stale_file.to_string_lossy())];
     let mut cands = folder_candidates(
         Why::Leftover,
         vec![tab(s("pf/Old Vendor")), tab(s("users/me/appdata/Old App")), tab(stale_file.to_string_lossy().into_owned())],
         &listed,
+        &shown,
     )
     .unwrap();
     // A stale-data row asked for through the `stale` kind reaches the engine the same way.
@@ -358,7 +361,7 @@ fn leftover_rows_go_through_the_engines_rules_and_admin_rows_are_left_without_an
 
     let pf = &prepared.items[0];
     assert_eq!((pf.why, pf.is_dir, pf.lock, pf.needs_admin), (Why::Leftover, true, None, true));
-    assert_eq!(pf.level, Some(Level::VeryLikely), "the level the window showed comes back with the item");
+    assert_eq!(pf.level, Some(Level::VeryLikely), "the level the list gave comes back with the item");
     assert_eq!(pf.reasons.len(), 1);
     let app = &prepared.items[1];
     assert_eq!((app.why, app.lock, app.needs_admin), (Why::Leftover, None, false));
@@ -747,6 +750,24 @@ fn a_scan_leaves_out_drives_still_on_their_first_scan_and_says_so() {
 }
 
 #[test]
+fn a_scan_leaves_out_an_offline_drive_and_names_it() {
+    // An offline drive's letter may now belong to another volume: it is never read.
+    let devices = vec![
+        device(1, 100, DeviceState::Online, 5),
+        device(4, 100, DeviceState::Offline, 5),
+        device(5, 100, DeviceState::Offline, 5),
+    ];
+    let plan = plan_scan(&[id(1), id(4), id(5)], &devices, host(100), &HashMap::new());
+    assert_eq!(plan.ask_local, vec![id(1)]);
+    assert!(!plan.nothing_local);
+    assert_eq!(plan.notice.as_deref(), Some("Drive 4 is offline, so it wasn't scanned. Drive 5 is offline, so it wasn't scanned."));
+    // Only an offline drive picked: nothing to scan, and the notice says why.
+    let plan = plan_scan(&[id(4)], &devices, host(100), &HashMap::new());
+    assert!(plan.nothing_local && plan.ask_local.is_empty());
+    assert_eq!(plan.notice.as_deref(), Some("Drive 4 is offline, so it wasn't scanned."));
+}
+
+#[test]
 fn a_linked_drive_picked_in_the_sidebar_gets_a_plain_notice_not_a_silent_empty_scan() {
     let devices = vec![device(1, 100, DeviceState::Online, 5), device(9, 200, DeviceState::Online, 5)];
     let plan = plan_scan(&[id(9)], &devices, host(100), &HashMap::new());
@@ -913,26 +934,51 @@ fn after_a_commit_the_scan_state_no_longer_lists_what_was_moved() {
 }
 
 #[test]
+fn the_claims_snapshot_goes_with_the_results_when_the_window_stays_hidden() {
+    use seek_clean::claims::{ClaimParts, SystemClaims};
+    let live = Arc::new(LiveClaims::with_readers(
+        Box::new(|| SystemClaims::from_parts(ClaimParts::default())),
+        Duration::from_secs(30),
+        Box::new(|| SystemClaims::from_parts(ClaimParts::default())),
+        Duration::from_secs(2),
+        Box::new(|| Duration::ZERO),
+    ));
+    let mut core = idle_core();
+    Arc::get_mut(&mut core).unwrap().claims = Some(live.clone());
+    let state = state_with(core);
+    // a use of the claims (a review, a listing) leaves a snapshot behind
+    let _ = live.is_claimed(Path::new(r"C:\Users\me\AppData\Local\Anything"));
+    assert!(live.holds_snapshots());
+    // hidden for a short while: nothing is let go of
+    state.window_hidden_for(Some(Duration::from_secs(60)));
+    assert!(live.holds_snapshots());
+    // hidden long enough for the results to go: the snapshot goes too
+    state.window_hidden_for(Some(Duration::from_secs(6 * 60)));
+    assert!(!live.holds_snapshots());
+}
+
+#[test]
 fn an_uninstall_request_names_its_app_and_becomes_folders_and_shortcuts() {
     let json = r#"{"kind":"folders","why":"uninstall","appId":"HKLM64\\{A}","folders":[{"path":"D:\\Apps\\Acme","level":"likely","reasons":[]},{"path":"C:\\Menu\\Acme.LNK","level":null,"reasons":[]}]}"#;
     let PrepareRequest::Folders { why, folders, app_id } = serde_json::from_str(json).unwrap() else { panic!("not folders") };
     assert_eq!((why, app_id.as_deref()), (Why::Uninstall, Some(r"HKLM64\{A}")));
     // A service that calls the same name stale changes nothing: an uninstall never makes a StaleFile.
     let stale = [stale(r"D:\Apps\Acme")];
-    let cands = folder_candidates(why, folders, &stale).unwrap();
+    let shown = listing_of(&[folder_row(r"D:\Apps\Acme", Level::Likely)]);
+    let cands = folder_candidates(why, folders, &stale, &shown).unwrap();
     assert!(matches!(&cands[0], Candidate::Folder { why: Why::Uninstall, level: Some(Level::Likely), .. }), "{:?}", cands[0]);
     assert!(matches!(&cands[1], Candidate::Shortcut { .. }), "{:?}", cands[1]);
 }
 
-fn uninstall_lists(app: &str, rows: &[LeftoverRow]) -> HashMap<String, HashSet<String>> {
-    HashMap::from([(app.to_string(), listed_set(rows))])
+fn uninstall_lists(app: &str, rows: &[LeftoverRow]) -> HashMap<String, Listing> {
+    HashMap::from([(app.to_string(), listing_of(rows))])
 }
 
 #[test]
 fn an_uninstall_path_not_in_the_last_list_for_that_app_is_refused() {
     let shown = [folder_row(r"D:\Apps\Acme", Level::VeryLikely), folder_row(r"C:\Menu\Acme.lnk", Level::Likely)];
     let lists = uninstall_lists("app-a", &shown);
-    let leftovers = listed_set(&[folder_row(r"C:\Users\me\AppData\Local\Old", Level::Likely)]);
+    let leftovers = listing_of(&[folder_row(r"C:\Users\me\AppData\Local\Old", Level::Likely)]);
     let ask = |app: Option<&str>, paths: &[&str]| check_folder_request(Why::Uninstall, app, paths.iter().copied(), &leftovers, &lists);
     // What the list showed, however spelled.
     assert!(ask(Some("app-a"), &[r"d:\apps\ACME", r"C:\Menu\Acme.lnk"]).is_ok());
@@ -952,7 +998,7 @@ fn an_uninstall_path_not_in_the_last_list_for_that_app_is_refused() {
 #[test]
 fn a_leftover_path_not_in_the_last_list_is_refused() {
     let shown = vec![folder_row(r"C:\Users\me\AppData\Local\Old", Level::Likely), stale_row(&stale(r"C:\ProgramData\Seek\indexes\a.seekidx"))];
-    let listed = listed_set(&shown);
+    let listed = listing_of(&shown);
     // What was shown is accepted, however it is spelled.
     assert!(check_listed([r"c:\users\ME\appdata\local\old", r"C:\ProgramData\Seek\indexes\A.SEEKIDX"], &listed).is_ok());
     // Anything else is not, even a real folder one level up or somewhere else entirely.
@@ -961,7 +1007,35 @@ fn a_leftover_path_not_in_the_last_list_is_refused() {
         assert!(e.contains(p), "{e}");
     }
     // Before any list was shown, nothing is accepted.
-    assert!(check_listed([r"C:\x"], &listed_set(&[])).is_err());
+    assert!(check_listed([r"C:\x"], &listing_of(&[])).is_err());
+}
+
+/// The sheet shows the confidence Seek itself listed, not what the request says about it.
+#[test]
+fn a_request_cannot_raise_the_level_or_change_the_reasons_the_list_gave() {
+    let dir = tempfile::tempdir().unwrap();
+    let b = dir.path();
+    let s = |p: &str| b.join(p).to_string_lossy().into_owned();
+    for d in ["win", "pf", "pd", "users/me/appdata/Old App"] {
+        std::fs::create_dir_all(b.join(d)).unwrap();
+    }
+    std::fs::write(b.join("users/me/appdata/Old App/a.txt"), b"x").unwrap();
+    let places = Places::for_tests(&s("win"), &[&s("pf")], &s("users"), &s("users/me"), &s("pd"), &[&s("users/me/appdata")]);
+    let engine = Engine::new(places, Arc::new(NeverRecycles), None, Arc::new(DiskOnly), Arc::new(ClaimsNothing));
+
+    let path = s("users/me/appdata/Old App");
+    let honest = Reason { text: "Contains programs".into(), points: -4 };
+    let shown = listing_of(&[LeftoverRow { reasons: vec![honest.clone()], ..folder_row(&path, Level::NotSure) }]);
+    // The request as a hostile or stale window would write it: "very likely", with its own reasons.
+    let json = format!(
+        r#"{{"kind":"folders","why":"leftover","folders":[{{"path":{},"level":"veryLikely","reasons":[{{"text":"Looks great","points":9}}]}}]}}"#,
+        serde_json::to_string(&path).unwrap()
+    );
+    let PrepareRequest::Folders { why, folders, .. } = serde_json::from_str(&json).unwrap() else { panic!("not folders") };
+    let cands = folder_candidates(why, folders, &[], &shown).unwrap();
+    let prepared = engine.prepare(cands, &[]);
+    assert_eq!(prepared.items[0].level, Some(Level::NotSure));
+    assert_eq!(prepared.items[0].reasons, vec![honest]);
 }
 
 #[test]

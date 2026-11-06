@@ -14,6 +14,7 @@ fn moved(n: u32) -> Entry {
         bin_path: Some(format!(r"C:\$Recycle.Bin\S\$R{n}.txt")),
         left_reason: None,
         put_back_ms: None,
+        needs_admin: false,
     }
 }
 
@@ -30,14 +31,21 @@ struct FakeBin {
     calls: Mutex<Vec<(String, PathBuf, i64)>>,
     /// How many times the whole batch was handed over (the real bin lists once per batch).
     batches: Mutex<usize>,
+    /// What the bin still lists (for entries whose original path is taken), and how often it was listed.
+    listed: Result<bool, String>,
+    listings: Mutex<usize>,
 }
 
 impl FakeBin {
     fn new(restore: Result<(), String>) -> FakeBin {
-        FakeBin { restore, calls: Mutex::new(vec![]), batches: Mutex::new(0) }
+        FakeBin { restore, calls: Mutex::new(vec![]), batches: Mutex::new(0), listed: Ok(true), listings: Mutex::new(0) }
     }
     fn calls(&self) -> usize {
         self.calls.lock().unwrap().len()
+    }
+    fn listing(mut self, listed: Result<bool, String>) -> FakeBin {
+        self.listed = listed;
+        self
     }
 }
 
@@ -45,6 +53,10 @@ impl BinRestore for FakeBin {
     fn restore(&self, bin_path: &str, original: &Path, near: i64) -> Result<(), String> {
         self.calls.lock().unwrap().push((bin_path.into(), original.into(), near));
         self.restore.clone()
+    }
+    fn listed(&self, bin_paths: &[String]) -> Result<Vec<bool>, String> {
+        *self.listings.lock().unwrap() += 1;
+        self.listed.clone().map(|l| vec![l; bin_paths.len()])
     }
     fn restore_all(&self, jobs: &[RestoreJob]) -> Vec<Result<(), String>> {
         *self.batches.lock().unwrap() += 1;
@@ -357,4 +369,89 @@ fn errors_read_in_plain_words() {
     let raw = std::io::Error::from_raw_os_error(5);
     assert!(raw.to_string().contains("os error 5"));
     assert_eq!(plain_io(&raw), "Access is denied.");
+}
+
+#[test]
+fn an_item_the_admin_step_moved_is_refused_before_any_bin_work() {
+    let dir = tempfile::tempdir().unwrap();
+    let original = dir.path().join("gone.txt");
+    let e = Entry { original_path: original.to_string_lossy().into_owned(), needs_admin: true, ..moved(1) };
+    let bin = FakeBin::new(Ok(()));
+    let r = put_back(&e, &bin);
+    assert!(!r.restored);
+    assert_eq!(r.reason.as_deref(), Some("Needs admin: restore it from the Recycle Bin."));
+    assert_eq!(bin.calls(), 0, "the verb must not run");
+    assert_eq!(*bin.batches.lock().unwrap(), 0);
+
+    // In a batch too: only the ordinary entry reaches the bin.
+    let h = History::open(file_in(dir.path()));
+    let plain = Entry { id: "p".into(), original_path: dir.path().join("plain.txt").to_string_lossy().into_owned(), ..moved(2) };
+    h.append(&[Entry { id: "a".into(), ..e }, plain]).unwrap();
+    let out = put_back_ids(&h, &bin, &["a".into(), "p".into()]);
+    assert_eq!(out[0].reason.as_deref(), Some("Needs admin: restore it from the Recycle Bin."));
+    assert!(out[1].restored);
+    assert_eq!(bin.calls(), 1);
+}
+
+#[test]
+fn an_entry_written_before_needs_admin_existed_reads_as_not_needing_it() {
+    let json = r#"{"version":1,"entries":[{"id":"x","timeMs":1,"originalPath":"C:/a","size":1,"why":"duplicate","binPath":"b","leftReason":null}]}"#;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(file_in(dir.path()), json).unwrap();
+    assert!(!History::open(file_in(dir.path())).list()[0].needs_admin);
+}
+
+#[test]
+fn a_taken_original_whose_bin_item_is_gone_counts_as_put_back_and_is_recorded() {
+    // The verb finished after its deadline (the user clicked Continue): the item is back in its folder.
+    let dir = tempfile::tempdir().unwrap();
+    let h = History::open(file_in(dir.path()));
+    let mk = |n: u32| {
+        let original = dir.path().join(format!("f{n}.txt"));
+        std::fs::write(&original, b"back").unwrap();
+        Entry { original_path: original.to_string_lossy().into_owned(), ..moved(n) }
+    };
+    h.append(&[mk(1), mk(2)]).unwrap();
+    let bin = FakeBin::new(Ok(())).listing(Ok(false));
+    let out = put_back_ids(&h, &bin, &["e1".into(), "e2".into()]);
+    for r in &out {
+        assert!(r.restored, "{r:?}");
+        assert_eq!(r.reason.as_deref(), Some("It's back in its folder."));
+    }
+    assert_eq!(bin.calls(), 0, "no verb");
+    assert_eq!(*bin.listings.lock().unwrap(), 1, "the bin is listed once for the batch");
+    assert!(h.list().iter().all(|e| e.put_back_ms.is_some()));
+}
+
+#[test]
+fn a_taken_original_whose_bin_item_is_still_listed_is_something_new() {
+    let dir = tempfile::tempdir().unwrap();
+    let original = dir.path().join("report.txt");
+    std::fs::write(&original, b"new").unwrap();
+    let h = History::open(file_in(dir.path()));
+    h.append(&[Entry { original_path: original.to_string_lossy().into_owned(), ..moved(1) }]).unwrap();
+    for listed in [Ok(true), Err("Couldn't read the Recycle Bin.".to_string())] {
+        let bin = FakeBin::new(Ok(())).listing(listed);
+        let out = put_back_ids(&h, &bin, &["e1".into()]);
+        assert!(!out[0].restored);
+        assert_eq!(out[0].reason, Some(format!("Something new is at {}. Move it first.", original.display())));
+        assert_eq!(bin.calls(), 0);
+    }
+    assert!(h.list()[0].put_back_ms.is_none());
+}
+
+#[test]
+fn a_raw_hresult_at_the_end_of_a_recycle_bin_error_is_not_shown() {
+    assert_eq!(plain_hresult("The device is not ready. (0x80070015)"), "The device is not ready.");
+    assert_eq!(plain_hresult("Couldn't read the Recycle Bin: The path is invalid. (0x8007007B)"), "Couldn't read the Recycle Bin: The path is invalid.");
+    assert_eq!(plain_hresult("undelete verb failed: Unspecified error (0x80004005)"), "undelete verb failed: Unspecified error");
+    // anything else is left as it is: no trailing code, a code in the middle, a short or non-hex one
+    for same in ["Nothing to strip.", "Code 0x80070015 in the middle of it.", "Odd (0x8007) one", "Odd (0xZ0070015) one", ""] {
+        assert_eq!(plain_hresult(same), same);
+    }
+    // and it is what put back shows
+    let dir = tempfile::tempdir().unwrap();
+    let e = Entry { original_path: dir.path().join("a.txt").to_string_lossy().into_owned(), ..moved(1) };
+    let r = put_back(&e, &FakeBin::new(Err("Couldn't read the Recycle Bin: The device is not ready. (0x80070015)".into())));
+    assert_eq!(r.reason.as_deref(), Some("Couldn't read the Recycle Bin: The device is not ready."));
 }

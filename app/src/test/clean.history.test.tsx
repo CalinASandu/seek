@@ -16,6 +16,7 @@ const entry = (over: Partial<HistoryEntry>): HistoryEntry => ({
   binPath: "C:\\$Recycle.Bin\\S\\$RAAA.docx",
   leftReason: null,
   putBackMs: null,
+  needsAdmin: false,
   ...over,
 });
 
@@ -42,6 +43,20 @@ describe("Recently removed", () => {
     await user.click(button);
     expect(cleanPutBack).toHaveBeenCalledWith(["u1"]);
     expect(await within(dialog).findByText("Put back")).toBeInTheDocument();
+  });
+
+  it("shows an admin-removed item's reason in place of the button, with the Recycle Bin in the footer", async () => {
+    const cleanPutBack = vi.fn(async (ids: string[]) => ids.map((id) => ({ id, restored: true, reason: null })));
+    const api: SeekApi = {
+      ...base(),
+      cleanHistory: async () => [entry({ id: "a1", why: "uninstall", originalPath: "C:\\Program Files\\Contoso", needsAdmin: true })],
+      cleanPutBack,
+    };
+    const { dialog } = await openRemoved(api);
+    expect(await within(dialog).findByText("Needs admin: restore it from the Recycle Bin.")).toBeInTheDocument();
+    expect(within(dialog).queryByRole("button", { name: /^Put back/ })).toBeNull();
+    expect(within(dialog).getByRole("button", { name: "Open Recycle Bin" })).toBeInTheDocument();
+    expect(cleanPutBack).not.toHaveBeenCalled();
   });
 
   it("shows a put-back entry as Put back, with no button", async () => {
@@ -72,6 +87,8 @@ describe("Recently removed", () => {
       ...b,
       openRecycleBin,
       cleanCommit: async (token, ids) => ({ ...(await b.cleanCommit(token, ids)), historyError: said }),
+      // nothing of this commit reached the history
+      cleanHistory: async () => [],
     };
     const user = userEvent.setup();
     render(<App api={api} />);
@@ -90,5 +107,49 @@ describe("Recently removed", () => {
     expect(within(done).queryByText(/or here/)).toBeNull();
     await user.click(within(done).getByRole("button", { name: "Open Recycle Bin" }));
     expect(openRecycleBin).toHaveBeenCalled();
+  });
+
+  async function reviewOne(api: SeekApi) {
+    const user = userEvent.setup();
+    render(<App api={api} />);
+    await user.click(await screen.findByRole("radio", { name: "Decimator" }));
+    await user.click(screen.getByRole("tab", { name: "Leftovers" }));
+    await screen.findByText("Battle.net Launcher");
+    await user.click(screen.getByRole("checkbox", { name: /Select .*ZoomUpdater-Cache/ }));
+    await user.click(screen.getByRole("button", { name: "Review…" }));
+    const sheet = await screen.findByRole("dialog");
+    await within(sheet).findAllByRole("row");
+    await user.click(within(sheet).getByRole("button", { name: /^Move 1 item/ }));
+    const done = await screen.findByRole("dialog");
+    await within(done).findByText(/^Moved 1 item/);
+    return { user, done };
+  }
+
+  it("shows a set-aside note as plain information and keeps Put back", async () => {
+    const note = "Recently removed couldn't be read, so it was started again. The old file was kept as cleanup-history.corrupt-1.json.";
+    const b = base();
+    const api: SeekApi = { ...b, cleanCommit: async (token, ids) => ({ ...(await b.cleanCommit(token, ids)), historyNote: note }) };
+    const { done } = await reviewOne(api);
+    expect(within(done).getByText(note)).toBeInTheDocument();
+    expect(within(done).queryByRole("alert")).toBeNull();
+    expect(within(done).getByRole("button", { name: "Put back" })).toBeInTheDocument();
+    expect(within(done).queryByRole("button", { name: "Open Recycle Bin" })).toBeNull();
+  });
+
+  it("keeps Put back for the items that were recorded when only the admin items failed to be, and still shows the error", async () => {
+    const said = "Moved to the Recycle Bin, but they weren't recorded. Access is denied. Put them back from the Recycle Bin if needed.";
+    const b = base();
+    const cleanPutBack = vi.fn(async (ids: string[]) => ids.map((id) => ({ id, restored: true, reason: null })));
+    // the commit's history entry is there (the ordinary items were recorded first); the error is for the rest
+    const api: SeekApi = {
+      ...b,
+      cleanPutBack,
+      cleanCommit: async (token, ids) => ({ ...(await b.cleanCommit(token, ids)), historyError: said }),
+    };
+    const { user, done } = await reviewOne(api);
+    expect(within(done).getByText(said)).toBeInTheDocument();
+    await user.click(await within(done).findByRole("button", { name: "Put back" }));
+    expect(cleanPutBack).toHaveBeenCalledTimes(1);
+    expect(within(done).getByText(said)).toBeInTheDocument();
   });
 });

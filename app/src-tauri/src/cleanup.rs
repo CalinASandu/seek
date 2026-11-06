@@ -111,12 +111,14 @@ pub struct ScanPlan {
 const LINKED_ONLY: &str = "Duplicates only looks at this PC's drives, so nothing was scanned.";
 
 /// Which drives to ask the service about. Of the drives asked for, only this PC's count; one still
-/// on its first scan is left out (its index is partial) and named. A linked PC's drive that was
+/// on its first scan is left out (its index is partial) and named, and so is one that is offline
+/// (its letter may belong to another volume by now). A linked PC's drive that was
 /// picked is not scanned and the notice says why.
 pub fn plan_scan(requested: &[DeviceId], devices: &[Device], this_host: HostId, pc_names: &HashMap<HostId, String>) -> ScanPlan {
     let owners = owners_of(devices, this_host, pc_names);
     let mut ask_local: Vec<DeviceId> = Vec::new();
     let mut left_out: Vec<String> = Vec::new();
+    let mut offline: Vec<String> = Vec::new();
     let mut picked_linked = false;
     for id in requested {
         let Some(d) = devices.iter().find(|d| d.id == *id) else { continue };
@@ -127,7 +129,9 @@ pub fn plan_scan(requested: &[DeviceId], devices: &[Device], this_host: HostId, 
         if ask_local.contains(id) {
             continue;
         }
-        if d.state == DeviceState::Scanning && d.index_updated_at == 0 {
+        if d.state == DeviceState::Offline {
+            offline.push(d.display_name.clone());
+        } else if d.state == DeviceState::Scanning && d.index_updated_at == 0 {
             left_out.push(d.display_name.clone());
         } else {
             ask_local.push(*id);
@@ -139,7 +143,8 @@ pub fn plan_scan(requested: &[DeviceId], devices: &[Device], this_host: HostId, 
     if !left_out.is_empty() {
         notes.push(format!("Left out, still being indexed for the first time: {}.", left_out.join(", ")));
     }
-    if nothing_local && picked_linked && left_out.is_empty() {
+    notes.extend(offline.iter().map(|name| format!("{name} is offline, so it wasn't scanned.")));
+    if nothing_local && picked_linked && left_out.is_empty() && offline.is_empty() {
         notes.push(LINKED_ONLY.to_string());
     }
     ScanPlan { ask_local, ask_linked, owners, notice: (!notes.is_empty()).then(|| notes.join(" ")), nothing_local }
@@ -327,13 +332,12 @@ pub struct ReqFile {
     pub device_id: String,
 }
 
-/// A folder of a `Folders` request, with the confidence the window showed for it.
+/// A folder of a `Folders` request. Only its path counts: the confidence the sheet shows comes from
+/// the list Seek made (`Listing`), whatever level or reasons the request carries.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReqFolder {
     pub path: String,
-    pub level: Option<Level>,
-    pub reasons: Vec<Reason>,
 }
 
 /// Same shapes as `PrepareRequest` in `app/src/api/types.ts`.
@@ -470,15 +474,28 @@ fn scan_folders(core: &Core, link: Arc<ServiceLink>) -> Vec<LeftoverRow> {
     leftovers::scan(&core.places, &claims, &installed, &*core.facts, &ServiceIndex(link))
 }
 
-/// The paths of the last list `clean_leftovers` gave, lowercased and in `canon` form.
-pub fn listed_set(rows: &[LeftoverRow]) -> HashSet<String> {
-    rows.iter().map(|r| canon(Path::new(&r.path))).collect()
+/// What the last list showed for one row: the confidence Seek worked out, kept so the review sheet
+/// shows it and not what a request says.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ListedRow {
+    pub level: Level,
+    pub reasons: Vec<Reason>,
+}
+
+/// The last list `clean_leftovers` (or an uninstall's "what's left") gave, by path in `canon` form
+/// (lowercased).
+pub type Listing = HashMap<String, ListedRow>;
+
+pub fn listing_of(rows: &[LeftoverRow]) -> Listing {
+    rows.iter()
+        .map(|r| (canon(Path::new(&r.path)), ListedRow { level: r.level, reasons: r.reasons.clone() }))
+        .collect()
 }
 
 /// Refuses a leftover or stale request for a path that was not in the last list. The window only
 /// asks for what it was shown; anything else is not a request Seek made.
-pub fn check_listed<'a>(paths: impl IntoIterator<Item = &'a str>, listed: &HashSet<String>) -> Result<(), String> {
-    match paths.into_iter().find(|p| !listed.contains(&canon(Path::new(p)))) {
+pub fn check_listed<'a>(paths: impl IntoIterator<Item = &'a str>, listed: &Listing) -> Result<(), String> {
+    match paths.into_iter().find(|p| !listed.contains_key(&canon(Path::new(p)))) {
         None => Ok(()),
         Some(p) => Err(format!("{p} isn't in the list of leftovers Seek last showed, so it can't be removed from here. Look again, then review it.")),
     }
@@ -491,8 +508,8 @@ pub fn check_folder_request<'a>(
     why: Why,
     app_id: Option<&str>,
     paths: impl IntoIterator<Item = &'a str>,
-    leftovers: &HashSet<String>,
-    uninstalls: &HashMap<String, HashSet<String>>,
+    leftovers: &Listing,
+    uninstalls: &HashMap<String, Listing>,
 ) -> Result<(), String> {
     match why {
         Why::Uninstall => {
@@ -515,15 +532,23 @@ fn same_place(a: &str, b: &str) -> bool {
 /// whatever is not one. `why` is `Leftover` or `Uninstall`. What an uninstall left is a folder or a
 /// Start Menu shortcut (a `.lnk`); the engine refuses anything else of either kind, and none of it
 /// is one of Seek's own stale files.
-pub fn folder_candidates(why: Why, folders: Vec<ReqFolder>, stale: &[StaleFile]) -> Result<Vec<Candidate>, String> {
+///
+/// The level and reasons of each come from `listing`, the list Seek itself last made, by path; the
+/// request's own are not read.
+pub fn folder_candidates(why: Why, folders: Vec<ReqFolder>, stale: &[StaleFile], listing: &Listing) -> Result<Vec<Candidate>, String> {
+    let shown = |path: &str| match listing.get(&canon(Path::new(path))) {
+        Some(row) => (Some(row.level), row.reasons.clone()),
+        None => (None, Vec::new()),
+    };
     if why == Why::Uninstall {
         return Ok(folders
             .into_iter()
             .map(|f| {
+                let (level, reasons) = shown(&f.path);
                 if Path::new(&f.path).extension().is_some_and(|e| e.eq_ignore_ascii_case("lnk")) {
-                    Candidate::Shortcut { path: PathBuf::from(f.path), level: f.level, reasons: f.reasons }
+                    Candidate::Shortcut { path: PathBuf::from(f.path), level, reasons }
                 } else {
-                    Candidate::Folder { path: PathBuf::from(f.path), why, level: f.level, reasons: f.reasons }
+                    Candidate::Folder { path: PathBuf::from(f.path), why, level, reasons }
                 }
             })
             .collect());
@@ -537,7 +562,8 @@ pub fn folder_candidates(why: Why, folders: Vec<ReqFolder>, stale: &[StaleFile])
             if looks_stale(&f.path) && stale.iter().any(|s| same_place(&s.path, &f.path)) {
                 Candidate::StaleFile { path: PathBuf::from(f.path) }
             } else {
-                Candidate::Folder { path: PathBuf::from(f.path), why, level: f.level, reasons: f.reasons }
+                let (level, reasons) = shown(&f.path);
+                Candidate::Folder { path: PathBuf::from(f.path), why, level, reasons }
             }
         })
         .collect())
@@ -904,10 +930,10 @@ impl Launcher for ShellLaunch {
 
 pub struct CleanState {
     core: Mutex<Option<Arc<Core>>>,
-    /// What the last Leftovers list held.
-    listed: Mutex<HashSet<String>>,
+    /// What the last Leftovers list held, with the confidence it gave each row.
+    listed: Mutex<Listing>,
     /// What the last "what's left" list of each uninstalled app held, by app id.
-    uninstall_listed: Mutex<HashMap<String, HashSet<String>>>,
+    uninstall_listed: Mutex<HashMap<String, Listing>>,
     /// The uninstallers this run has started. Lives as long as the app, hidden window or not.
     uninstalls: Uninstalls,
     shared: Arc<Shared>,
@@ -941,7 +967,7 @@ impl Default for CleanState {
     fn default() -> Self {
         CleanState {
             core: Mutex::new(None),
-            listed: Mutex::new(HashSet::new()),
+            listed: Mutex::new(Listing::new()),
             uninstall_listed: Mutex::new(HashMap::new()),
             uninstalls: Uninstalls::default(),
             shared: Arc::new(Shared::default()),
@@ -990,6 +1016,10 @@ impl CleanState {
         apps::clear_icon_cache();
         if let Some(core) = self.core.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
             core.engine.drop_reviews();
+            // The snapshot of installed apps and running programs goes too; the next use reads it again.
+            if let Some(claims) = &core.claims {
+                claims.refresh();
+            }
         }
         if had_results {
             (*self.emitter())(json!({ "type": "dropped" }));
@@ -1189,7 +1219,7 @@ pub async fn clean_leftovers(clean: Clean<'_>, link: State<'_, Arc<ServiceLink>>
     let stale = fetch_stale(&link).await;
     let folders = walk.await.map_err(|e| format!("Looking for leftovers stopped unexpectedly: {e}"))?;
     let rows = merge_leftovers(folders, stale);
-    *clean.listed.lock().unwrap_or_else(|e| e.into_inner()) = listed_set(&rows);
+    *clean.listed.lock().unwrap_or_else(|e| e.into_inner()) = listing_of(&rows);
     Ok(rows)
 }
 
@@ -1223,7 +1253,12 @@ pub async fn clean_prepare(clean: Clean<'_>, link: State<'_, Arc<ServiceLink>>, 
             )?;
             // Which files are stale is also asked now. Only a leftovers request that names one needs the answer.
             let stale = if why == Why::Leftover && folders.iter().any(|f| looks_stale(&f.path)) { fetch_stale(&link).await? } else { Vec::new() };
-            folder_candidates(why, folders, &stale)?
+            // The confidence shown comes from the list Seek made, not from the request.
+            let listing = match (why, app_id.as_deref()) {
+                (Why::Uninstall, Some(app)) => clean.uninstall_listed.lock().unwrap_or_else(|e| e.into_inner()).get(app).cloned().unwrap_or_default(),
+                _ => clean.listed.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+            };
+            folder_candidates(why, folders, &stale, &listing)?
         }
         PrepareRequest::Stale { files } => {
             check_listed(files.iter().map(String::as_str), &clean.listed.lock().unwrap_or_else(|e| e.into_inner()))?;
@@ -1310,7 +1345,7 @@ pub async fn uninstall_leftovers(clean: Clean<'_>, link: State<'_, Arc<ServiceLi
     })
     .await
     .map_err(|e| format!("Looking for what was left behind stopped unexpectedly: {e}"))??;
-    clean.uninstall_listed.lock().unwrap_or_else(|e| e.into_inner()).insert(app_id, listed_set(&rows));
+    clean.uninstall_listed.lock().unwrap_or_else(|e| e.into_inner()).insert(app_id, listing_of(&rows));
     Ok(rows)
 }
 

@@ -15,7 +15,8 @@ interface Props {
   hub: HubStatus | null;
   /** Why the saved settings can't be used (so the protected list can't be read), or null. */
   problem: string | null;
-  onChange: (patch: Partial<Settings>) => void;
+  /** A function form works out its change from the settings as they are when it is saved. */
+  onChange: (patch: Partial<Settings> | ((s: Settings) => Partial<Settings>)) => void;
   onSharing: (enabled: boolean) => void;
   onLinkPc: () => void;
   /** Unlinks from the hub, or dismisses the notice. `done` is shown as a toast when it worked. */
@@ -224,7 +225,7 @@ export function SettingsPanel({ settings, version, peers, hub, problem, onChange
                     <button
                       className="icon-btn"
                       aria-label={`Stop protecting ${f}`}
-                      onClick={() => onChange({ protectedPaths: settings.protectedPaths.filter((x) => x !== f) })}
+                      onClick={() => onChange((s) => ({ protectedPaths: s.protectedPaths.filter((x) => x !== f) }))}
                     >
                       <X size={14} />
                     </button>

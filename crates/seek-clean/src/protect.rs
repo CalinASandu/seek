@@ -114,6 +114,12 @@ impl Places {
         !self.program_data.is_empty() && is_inside(canon_path, &self.program_data)
     }
 
+    /// True if `canon_path` (in `canon` form) is in the places programs and their data usually live:
+    /// Program Files (either), ProgramData, or the user's AppData.
+    pub fn in_usual_program_folders(&self, canon_path: &str) -> bool {
+        self.in_program_files(canon_path) || self.in_program_data(canon_path) || self.app_data.iter().any(|p| is_inside(canon_path, p))
+    }
+
     /// True if `canon_path` (in `canon` form) is strictly inside a Start Menu `Programs` folder.
     pub fn in_start_menu(&self, canon_path: &str) -> bool {
         self.start_menus.iter().map(|r| canon(r)).any(|r| canon_path.len() > r.len() && is_inside(canon_path, &r))

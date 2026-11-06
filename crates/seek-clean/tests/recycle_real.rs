@@ -93,6 +93,7 @@ fn real_put_back_restores_to_its_folder() {
         bin_path: Some(bin.clone()),
         left_reason: None,
         put_back_ms: None,
+        needs_admin: false,
     };
     let result = put_back(&entry, &ShellBin { owner: 0 });
     assert!(

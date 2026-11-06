@@ -103,6 +103,15 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
+/// `SetDefaultDllDirectories(System32 | application directory)` for this process. True if it took.
+fn restrict_dll_search() -> bool {
+    use windows_sys::Win32::System::LibraryLoader::{
+        SetDefaultDllDirectories, LOAD_LIBRARY_SEARCH_APPLICATION_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32,
+    };
+    // SAFETY: a plain call with two documented flags.
+    unsafe { SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32 | LOAD_LIBRARY_SEARCH_APPLICATION_DIR) != 0 }
+}
+
 /// The first thing `main` does: `--clean-elevated <pipe name>` is the admin step of Cleanup, started
 /// behind one UAC prompt. It needs no Tauri, no window and no single-instance plugin, so it is
 /// handled here and the process exits with the returned code. Anything else after the flag, or
@@ -110,6 +119,12 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
 pub fn clean_elevated_dispatch(args: &[std::ffi::OsString]) -> Option<i32> {
     if args.first()? != "--clean-elevated" {
         return None;
+    }
+    // Before anything else is loaded or read: from now on a DLL is found only in System32 or next to
+    // this exe, never in the current directory or on PATH, which a user (or anything running as them)
+    // can plant in. If that can't be set, nothing is done.
+    if !restrict_dll_search() {
+        return Some(2);
     }
     // Only the right shape of arguments gets any further (a refusal reads nothing and changes nothing).
     let [_, pipe_name] = args else { return Some(2) };
@@ -131,6 +146,9 @@ pub fn run() {
     let link = Arc::new(ServiceLink::default());
     let clean = Arc::new(CleanState::default());
     tauri::Builder::default()
+        // First, as the plugin requires. A second process would have its own settings cache and engine
+        // (and could drop a protected path), so a second launch only shows this window and exits.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| show_main(app)))
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             Some(vec!["--minimized"]),

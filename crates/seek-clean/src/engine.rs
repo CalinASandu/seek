@@ -13,7 +13,7 @@ use crate::model::{
     Candidate, CommitResult, ItemOutcome, JobItem, Level, Lock, Outcome, Prepared, Reason,
     ReviewItem, Why,
 };
-use crate::paths::{canon, is_inside, real_location, target_location};
+use crate::paths::{canon, has_odd_spelling, is_inside, real_location, target_location};
 use crate::protect::{candidate_lock, in_shared_folder, lock_for, uninstall_lock, Places};
 use crate::reasons::*;
 use support::{in_system_store, inside_any, new_token, run_admin, spellings};
@@ -259,6 +259,7 @@ impl Engine {
             files: 1,
             reparse: false,
             cloud: false,
+            unreadable: false,
         };
         let item = ReviewItem {
             id,
@@ -338,6 +339,11 @@ impl Engine {
         st: &Stat,
         ctx: &Ctx,
     ) -> (Option<Lock>, bool, String) {
+        // The path as written is what gets stat'ed and recycled, so a spelling `canon` would read
+        // differently (a stream name, `.` or `..`) is refused before anything is judged.
+        if has_odd_spelling(path) {
+            return (Some(Lock::UnsupportedPath), false, c.chars().take(2).collect());
+        }
         let real = real_location(path);
         let spell: Vec<&str> = std::iter::once(c).chain(real.as_deref()).collect();
         let mut lock = spell
@@ -376,6 +382,9 @@ impl Engine {
         let admin = why == Why::StaleData
             || (matches!(why, Why::Leftover | Why::Uninstall) && spell.iter().any(pf))
             || (why == Why::Uninstall && spell.iter().any(|s| self.places.in_program_data(s)));
+        if lock.is_none() && st.unreadable {
+            lock = Some(Lock::Unreadable);
+        }
         if lock.is_none() && st.cloud {
             lock = Some(Lock::CloudPlaceholder);
         }
@@ -534,9 +543,14 @@ impl Engine {
 
         // What this process moved is written down before the admin prompt: a Quit while that is
         // open still keeps it. The admin items are written when the answer comes back.
+        let mut errors: Vec<String> = Vec::new();
         let mut notes: Vec<String> = Vec::new();
         let recorded = out.len();
-        notes.extend(self.record(&review, &out, &moved_at));
+        let mut keep = |(error, note): (Option<String>, Option<String>)| {
+            errors.extend(error);
+            notes.extend(note);
+        };
+        keep(self.record(&review, &out, &moved_at, false));
         if let Some(e) = self.elevator.as_ref().filter(|_| !admin.is_empty()) {
             run_admin(
                 e.as_ref(),
@@ -546,25 +560,31 @@ impl Engine {
                 &mut stopped,
             );
         }
-        notes.extend(self.record(&review, &out[recorded..], &HashMap::new()));
+        keep(self.record(&review, &out[recorded..], &HashMap::new(), true));
+        errors.dedup();
         notes.dedup();
-        let history_error = (!notes.is_empty()).then(|| notes.join(" "));
+        let history_error = (!errors.is_empty()).then(|| errors.join(" "));
+        let history_note = (!notes.is_empty()).then(|| notes.join(" "));
         Ok(CommitResult {
             items: out,
             moved_bytes,
             stopped_early: stopped,
             history_error,
+            history_note,
         })
     }
 
     /// Writes one history entry per item, moved or left. Each carries the time it moved (items
     /// with no time here, left ones and the admin step's, get now). A failure here never undoes a
-    /// removal: it comes back as text for the result to show, as does a note that a damaged file
-    /// was set aside.
-    fn record(&self, review: &Review, items: &[ItemOutcome], moved_at: &HashMap<u32, i64>) -> Option<String> {
-        let history = self.history.as_ref()?;
+    /// removal: it comes back as an error text for the result to show. A damaged file that was set
+    /// aside is not an error (everything was recorded): it comes back as a note. Returns
+    /// `(error, note)`.
+    fn record(&self, review: &Review, items: &[ItemOutcome], moved_at: &HashMap<u32, i64>, by_admin: bool) -> (Option<String>, Option<String>) {
+        let Some(history) = self.history.as_ref() else {
+            return (None, None);
+        };
         if items.is_empty() {
-            return None;
+            return (None, None);
         }
         let now = history::now_ms();
         let entries: Vec<history::Entry> = items
@@ -580,6 +600,7 @@ impl Engine {
                     original_path: i.path.clone(),
                     size: i.size,
                     why: review.recs.get(&i.id).map_or(Why::Leftover, |r| r.why),
+                    needs_admin: by_admin && bin_path.is_some(),
                     bin_path,
                     left_reason,
                     put_back_ms: None,
@@ -587,11 +608,14 @@ impl Engine {
             })
             .collect();
         match history.append(&entries) {
-            Ok(note) => note,
-            Err(e) if entries.iter().any(|e| e.bin_path.is_some()) => Some(format!(
-                "Moved to the Recycle Bin, but they weren't recorded. {e} Put them back from the Recycle Bin if needed."
-            )),
-            Err(e) => Some(format!("Nothing was recorded in Recently removed. {e}")),
+            Ok(note) => (None, note),
+            Err(e) if entries.iter().any(|e| e.bin_path.is_some()) => (
+                Some(format!(
+                    "Moved to the Recycle Bin, but they weren't recorded. {e} Put them back from the Recycle Bin if needed."
+                )),
+                None,
+            ),
+            Err(e) => (Some(format!("Nothing was recorded in Recently removed. {e}")), None),
         }
     }
 

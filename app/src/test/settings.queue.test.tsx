@@ -1,10 +1,11 @@
-import { act, renderHook, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, renderHook, screen, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { describe, expect, it, vi } from "vitest";
 import { createMockApi } from "../api/mock";
 import { ApiContext } from "../api/context";
 import type { Settings, SeekApi } from "../api/types";
 import { useSettings } from "../hooks/useSettings";
+import { SettingsPanel } from "../components/SettingsPanel";
 
 /** An API whose saves wait until the test lets them finish (or fail). */
 function gatedApi() {
@@ -106,5 +107,52 @@ describe("useSettings save queue", () => {
     await b;
     expect(setSettings.mock.calls.at(-1)![0].protectedPaths).toEqual(["B"]);
     expect(result.current.settings.protectedPaths).toEqual(["B"]);
+  });
+});
+
+describe("Settings panel removal", () => {
+  it("a Stop protecting click made while a row protect is still saving keeps both results", async () => {
+    const { api, base, gates } = gatedApi();
+    await base.setSettings({ ...(await base.getSettings()), protectedPaths: ["Y"] });
+    const hookRef: { current?: ReturnType<typeof useSettings> } = {};
+    function Harness() {
+      const h = useSettings();
+      hookRef.current = h;
+      return (
+        <SettingsPanel
+          settings={h.settings}
+          version={undefined}
+          peers={null}
+          hub={null}
+          problem={null}
+          onChange={(patch) => void h.update(patch).catch(() => undefined)}
+          onSharing={() => undefined}
+          onLinkPc={() => undefined}
+          onUnlinkHub={() => undefined}
+          onClose={() => undefined}
+        />
+      );
+    }
+    render(
+      <ApiContext.Provider value={api}>
+        <Harness />
+      </ApiContext.Provider>,
+    );
+    await screen.findByLabelText("Stop protecting Y");
+    await act(async () => undefined);
+    let a!: Promise<void>;
+    // the row menu protects X (saveFirst: the panel doesn't know about X until the save lands)
+    act(() => {
+      a = hookRef.current!.update(add("X"), { saveFirst: true });
+    });
+    await waitFor(() => expect(gates).toHaveLength(1));
+    // meanwhile the panel's own button removes Y, from the props it has drawn so far
+    fireEvent.click(screen.getByLabelText("Stop protecting Y"));
+    await act(async () => gates[0]!.ok());
+    await waitFor(() => expect(gates).toHaveLength(2));
+    await act(async () => gates[1]!.ok());
+    await a;
+    expect((await base.getSettings()).protectedPaths).toEqual(["X"]);
+    expect(hookRef.current!.settings.protectedPaths).toEqual(["X"]);
   });
 });
