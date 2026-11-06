@@ -355,8 +355,9 @@ enum Ready {
     Go(RestoreJob),
     /// The answer already.
     Refused(PutBackResult),
-    /// Something is at the original path. If the entry's bin item is gone too, it is back in its
-    /// folder (a put back that finished after its deadline); otherwise it is something new.
+    /// Something is at the original path, and it was created no later than the removal. If the
+    /// entry's bin item is gone too, it is back in its folder (a put back that finished after its
+    /// deadline); otherwise it is something new.
     Taken(String),
 }
 
@@ -372,8 +373,13 @@ fn ready(entry: &Entry) -> Ready {
     }
     let original = Path::new(&entry.original_path);
     // Anything at all there, even a broken link: restoring over it could lose it.
-    if std::fs::symlink_metadata(original).is_ok() {
-        return Ready::Taken(bin_path.to_string());
+    if let Ok(md) = std::fs::symlink_metadata(original) {
+        // A restored item keeps its creation time; a file made after the removal is something new.
+        let created_ms = md.created().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map(|d| d.as_millis() as i64);
+        return match created_ms {
+            Some(c) if c <= entry.time_ms => Ready::Taken(bin_path.to_string()),
+            _ => Ready::Refused(something_new(entry)),
+        };
     }
     Ready::Go((bin_path.to_string(), original.to_path_buf(), entry.time_ms))
 }

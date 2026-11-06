@@ -450,13 +450,28 @@ pub fn in_bin(bin_path: &str) -> bool {
 
 /// For each bin path, whether the Recycle Bin still lists it: one listing for all of them. A bin
 /// that can't be listed is an error, never "not there".
+/// Waits no longer than [`PUT_BACK_DEADLINE`]; a bin that doesn't answer in time is an error.
 pub fn bin_lists(bin_paths: &[String]) -> Result<Vec<bool>, String> {
     let wanted = bin_paths.to_vec();
-    // SAFETY: COM objects stay on the STA thread and drop before CoUninitialize.
-    on_sta(move || unsafe {
-        let listed: std::collections::HashSet<String> = list_bin()?.into_iter().map(|(p, _)| p.to_ascii_lowercase()).collect();
-        Ok(wanted.iter().map(|p| listed.contains(&p.to_ascii_lowercase())).collect())
+    within(PUT_BACK_DEADLINE, move || {
+        // SAFETY: COM objects stay on the STA thread and drop before CoUninitialize.
+        on_sta(move || unsafe {
+            let listed: std::collections::HashSet<String> = list_bin()?.into_iter().map(|(p, _)| p.to_ascii_lowercase()).collect();
+            Ok(wanted.iter().map(|p| listed.contains(&p.to_ascii_lowercase())).collect())
+        })
     })
+}
+
+pub const BIN_NO_ANSWER: &str = "Couldn't read the Recycle Bin: Windows didn't answer.";
+
+/// Runs `work` on a thread of its own and waits at most `deadline` for it. The thread is detached
+/// when the wait runs out (it may be stuck inside Windows), never joined.
+fn within<T: Send + 'static>(deadline: std::time::Duration, work: impl FnOnce() -> Result<T, String> + Send + 'static) -> Result<T, String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(work());
+    });
+    rx.recv_timeout(deadline).unwrap_or_else(|_| Err(BIN_NO_ANSWER.to_string()))
 }
 
 /// `System.Recycle.DateDeleted` (fmtid 9B174B33-..., pid 3) of a bin item, in unix epoch ms.
@@ -765,6 +780,18 @@ mod tests {
     }
 
     #[test]
+    fn a_bin_listing_that_never_answers_gives_up_with_a_plain_reason() {
+        let started = std::time::Instant::now();
+        let out: Result<u8, String> = super::within(std::time::Duration::from_millis(150), || {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            Ok(1)
+        });
+        assert_eq!(out, Err("Couldn't read the Recycle Bin: Windows didn't answer.".to_string()));
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+        assert_eq!(super::within(std::time::Duration::from_secs(5), || Ok::<_, String>(7)), Ok(7));
+    }
+
+    #[test]
     fn after_the_deadline_the_put_back_thread_starts_no_new_item() {
         let started = std::sync::Arc::new(std::sync::Mutex::new(Vec::<usize>::new()));
         let seen = started.clone();
@@ -867,11 +894,18 @@ mod tests {
             r"C:\x\..\y",
             "C:/x/../y",
             r"C:\x\y\..",
+            r"C:\x\...",
+            r"C:\x\foo.",
+            r"C:\x\foo ",
+            r"C:\x\foo.\bar",
         ] {
             assert!(!is_plain_absolute(Path::new(bad)), "{bad}");
             assert!(recycle_one(Path::new(bad)).is_err(), "{bad}");
         }
-        assert!(is_plain_absolute(Path::new(r"C:\x\.hidden\a..b.txt")));
+        for fine in [r"C:\x\.hidden\a..b.txt", r"C:\x\.config", r"C:\x\a..b", r"C:\x\a.b"] {
+            assert!(is_plain_absolute(Path::new(fine)), "{fine}");
+            assert!(!crate::paths::has_odd_spelling(Path::new(fine)), "{fine}");
+        }
     }
 
     #[test]

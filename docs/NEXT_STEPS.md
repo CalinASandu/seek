@@ -1,6 +1,6 @@
 # Seek — Status & Next Steps
 
-_Last updated: 2026-11-05 (Decimator spec approved, plan written). Read this first when starting a new session in this repo._
+_Last updated: 2026-11-06 (Decimator built and reviewed; real-window check by the user next). Read this first when starting a new session in this repo._
 
 ## Where we are
 
@@ -287,36 +287,47 @@ optional `init`, `compose up -d`, `compose logs`, `openssl s_client` (the certif
   and the Link dialog keep the older `.segmented` control.
 - Maybe later (user): a shortcuts page in Settings.
 
-## Next task: Cleanup and uninstaller (asked for 2026-11-04, nothing built yet)
+## Decimator (Cleanup): built 2026-11-05 … 11-06, waiting for the user's real-window check
 
-The user wants the Cleanup area and uninstaller built next, with a panel as polished as the rest of the app: Apple-style, clean,
-smooth animations (read the `emil-design-eng` skill first). Suggested setup: Opus orchestrates and owns design and final UI review,
-Sonnet agents code. Write a design spec first, since this is the first time Seek deletes anything.
+Spec `docs/superpowers/specs/2026-11-04-seek-cleanup-design.md`, plan `docs/superpowers/plans/2026-11-05-seek-decimator.md`, all 18
+tasks plus a final whole-branch review and fix pass, committed on `feat/v1` (not pushed). Every ruling made along the way, with what
+it costs if wrong, is in the ledger `.superpowers/sdd/2026-11-05-seek-decimator/progress.md` (git-ignored).
 
-The RAM and "seen" work is committed (`24cbddc`). The pairing fix below needs `Rebuild Seek.bat` to run on this PC.
+- **What it is:** a Decimator area beside Search and Space (`Ctrl+Shift+D`) with Duplicates, Leftovers and Apps (run an app's own
+  uninstaller, then offer what it left), plus Recently removed with Put back. `crates/seek-clean` is the only code that removes
+  anything, and it only moves to the Recycle Bin; every rule is in its engine (`prepare` → token → `commit`), not the UI.
+- **Admin:** Program Files leftovers and Seek's stale index files go through one UAC prompt per removal, run by `seek-app.exe
+  --clean-elevated` over a user-only named pipe; the elevated copy re-judges every item. Put back of an admin-removed item says to
+  restore it from the Recycle Bin.
+- **Protect:** row menu *Always protect* (saved before the row changes) and Settings → Protected from Cleanup.
+- **Seek's own uninstaller** asks "Also delete Seek's index and settings? This is permanent." (No by default; skipped when silent,
+  passive or updating).
+- **One Seek at a time** now (`tauri-plugin-single-instance`): a second launch focuses the running window.
+- The app and service must be rebuilt together (the protocol gained `StaleData` and `FolderFacts`).
+- Tests at the end: `cargo test --workspace` 817 passed; `pnpm test` 165; clippy clean. Real-Recycle-Bin flows:
+  `cargo test -p seek-clean --test flows -- --ignored` (temp files only).
 
-**Where this stands (2026-11-05):** the user approved the spec `docs/superpowers/specs/2026-11-04-seek-cleanup-design.md`, including the name
-Decimator and leaving registry cleaning out. The plan is `docs/superpowers/plans/2026-11-05-seek-decimator.md`, waiting for the user's review.
-No code is written yet, and the spec and plan are uncommitted.
+**Limits the user should know (rulings):**
+- Only NTFS and ReFS drives can be cleaned; others show why (Google Drive's G: can't be told apart from a FAT32 drive with a bin).
+- A removal is refused when the Recycle Bin would be over 90% full afterwards: "empty the Recycle Bin first".
+- Very long paths are refused with a reason (Windows may delete them for good instead of recycling).
+- Two separate removals can leave the last copy of a file only in the Recycle Bin (a duplicate removed, later its twin as a leftover).
+- Running an older Seek build and saving settings drops the Always protect list.
 
-**Decided by the user (2026-11-04), defaults plus their changes:**
-
-- A Cleanup area beside Search and Space. Files only go to the Recycle Bin, never permanently deleted. Deletes run from the window
-  with the user's permissions, never from the SYSTEM service.
-- **The user sees exactly which leftovers and files Seek removes, every time, and can protect any item.** This doesn't cover what an app's own
-  uninstaller removes. Program Files can be cleaned, with an admin prompt for that removal, but only after that list.
-- A duplicate means identical contents, checked by comparing the files; a name and size match is never enough. Only this PC's files can
-  be deleted; a linked PC's duplicates can be listed. Duplicates never touch Windows, Program Files or other users' folders. Seek
-  suggests which copy to keep and never picks for the user.
-- Uninstaller: Seek uninstalls other apps and removes what they leave behind, like Revo, plus a small polish of Seek's own uninstaller
-  (an opt-in "delete my index" step). Desktop apps first, Store apps later.
-- Leftovers: Program Files and AppData folders no installed app owns, plus Seek's own data. No registry cleaning in the first version.
-- Drives without a Recycle Bin: their files can't be removed from Seek, and the list says why. An app's own uninstaller can't be undone:
-  Seek warns first, then offers the leftover scan. No automatic restore point.
-- Every selector uses `Segmented.tsx` (Link a device, Settings theme, Search/Space, Space tabs), which also fixes Hub wrapping onto its
-  own row in the Link dialog. The beam in dark mode (now `#f5f5f7`) gets clearly darker: the user asked for darker than the `#c7c7cc`
-  first suggested. Dark label text kept, glow softened. Light mode keeps its dark beam.
-- Link panels: steadier spacing, a dialog that keeps its height when switching tabs, tabs ordered Show a code, Enter a code, Hub.
+**Real-window checks (user), after `Stop Seek.bat` then `Rebuild Seek.bat`:**
+1. Look and feel, light and dark: each tab, the review sheet, Recently removed, the beam colour (`#aeaeb2`), the motion. Not yet seen
+   in a real window (the session's browser pane couldn't draw).
+2. A USB stick or other non-NTFS drive shows its items locked, with the reason.
+3. A Program Files leftover: exactly one admin prompt, no false "system folders don't match" refusal, and it lands in the
+   Recycle Bin (the admin copy now loads DLLs from System32 and its own folder only).
+4. Uninstall a small real app: UAC if it asks, its uninstaller runs, then its leftovers are listed.
+5. *Put back* restores a file to its folder; with a new file of the same name at the original path it refuses with the reason; an
+   admin-removed item says to restore it from the Recycle Bin.
+6. Scan Duplicates, hide the window for 5 minutes, then `seek memory` / Task Manager: the window's memory goes back down.
+7. A OneDrive folder: online-only files are never downloaded by a scan.
+8. A second double-click on `Seek.bat` brings up the running window.
+9. Installer: `.\scripts\build-installer.ps1` (Seek stopped), install, uninstall: the data question defaults to No.
+10. Index timing for Leftovers: `cargo test -p seek-app real_leftovers_list_with_index -- --ignored --nocapture`.
 
 ## Pairing race (fixed 2026-11-04)
 
@@ -458,7 +469,7 @@ Hub, PC side (final review; I1-I4, M1, M2, M5, M6 were fixed in the final fix pa
 4. Empty query sorted by name over 10M ≈ 0.5 s (consider a pre-sorted name order per index).
 5. UI: no inline query syntax highlighting (spec §8.2).
 6. Google Drive (`G:`, virtual FAT32) is treated as a removable drive; classify cloud-sync drives separately.
-7. Uninstall keeps `%ProgramData%\Seek` (indexes); add an opt-in "delete my index" step. MSI target.
+7. MSI target for the installer.
 8. Shares: rescan only changed folders too (needs incremental pushes instead of whole indexes).
 9. Later specs: self-hosted server sync (and relaying between PCs that can't reach each other) → macOS/Linux →
    content search / duplicates.

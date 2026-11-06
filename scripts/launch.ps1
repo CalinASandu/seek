@@ -44,11 +44,6 @@ if (-not (Test-ServicePipe)) {
 # 3. Open the window (or bring the running one to the front).
 # A copy hidden in the tray has no window handle, so look for the process. Starting the app again
 # is safe: a second launch shows the first window and exits (single instance).
-$running = Get-Process seek-app -ErrorAction SilentlyContinue
-if ($running) {
-    $env:SEEK_SERVICE_PATH = $service
-    Start-Process $app
-} else {
-    $env:SEEK_SERVICE_PATH = $service
-    Start-Process $app
-}
+# Either way the same call: with no copy running it opens the window.
+$env:SEEK_SERVICE_PATH = $service
+Start-Process $app

@@ -1244,20 +1244,21 @@ pub async fn clean_prepare(clean: Clean<'_>, link: State<'_, Arc<ServiceLink>>, 
             candidates_from_request(groups, &owners)
         }
         PrepareRequest::Folders { why, folders, app_id } => {
-            check_folder_request(
-                why,
-                app_id.as_deref(),
-                folders.iter().map(|f| f.path.as_str()),
-                &clean.listed.lock().unwrap_or_else(|e| e.into_inner()),
-                &clean.uninstall_listed.lock().unwrap_or_else(|e| e.into_inner()),
-            )?;
+            // One snapshot of the lists, under both locks: the check and the confidence lookup below
+            // use the same list, so a path that passed the check always has its row (a new listing
+            // arriving in between changes nothing here). The confidence shown comes from this list,
+            // not from the request.
+            let listing = {
+                let leftovers = clean.listed.lock().unwrap_or_else(|e| e.into_inner());
+                let uninstalls = clean.uninstall_listed.lock().unwrap_or_else(|e| e.into_inner());
+                check_folder_request(why, app_id.as_deref(), folders.iter().map(|f| f.path.as_str()), &leftovers, &uninstalls)?;
+                match (why, app_id.as_deref()) {
+                    (Why::Uninstall, Some(app)) => uninstalls.get(app).cloned().unwrap_or_default(),
+                    _ => leftovers.clone(),
+                }
+            };
             // Which files are stale is also asked now. Only a leftovers request that names one needs the answer.
             let stale = if why == Why::Leftover && folders.iter().any(|f| looks_stale(&f.path)) { fetch_stale(&link).await? } else { Vec::new() };
-            // The confidence shown comes from the list Seek made, not from the request.
-            let listing = match (why, app_id.as_deref()) {
-                (Why::Uninstall, Some(app)) => clean.uninstall_listed.lock().unwrap_or_else(|e| e.into_inner()).get(app).cloned().unwrap_or_default(),
-                _ => clean.listed.lock().unwrap_or_else(|e| e.into_inner()).clone(),
-            };
             folder_candidates(why, folders, &stale, &listing)?
         }
         PrepareRequest::Stale { files } => {
