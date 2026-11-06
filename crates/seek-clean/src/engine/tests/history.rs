@@ -52,7 +52,10 @@ fn a_history_that_cant_be_written_says_so_but_the_items_are_still_moved() {
     let r = env.engine.commit(&prep.token, &[0], &[]).unwrap();
     assert!(is_moved(&r, 0));
     assert!(!a.exists() && b.exists(), "the removal went ahead");
-    assert!(r.history_error.as_deref().is_some_and(|e| !e.is_empty()), "{:?}", r.history_error);
+    let said = r.history_error.as_deref().unwrap();
+    assert!(said.starts_with("Moved to the Recycle Bin, but they weren't recorded."), "{said}");
+    assert!(said.contains("Put them back from the Recycle Bin if needed."), "{said}");
+    assert!(!said.contains("os error") && !said.to_lowercase().contains("try again"), "{said}");
 }
 
 #[test]
@@ -62,4 +65,55 @@ fn an_engine_without_history_records_nothing_and_reports_nothing() {
     let b = env.file("users/me/docs/b.bin", b"aa");
     let prep = env.engine.prepare(vec![dups(&[&a, &b])], &[]);
     assert_eq!(env.engine.commit(&prep.token, &[0], &[]).unwrap().history_error, None);
+}
+
+/// An elevator that looks at the history when it is asked, then moves everything.
+struct Peeking {
+    history: Arc<History>,
+    seen: Mutex<Option<usize>>,
+}
+
+impl Elevator for Peeking {
+    fn run(&self, items: &[JobItem]) -> Result<crate::facts::AdminAnswer, String> {
+        *self.seen.lock().unwrap() = Some(self.history.list().len());
+        let answered = items
+            .iter()
+            .map(|j| ItemOutcome {
+                id: j.id,
+                path: j.path.clone(),
+                size: j.size,
+                outcome: Outcome::Moved { bin_path: r"C:\$Recycle.Bin\S\$RADMIN".into() },
+            })
+            .collect();
+        Ok(crate::facts::AdminAnswer { items: answered, stopped_early: None })
+    }
+}
+
+#[test]
+fn admin_items_are_recorded_after_the_prompt_and_what_moved_before_it_is_kept_first() {
+    let mut env = Env::new(true);
+    let dir = tempfile::tempdir().unwrap();
+    let hist = Arc::new(History::open(dir.path().join("cleanup-history.json")));
+    let peek = Arc::new(Peeking { history: hist.clone(), seen: Mutex::new(None) });
+    env.engine = env.engine.with_history(hist.clone());
+    env.engine.elevator = Some(peek.clone());
+
+    let a = env.file("users/me/docs/a.bin", b"aa");
+    let b = env.file("users/me/docs/b.bin", b"aa");
+    let admin_folder = env.folder("pf/OldApp");
+    let admin_path = env.p("pf/OldApp");
+    let prep = env.engine.prepare(vec![dups(&[&a, &b]), admin_folder], &[]);
+    let r = env.engine.commit(&prep.token, &[0, 2], &[]).unwrap();
+    assert!(is_moved(&r, 0) && is_moved(&r, 2));
+    assert_eq!(r.history_error, None);
+
+    // When the prompt opened, the ordinary removal was already written down.
+    assert_eq!(*peek.seen.lock().unwrap(), Some(1));
+    let got = hist.list();
+    assert_eq!(got.len(), 2);
+    let admin = got.iter().find(|e| e.original_path == admin_path.to_string_lossy()).unwrap();
+    assert_eq!(admin.bin_path.as_deref(), Some(r"C:\$Recycle.Bin\S\$RADMIN"));
+    assert_eq!(admin.why, Why::Leftover);
+    let plain = got.iter().find(|e| e.original_path == a.to_string_lossy()).unwrap();
+    assert!(admin.time_ms >= plain.time_ms, "each item has its own time, the admin one stamped when the answer came back");
 }

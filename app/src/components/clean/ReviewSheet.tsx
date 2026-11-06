@@ -79,7 +79,8 @@ export function ReviewSheet({ request, picked, contents, onProtect, onClose }: P
   const [open, setOpen] = useState<ReadonlySet<number>>(new Set());
   const [focus, setFocus] = useState(0);
   const [result, setResult] = useState<CommitResult | null>(null);
-  const [putBack, setPutBack] = useState<{ busy: boolean; done: number; failed: string[] } | null>(null);
+  const [putBack, setPutBack] = useState<{ busy: boolean; done: number; failed: string[]; notes: string[] } | null>(null);
+  const [binProblem, setBinProblem] = useState<string | null>(null);
   const [restored, setRestored] = useState<ReadonlySet<string>>(new Set());
   const root = useRef<HTMLDivElement>(null);
   const listRef = useRef<HTMLDivElement | null>(null);
@@ -216,10 +217,10 @@ export function ReviewSheet({ request, picked, contents, onProtect, onClose }: P
 
   const doPutBack = async () => {
     if (!result) return;
-    setPutBack({ busy: true, done: 0, failed: [] });
+    setPutBack({ busy: true, done: 0, failed: [], notes: [] });
     try {
       const bins = new Map(result.items.flatMap((i) => (i.outcome.kind === "moved" ? [[i.outcome.binPath, i.path] as const] : [])));
-      const entries = (await api.cleanHistory()).filter((h) => h.binPath !== null && bins.has(h.binPath));
+      const entries = (await api.cleanHistory()).filter((h) => h.putBackMs === null && h.binPath !== null && bins.has(h.binPath));
       const results = await api.cleanPutBack(entries.map((e) => e.id));
       const okPaths = new Set<string>();
       results.forEach((r) => {
@@ -227,9 +228,15 @@ export function ReviewSheet({ request, picked, contents, onProtect, onClose }: P
         if (r.restored && e) okPaths.add(e.originalPath);
       });
       setRestored(okPaths);
-      setPutBack({ busy: false, done: okPaths.size, failed: results.filter((r) => !r.restored).map((r) => r.reason ?? "It could not be put back.") });
+      setPutBack({
+        busy: false,
+        done: okPaths.size,
+        failed: results.filter((r) => !r.restored).map((r) => r.reason ?? "It could not be put back."),
+        // Put back, but Recently removed couldn't record it: still shown.
+        notes: results.filter((r) => r.restored && r.reason).map((r) => r.reason as string),
+      });
     } catch (e) {
-      setPutBack({ busy: false, done: 0, failed: [errText(e)] });
+      setPutBack({ busy: false, done: 0, failed: [errText(e)], notes: [] });
     }
   };
 
@@ -277,11 +284,17 @@ export function ReviewSheet({ request, picked, contents, onProtect, onClose }: P
   const footer =
     phase === "done" ? (
       <>
-        {movedPaths.length > 0 && (
-          <button className="btn" onClick={() => void doPutBack()} disabled={!!putBack && (putBack.busy || putBack.done > 0)}>
-            Put back
-          </button>
-        )}
+        {movedPaths.length > 0 &&
+          (result?.historyError ? (
+            // Nothing was recorded to put back from here: the Recycle Bin is the way.
+            <button className="btn" onClick={() => void api.openRecycleBin().catch(() => setBinProblem("Couldn't open the Recycle Bin."))}>
+              Open Recycle Bin
+            </button>
+          ) : (
+            <button className="btn" onClick={() => void doPutBack()} disabled={!!putBack && (putBack.busy || putBack.done > 0)}>
+              Put back
+            </button>
+          ))}
         <button className="btn btn-primary" data-autofocus onClick={close}>
           Done
         </button>
@@ -306,21 +319,23 @@ export function ReviewSheet({ request, picked, contents, onProtect, onClose }: P
         <div className="review-result">
           <p className="review-note">
             {movedPaths.length > 0
-              ? `${plural(movedPaths.length)} ${movedPaths.length === 1 ? "is" : "are"} in the Recycle Bin. You can put ${movedPaths.length === 1 ? "it" : "them"} back from there, or here.`
+              ? `${plural(movedPaths.length)} ${movedPaths.length === 1 ? "is" : "are"} in the Recycle Bin. ${
+                  result.historyError ? "" : `You can put ${movedPaths.length === 1 ? "it" : "them"} back from there, or here.`
+                }`.trim()
               : "Everything was left where it was."}
           </p>
           {result.stoppedEarly && <p className="review-warn">Removal stopped early. {result.stoppedEarly}</p>}
           {result.historyError && (
             <p className="review-warn" role="status">
-              {movedPaths.length > 0
-                ? `Moved, but Recently removed couldn't record it: ${result.historyError} The items are in the Recycle Bin.`
-                : `Recently removed couldn't record this: ${result.historyError}`}
+              {result.historyError}
             </p>
           )}
+          {binProblem && <p className="review-warn">{binProblem}</p>}
           {putBack && !putBack.busy && (
             <p className="review-note" role="status">
               {putBack.done > 0 ? `Put back ${plural(putBack.done)}.` : "Nothing was put back."}
               {putBack.failed.length > 0 && ` ${putBack.failed[0]}`}
+              {putBack.notes.length > 0 && <span className="removed-note"> {putBack.notes[0]}</span>}
             </p>
           )}
           {left.length > 0 && (

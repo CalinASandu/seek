@@ -463,6 +463,8 @@ impl Engine {
         let mut stayed: HashSet<u32> = HashSet::new();
         let mut admin: Vec<JobItem> = Vec::new();
         let mut stopped: Option<String> = None;
+        // When each item was moved (by this process), so its history entry carries its own time.
+        let mut moved_at: HashMap<u32, i64> = HashMap::new();
 
         for &id in &sel {
             let rec = &review.recs[&id];
@@ -509,6 +511,7 @@ impl Engine {
                     // One path per call, straight after its own last look.
                     Ok(_) => match self.recycle_step(rec) {
                         Step::Moved(bin_path) => {
+                            moved_at.insert(id, history::now_ms());
                             moved_bytes = moved_bytes.saturating_add(rec.stat.size);
                             Outcome::Moved { bin_path }
                         }
@@ -529,6 +532,11 @@ impl Engine {
             out.push(mk(outcome));
         }
 
+        // What this process moved is written down before the admin prompt: a Quit while that is
+        // open still keeps it. The admin items are written when the answer comes back.
+        let mut notes: Vec<String> = Vec::new();
+        let recorded = out.len();
+        notes.extend(self.record(&review, &out, &moved_at));
         if let Some(e) = self.elevator.as_ref().filter(|_| !admin.is_empty()) {
             run_admin(
                 e.as_ref(),
@@ -538,7 +546,9 @@ impl Engine {
                 &mut stopped,
             );
         }
-        let history_error = self.record(&review, &out);
+        notes.extend(self.record(&review, &out[recorded..], &HashMap::new()));
+        notes.dedup();
+        let history_error = (!notes.is_empty()).then(|| notes.join(" "));
         Ok(CommitResult {
             items: out,
             moved_bytes,
@@ -547,14 +557,16 @@ impl Engine {
         })
     }
 
-    /// Writes one history entry per item of a finished commit, moved or left. A failure here never
-    /// undoes a removal: it comes back as text for the result to show.
-    fn record(&self, review: &Review, items: &[ItemOutcome]) -> Option<String> {
+    /// Writes one history entry per item, moved or left. Each carries the time it moved (items
+    /// with no time here, left ones and the admin step's, get now). A failure here never undoes a
+    /// removal: it comes back as text for the result to show, as does a note that a damaged file
+    /// was set aside.
+    fn record(&self, review: &Review, items: &[ItemOutcome], moved_at: &HashMap<u32, i64>) -> Option<String> {
         let history = self.history.as_ref()?;
         if items.is_empty() {
             return None;
         }
-        let time_ms = history::now_ms();
+        let now = history::now_ms();
         let entries: Vec<history::Entry> = items
             .iter()
             .map(|i| {
@@ -564,7 +576,7 @@ impl Engine {
                 };
                 history::Entry {
                     id: history::new_id(),
-                    time_ms,
+                    time_ms: moved_at.get(&i.id).copied().unwrap_or(now),
                     original_path: i.path.clone(),
                     size: i.size,
                     why: review.recs.get(&i.id).map_or(Why::Leftover, |r| r.why),
@@ -574,7 +586,13 @@ impl Engine {
                 }
             })
             .collect();
-        history.append(&entries).err()
+        match history.append(&entries) {
+            Ok(note) => note,
+            Err(e) if entries.iter().any(|e| e.bin_path.is_some()) => Some(format!(
+                "Moved to the Recycle Bin, but they weren't recorded. {e} Put them back from the Recycle Bin if needed."
+            )),
+            Err(e) => Some(format!("Nothing was recorded in Recently removed. {e}")),
+        }
     }
 
     /// Recycles one item. If Windows reports failure, the item counts as still there only when it

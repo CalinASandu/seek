@@ -51,11 +51,27 @@ describe("Recently removed", () => {
     expect(within(dialog).queryByRole("button", { name: /^Put back/ })).toBeNull();
   });
 
-  it("says in the result when the history could not be written", async () => {
+  it("says the reason when a put-back worked but could not be recorded", async () => {
+    const note = "Recently removed couldn't record it. Access is denied.";
+    const api: SeekApi = {
+      ...base(),
+      cleanHistory: async () => [entry({})],
+      cleanPutBack: async (ids) => ids.map((id) => ({ id, restored: true, reason: note })),
+    };
+    const { user, dialog } = await openRemoved(api);
+    await user.click(await within(dialog).findByRole("button", { name: "Put back report.docx" }));
+    expect(await within(dialog).findByText("Put back")).toBeInTheDocument();
+    expect(within(dialog).getByText(note)).toBeInTheDocument();
+  });
+
+  it("says in the result when the history could not be written, and offers the Recycle Bin instead of Put back", async () => {
+    const said = "Moved to the Recycle Bin, but they weren't recorded. Access is denied. Put them back from the Recycle Bin if needed.";
     const b = base();
+    const openRecycleBin = vi.fn(async () => {});
     const api: SeekApi = {
       ...b,
-      cleanCommit: async (token, ids) => ({ ...(await b.cleanCommit(token, ids)), historyError: "Access is denied." }),
+      openRecycleBin,
+      cleanCommit: async (token, ids) => ({ ...(await b.cleanCommit(token, ids)), historyError: said }),
     };
     const user = userEvent.setup();
     render(<App api={api} />);
@@ -67,9 +83,12 @@ describe("Recently removed", () => {
     const sheet = await screen.findByRole("dialog");
     await within(sheet).findAllByRole("row");
     await user.click(within(sheet).getByRole("button", { name: /^Move 1 item/ }));
-    await within(await screen.findByRole("dialog")).findByText(/^Moved 1 item/);
-    expect(
-      within(screen.getByRole("dialog")).getByText("Moved, but Recently removed couldn't record it: Access is denied. The items are in the Recycle Bin."),
-    ).toBeInTheDocument();
+    const done = await screen.findByRole("dialog");
+    await within(done).findByText(/^Moved 1 item/);
+    expect(within(done).getByText(said)).toBeInTheDocument();
+    expect(within(done).queryByRole("button", { name: "Put back" })).toBeNull();
+    expect(within(done).queryByText(/or here/)).toBeNull();
+    await user.click(within(done).getByRole("button", { name: "Open Recycle Bin" }));
+    expect(openRecycleBin).toHaveBeenCalled();
   });
 });

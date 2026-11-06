@@ -88,7 +88,14 @@ export function RemovedSheet({ onClose, notify }: { onClose: () => void; notify:
                       {e.leftReason}
                     </span>
                   ) : e.putBackMs !== null || done?.restored ? (
-                    <span className="removed-done">Put back</span>
+                    <>
+                      <span className="removed-done">Put back</span>
+                      {done?.restored && done.reason && (
+                        <span className="removed-note" title={done.reason}>
+                          {done.reason}
+                        </span>
+                      )}
+                    </>
                   ) : done ? (
                     <span className="removed-left" title={done.reason ?? undefined}>
                       {done.reason}
