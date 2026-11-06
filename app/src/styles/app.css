@@ -267,6 +267,8 @@ kbd { font-size: var(--fs-2xs); font-weight: 500; color: var(--muted); border-ra
 .menu-item { width: 100%; white-space: nowrap; height: 26px; display: flex; align-items: center; gap: 9px; padding: 0 9px; border-radius: 5px; text-align: left; }
 .menu-item.is-active { background: var(--accent); color: var(--accent-fg); }
 .menu-item:disabled { color: var(--faint); background: none; }
+.menu-note { max-width: 300px; padding: 0 9px 6px 36px; font-size: 11px; line-height: 1.35; color: var(--muted); }
+.menu-note .mid { display: inline-flex; vertical-align: bottom; max-width: 100%; }
 .menu-item.is-danger:not(:disabled) { color: var(--danger-text); }
 .menu-item.is-danger.is-active:not(:disabled) { background: var(--danger); color: #fff; }
 .menu-icon { width: 16px; display: grid; place-items: center; color: var(--muted); }

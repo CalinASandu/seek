@@ -16,6 +16,8 @@ import { RowActionsProvider, type RowActions } from "./rowMenu";
 import { ReviewSheet } from "./ReviewSheet";
 import { UninstallSheet } from "./UninstallSheet";
 
+const ERROR_TOAST_MS = 5000;
+
 export type CleanTab = "duplicates" | "leftovers" | "apps";
 const TABS: SegmentedItem<CleanTab>[] = [
   { id: "duplicates", label: "Duplicates" },
@@ -45,7 +47,8 @@ interface Props {
   onProtect: (path: string) => Promise<void>;
   /** Takes one entry off the protected list (the entry itself, not a path inside it). */
   onUnprotect: (entry: string) => Promise<void>;
-  notify: (message: string) => void;
+  /** `ms`: how long the message stays; errors pass a longer time. */
+  notify: (message: string, ms?: number) => void;
 }
 
 export const CleanView = memo(function CleanView({ active, deviceId, deviceName, scanDeviceIds, protectedPaths, onProtect, onUnprotect, notify }: Props) {
@@ -95,7 +98,7 @@ export const CleanView = memo(function CleanView({ active, deviceId, deviceName,
 
   // The row menus: a save that fails is said out loud and the row is not shown as protected.
   const rowActions = useMemo<RowActions>(() => {
-    const say = (what: string) => (e: unknown) => notify(`${what} ${e instanceof Error ? e.message : String(e)}`);
+    const say = (what: string) => (e: unknown) => notify(`${what} ${e instanceof Error ? e.message : String(e)}`, ERROR_TOAST_MS);
     return {
       protectedPaths,
       protect: (path) => onProtect(path).catch(say('"Always protect" could not be saved.')),
