@@ -100,7 +100,24 @@ enum Step {
     Stop(String),
 }
 
+/// Held across the last look at an item and its move to the Recycle Bin. The normal one holds
+/// nothing; the elevated process holds the folders above the item so none can be swapped for a
+/// link in between. `Err` is the reason the item stays.
+pub trait Guard: Send + Sync {
+    fn hold(&self, path: &Path) -> Result<Box<dyn std::any::Any + Send>, String>;
+}
+
+/// Holds nothing.
+pub struct NoGuard;
+
+impl Guard for NoGuard {
+    fn hold(&self, _path: &Path) -> Result<Box<dyn std::any::Any + Send>, String> {
+        Ok(Box::new(()))
+    }
+}
+
 pub struct Engine {
+    guard: Arc<dyn Guard>,
     places: Places,
     recycler: Arc<dyn Recycler>,
     elevator: Option<Arc<dyn Elevator>>,
@@ -123,6 +140,7 @@ impl Engine {
         claims: Arc<dyn ClaimCheck>,
     ) -> Engine {
         Engine {
+            guard: Arc::new(NoGuard),
             places,
             recycler,
             elevator,
@@ -132,6 +150,12 @@ impl Engine {
             tokens: Mutex::new(VecDeque::new()),
             serial: Mutex::new(()),
         }
+    }
+
+    /// Replaces the guard held around each item's last look and recycle.
+    pub fn with_guard(mut self, guard: Arc<dyn Guard>) -> Engine {
+        self.guard = guard;
+        self
     }
 
     /// The engine of the elevated process (`elevated::run_main`): the same rules and the same
@@ -445,6 +469,16 @@ impl Engine {
             } else if inner.contains(&id) {
                 left(NESTED)
             } else {
+                // Held from the last look until the item is moved (the elevated process holds the
+                // folders above it, so none can be swapped for a link in between).
+                let _hold = match self.guard.hold(&rec.path) {
+                    Ok(h) => h,
+                    Err(why) => {
+                        stayed.insert(id);
+                        out.push(mk(left(&why)));
+                        continue;
+                    }
+                };
                 match self.check(&plan, &stayed, id, &ctx) {
                     Err(reason) => left(&reason),
                     // The last look before removal, so the byte comparison above can't have gone stale.
@@ -490,7 +524,7 @@ impl Engine {
                 &admin,
                 &mut out,
                 &mut moved_bytes,
-                stopped.is_some(),
+                &mut stopped,
             );
         }
         Ok(CommitResult {

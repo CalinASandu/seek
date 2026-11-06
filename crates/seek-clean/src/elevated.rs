@@ -1,51 +1,59 @@
 //! Admin removal. Program Files leftovers and Seek's own stale data need admin rights, so the
-//! window starts `seek-app.exe --clean-elevated <job file>` behind one UAC prompt. The elevated copy
-//! re-checks everything and moves the items to the Recycle Bin, then writes a result beside the job.
+//! window starts `seek-app.exe --clean-elevated <pipe name>` behind one UAC prompt. The job goes
+//! to the elevated copy, and its result comes back, over a named pipe the window made: no file
+//! holds either, and the elevated copy writes nothing to the filesystem but the Recycle Bin.
 //!
-//! This is a security boundary. The job file sits in a folder the user can write to, so the
-//! elevated process treats it as written by an attacker running as the same user: it takes paths
-//! from it and nothing else, and runs them through the removal engine's own rules (not a second
-//! set), plus the few rules that only apply here.
+//! This is a security boundary. Whoever is on the other end of the pipe is treated as a same-user
+//! attacker: the elevated process takes paths from the job and nothing else, and runs them through
+//! the removal engine's own rules (not a second set), plus the few rules that only apply here.
 
 use std::collections::{HashMap, HashSet};
-use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use seek_core::{DeviceId, DeviceRegistry};
 use serde::{Deserialize, Serialize};
 
 use crate::claims::SystemClaims;
-use crate::engine::Engine;
-use crate::facts::{ClaimCheck, Elevator, FileFacts, RealFacts, Recycler};
+use crate::engine::{Engine, Guard};
+use crate::facts::{AdminAnswer, ClaimCheck, Elevator, FileFacts, RealFacts, Recycler};
 use crate::model::{Candidate, ElevatedJob, ItemOutcome, JobItem, Outcome, Why};
-use crate::paths::{canon, canon_lexical, real_location, target_location};
-use crate::protect::{is_seek_data_file, Places};
-use crate::reasons::{CHANGED, GONE};
+use crate::paths::{canon, real_location, target_location};
+use crate::protect::{is_seek_data_file, uninstall_lock, Places};
+use crate::reasons::{ADMIN_SILENT, CHANGED, GONE};
 use crate::recycle::ShellRecycler;
 
 pub mod account;
+pub mod guard;
+pub mod pipe;
 
-pub const JOB_FILE: &str = "job.json";
-pub const RESULT_FILE: &str = "result.json";
 /// A job bigger than this is refused unread.
 pub const MAX_JOB_BYTES: u64 = 1 << 20;
 pub const MAX_JOB_ITEMS: usize = 10_000;
 /// A result bigger than this is ignored.
 const MAX_RESULT_BYTES: u64 = 16 << 20;
+/// How long the elevated copy waits for the job to arrive.
+const JOB_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub const DECLINED: &str = "Windows asked for admin and it was declined.";
-pub const NO_REPORT: &str = "The admin step didn't report on this item.";
+/// The exit code of a run that refused the job as a whole and did nothing.
+pub const EXIT_REFUSED: i32 = 2;
+/// The exit code of a run that processed the job but could not send the result.
+pub const EXIT_NO_RESULT: i32 = 3;
 const OUTSIDE: &str = "This is not somewhere the admin step may remove from, so it was left in place.";
 const DEVICE_IN_USE: &str = "This belongs to a drive or PC Seek still has, so it was left in place.";
+const REFUSED_RUN: &str = "The admin step refused to run, so nothing was removed.";
 
-/// What the elevated process writes beside the job. `note` says why everything was refused when
-/// the job could not be read item by item.
+/// What the elevated process sends back. `note` says why everything was refused when the job could
+/// not be taken item by item; `stopped_early` is the engine's own sentence when a move could not
+/// be confirmed and the rest was left untouched.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ElevatedResult {
     pub items: Vec<ItemOutcome>,
     pub note: Option<String>,
+    pub stopped_early: Option<String>,
 }
 
 fn left(j: &JobItem, reason: &str) -> ItemOutcome {
@@ -55,9 +63,11 @@ fn left(j: &JobItem, reason: &str) -> ItemOutcome {
 // ---- the rules that only exist here ----------------------------------------------------------------
 
 /// The rules that only apply to the elevated side, on top of what the engine checks for every
-/// item: what the item is must be one of the two things admin removal is for, and it must be where
+/// item: what the item is must be one of the things admin removal is for, and it must be where
 /// those live, by the path as written and by where it really is, compared by whole segments.
-/// Also refuses a claimed folder, so this can be tested alone.
+/// Those are: a Leftover or Uninstall folder in Program Files, a `.lnk` an uninstall left in the
+/// all-users Start Menu, and one of Seek's own stale files. Also refuses a claimed folder, so
+/// that can be tested alone.
 pub fn check_item(
     item: &JobItem,
     places: &Places,
@@ -77,11 +87,16 @@ pub fn check_item(
     let spellings = [written.as_str(), real.as_str(), target.as_str()];
     match item.why {
         Why::Leftover | Why::Uninstall => {
-            let ok = spellings.iter().all(|s| places.in_program_files(s) && !places.is_program_files_root(s));
-            if !ok {
+            let in_pf = spellings.iter().all(|s| places.in_program_files(s) && !places.is_program_files_root(s));
+            // Nothing else in ProgramData: only a shortcut the engine's own Start Menu rule accepts.
+            let is_dir = std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir());
+            let menu_link = item.why == Why::Uninstall
+                && !is_dir
+                && spellings.iter().all(|s| places.in_all_users_start_menu(s) && uninstall_lock(places, s, false).is_none());
+            if !in_pf && !menu_link {
                 return Err(OUTSIDE.into());
             }
-            if claims.is_claimed(path).is_some() || claims.is_claimed(Path::new(&real)).is_some() {
+            if in_pf && (claims.is_claimed(path).is_some() || claims.is_claimed(Path::new(&real)).is_some()) {
                 return Err("An app or a running program is using this folder, so it was left in place.".into());
             }
         }
@@ -127,6 +142,8 @@ pub struct ElevatedContext {
     pub facts: Arc<dyn FileFacts>,
     pub recycler: Arc<dyn Recycler>,
     pub claims: Arc<dyn ClaimCheck>,
+    /// Held around each item's last look and recycle.
+    pub guard: Arc<dyn Guard>,
     pub protected: Result<Vec<String>, String>,
     pub devices: Result<HashSet<DeviceId>, String>,
     pub account: Result<(), String>,
@@ -134,9 +151,9 @@ pub struct ElevatedContext {
 
 /// One outcome per job item, in the job's order. Nothing is removed unless the account matches and
 /// the protected list could be read; each item must then pass `check_item`, still match what the
-/// window reviewed, and pass every rule of the engine.
-pub fn process_job(job: &ElevatedJob, ctx: &ElevatedContext) -> Vec<ItemOutcome> {
-    let refuse_all = |why: &str| job.items.iter().map(|j| left(j, why)).collect::<Vec<_>>();
+/// window reviewed (twice: before and after the engine looks), and pass every rule of the engine.
+pub fn process_job(job: &ElevatedJob, ctx: &ElevatedContext) -> ElevatedResult {
+    let refuse_all = |why: &str| ElevatedResult { items: job.items.iter().map(|j| left(j, why)).collect(), ..ElevatedResult::default() };
     if let Err(e) = &ctx.account {
         return refuse_all(e);
     }
@@ -151,7 +168,7 @@ pub fn process_job(job: &ElevatedJob, ctx: &ElevatedContext) -> Vec<ItemOutcome>
     let no_devices = HashSet::new();
     let mut results: HashMap<u32, Outcome> = HashMap::new();
     let mut candidates = Vec::new();
-    let mut by_path: HashMap<String, u32> = HashMap::new();
+    let mut by_path: HashMap<String, &JobItem> = HashMap::new();
     let mut seen_paths = HashSet::new();
     for j in &job.items {
         let outcome = (|| -> Result<(), String> {
@@ -174,17 +191,19 @@ pub fn process_job(job: &ElevatedJob, ctx: &ElevatedContext) -> Vec<ItemOutcome>
                 (Why::Uninstall, false) => Candidate::Shortcut { path: PathBuf::from(&j.path), level: None, reasons: vec![] },
                 (why, _) => Candidate::Folder { path: PathBuf::from(&j.path), why, level: None, reasons: vec![] },
             });
-            by_path.insert(j.path.clone(), j.id);
+            by_path.insert(j.path.clone(), j);
             Ok(())
         })();
         if let Err(reason) = outcome {
             results.insert(j.id, Outcome::Left { reason });
         }
     }
+    let mut stopped_early = None;
     if !candidates.is_empty() {
-        run_engine(ctx, protected, candidates, &by_path, &mut results);
+        stopped_early = run_engine(ctx, protected, candidates, &by_path, &mut results);
     }
-    job.items
+    let items = job
+        .items
         .iter()
         .map(|j| ItemOutcome {
             id: j.id,
@@ -192,21 +211,33 @@ pub fn process_job(job: &ElevatedJob, ctx: &ElevatedContext) -> Vec<ItemOutcome>
             size: j.size,
             outcome: results.remove(&j.id).unwrap_or(Outcome::Left { reason: GONE.into() }),
         })
-        .collect()
+        .collect();
+    ElevatedResult { items, note: None, stopped_early }
 }
 
 /// The engine's own prepare and commit, in the mode where admin items are recycled on the spot.
+/// Returns why it stopped early, if it did.
 fn run_engine(
     ctx: &ElevatedContext,
     protected: &[String],
     candidates: Vec<Candidate>,
-    by_path: &HashMap<String, u32>,
+    by_path: &HashMap<String, &JobItem>,
     results: &mut HashMap<u32, Outcome>,
-) {
-    let engine = Engine::new_elevated(ctx.places.clone(), ctx.recycler.clone(), ctx.facts.clone(), ctx.claims.clone());
+) -> Option<String> {
+    let engine = Engine::new_elevated(ctx.places.clone(), ctx.recycler.clone(), ctx.facts.clone(), ctx.claims.clone()).with_guard(ctx.guard.clone());
     let prepared = engine.prepare(candidates, protected);
-    let job_id: HashMap<u32, u32> = prepared.items.iter().filter_map(|i| by_path.get(&i.path).map(|j| (i.id, *j))).collect();
-    let ids: Vec<u32> = prepared.items.iter().map(|i| i.id).collect();
+    let mut job_id: HashMap<u32, u32> = HashMap::new();
+    let mut ids = Vec::new();
+    for i in &prepared.items {
+        let Some(j) = by_path.get(&i.path) else { continue };
+        job_id.insert(i.id, j.id);
+        // What the engine just read must still be what the window reviewed.
+        if i.size != j.size || i.modified_ms != j.modified_ms {
+            results.insert(j.id, Outcome::Left { reason: CHANGED.into() });
+        } else {
+            ids.push(i.id);
+        }
+    }
     match engine.commit(&prepared.token, &ids, protected) {
         Ok(done) => {
             for item in done.items {
@@ -214,114 +245,77 @@ fn run_engine(
                     results.insert(*j, item.outcome);
                 }
             }
+            done.stopped_early
         }
         Err(e) => {
-            for j in job_id.values() {
-                results.insert(*j, Outcome::Left { reason: e.clone() });
+            for i in ids {
+                results.insert(job_id[&i], Outcome::Left { reason: e.clone() });
             }
+            None
         }
     }
 }
 
 // ---- the process entry ----------------------------------------------------------------------------
 
-/// Checks that `job_file` is `<base>\<32 hex digits>\job.json` for real: not through a link, not a
-/// link itself. Returns its folder.
-fn job_folder(job_file: &Path, base: &Path) -> Result<PathBuf, String> {
-    let bad = || "The job file is not in the folder Seek makes for admin steps.".to_string();
-    let dir = job_file.parent().ok_or_else(bad)?;
-    let hex = dir.file_name().and_then(|n| n.to_str()).ok_or_else(bad)?;
-    let named = job_file.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.eq_ignore_ascii_case(JOB_FILE));
-    if !named || hex.len() != 32 || !hex.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')) {
-        return Err(bad());
+/// The whole elevated run, with the way the facts are read passed in. `pipe_name` must be exactly
+/// the shape the window makes. Returns the exit code: 0 when the job was processed and the
+/// result sent, `EXIT_REFUSED` when it was refused as a whole (a result saying so is sent if it
+/// can be; nothing was removed), `EXIT_NO_RESULT` when it was processed but the result could not
+/// be sent.
+pub fn run_main_with(pipe_name: &str, context: &dyn Fn(&ElevatedJob) -> Result<ElevatedContext, String>) -> i32 {
+    if !pipe::name_ok(pipe_name) {
+        return EXIT_REFUSED;
     }
-    if canon_lexical(dir.parent().ok_or_else(bad)?) != canon_lexical(base) {
-        return Err(bad());
-    }
-    // Where it really is must be the same place: no junction in any parent.
-    let real = real_location(job_file).ok_or_else(bad)?;
-    let expected = format!("{}\\{hex}\\{JOB_FILE}", real_location(base).ok_or_else(bad)?);
-    if real != expected || !std::fs::symlink_metadata(job_file).map_err(|_| bad())?.file_type().is_file() {
-        return Err(bad());
-    }
-    Ok(dir.to_path_buf())
-}
-
-/// Reads and parses a job, within the size and item caps.
-fn read_job(job_file: &Path) -> Result<ElevatedJob, String> {
-    let f = std::fs::File::open(job_file).map_err(|e| format!("The job file couldn't be read ({e})."))?;
-    let mut bytes = Vec::new();
-    f.take(MAX_JOB_BYTES + 1).read_to_end(&mut bytes).map_err(|e| format!("The job file couldn't be read ({e})."))?;
-    if bytes.len() as u64 > MAX_JOB_BYTES {
-        return Err("The job file is too big, so nothing was removed.".into());
-    }
-    let job: ElevatedJob = serde_json::from_slice(&bytes).map_err(|_| "The job file is malformed, so nothing was removed.".to_string())?;
-    if job.items.len() > MAX_JOB_ITEMS {
-        return Err("The job lists too many items, so nothing was removed.".into());
-    }
-    Ok(job)
-}
-
-/// Writes the result beside the job without following anything already there: a new file with a
-/// random name, then renamed over `result.json`.
-fn write_result(dir: &Path, result: &ElevatedResult) -> Result<(), String> {
-    let bytes = serde_json::to_vec(result).map_err(|e| e.to_string())?;
-    let tmp = dir.join(format!("result-{:032x}.tmp", rand::random::<u128>()));
-    let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp).map_err(|e| e.to_string())?;
-    f.write_all(&bytes).and_then(|_| f.sync_all()).map_err(|e| e.to_string())?;
-    drop(f);
-    std::fs::rename(&tmp, dir.join(RESULT_FILE)).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        e.to_string()
-    })
-}
-
-/// The whole elevated run, with the way the facts are read passed in. Returns the exit code:
-/// 0 when the job was processed and the result written, 2 when the job was refused as a whole
-/// (a result saying so is written if it can be), 3 when no result could be written.
-pub fn run_main_with(
-    job_file: &Path,
-    base: &Path,
-    context: &dyn Fn(&ElevatedJob) -> Result<ElevatedContext, String>,
-) -> i32 {
-    let Ok(dir) = job_folder(job_file, base) else {
-        return 2;
+    let Ok(client) = pipe::Client::connect(pipe_name) else {
+        return EXIT_REFUSED;
     };
-    let refuse = |note: String, items: Vec<ItemOutcome>| {
-        let _ = write_result(&dir, &ElevatedResult { items, note: Some(note) });
-        2
+    let server_pid = client.server_pid;
+    let bytes = match client.read_job(MAX_JOB_BYTES, JOB_TIMEOUT) {
+        Ok(b) => b,
+        Err(note) => return refuse(client, note, vec![]),
     };
-    let job = match read_job(job_file) {
+    let job: ElevatedJob = match serde_json::from_slice(&bytes) {
         Ok(j) => j,
-        Err(note) => return refuse(note, vec![]),
+        Err(_) => return refuse(client, "The job is malformed, so nothing was removed.".into(), vec![]),
     };
+    if job.items.len() > MAX_JOB_ITEMS {
+        return refuse(client, "The job lists too many items, so nothing was removed.".into(), vec![]);
+    }
+    let refuse_items = |note: &str| job.items.iter().map(|j| left(j, note)).collect::<Vec<_>>();
+    // The job must come from the window it names: the process serving this pipe is that window.
+    if server_pid != job.window_pid {
+        let note = "This admin step was not asked for by the Seek window the job names, so nothing was removed.";
+        return refuse(client, note.into(), refuse_items(note));
+    }
     let ctx = match context(&job) {
         Ok(c) => c,
-        Err(note) => return refuse(note.clone(), job.items.iter().map(|j| left(j, &note)).collect()),
+        Err(note) => return refuse(client, note.clone(), refuse_items(&note)),
     };
-    let items = process_job(&job, &ctx);
-    match write_result(&dir, &ElevatedResult { items, note: None }) {
+    let result = process_job(&job, &ctx);
+    match serde_json::to_vec(&result).map_err(|e| e.to_string()).and_then(|b| client.reply(&b)) {
         Ok(()) => 0,
-        Err(_) => 3,
+        Err(_) => EXIT_NO_RESULT,
     }
 }
 
-/// `%LOCALAPPDATA%\Seek\elevated`, where the window puts one folder per run.
-pub fn jobs_base() -> Option<PathBuf> {
-    std::env::var_os("LOCALAPPDATA").filter(|v| !v.is_empty()).map(|v| PathBuf::from(v).join("Seek").join("elevated"))
+/// Sends a result that says everything was refused, if it can.
+fn refuse(client: pipe::Client, note: String, items: Vec<ItemOutcome>) -> i32 {
+    if let Ok(b) = serde_json::to_vec(&ElevatedResult { items, note: Some(note), stopped_early: None }) {
+        let _ = client.reply(&b);
+    }
+    EXIT_REFUSED
 }
 
-/// `seek-app.exe --clean-elevated <job file>`. `protected` is the user's "Always protect" list as
+/// `seek-app.exe --clean-elevated <pipe name>`. `protected` is the user's "Always protect" list as
 /// read by the same strict reader the window uses (an error means nothing is removed).
-pub fn run_main(job_file: &Path, protected: Result<Vec<String>, String>) -> i32 {
-    let Some(base) = jobs_base() else {
-        return 2;
-    };
-    run_main_with(job_file, &base, &|job| real_context(job, protected.clone()))
+pub fn run_main(pipe_name: &str, protected: Result<Vec<String>, String>) -> i32 {
+    run_main_with(pipe_name, &|job| real_context(job, protected.clone()))
 }
 
 /// The one place the elevated side builds its real pieces: the disk's own facts, the Recycle Bin
-/// recycler, and fresh claims read now (never a cache).
+/// recycler, and fresh claims read now (never a cache) that take the system folders from Windows
+/// and not from the environment.
 fn real_context(job: &ElevatedJob, protected: Result<Vec<String>, String>) -> Result<ElevatedContext, String> {
     let places = Places::from_system().map_err(|e| format!("The admin step can't run safely on this PC: {e}"))?;
     let devices = places
@@ -329,7 +323,9 @@ fn real_context(job: &ElevatedJob, protected: Result<Vec<String>, String>) -> Re
         .ok_or_else(|| "Windows didn't say where Seek's data is kept.".to_string())
         .and_then(|d| read_live_devices(&d));
     let account = account::check_account(&job.user_sid, &account::read_facts(job.window_pid));
+    crate::claims::trust_system_folders_only();
     Ok(ElevatedContext {
+        guard: Arc::new(guard::ParentChainGuard::new(places.guarded_roots())),
         places,
         facts: Arc::new(RealFacts),
         recycler: Arc::new(ShellRecycler),
@@ -350,100 +346,85 @@ pub enum LaunchError {
     Failed(String),
 }
 
-/// Starts the elevated copy on `job_file` and waits for it to exit. The real one is
-/// `cleanup::ShellLaunch`; tests use fakes.
+/// Starts the elevated copy on `pipe_name`, waits for it to exit and returns its exit code. The
+/// real one is `cleanup::ShellLaunch`; tests use fakes.
 pub trait Launcher: Send + Sync {
-    fn launch_and_wait(&self, job_file: &Path) -> Result<(), LaunchError>;
-}
-
-/// Removes the run folder when it goes out of scope, on every path.
-struct RunFolder(PathBuf);
-
-impl Drop for RunFolder {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-fn new_run_folder(base: &Path) -> std::io::Result<RunFolder> {
-    std::fs::create_dir_all(base)?;
-    let dir = base.join(format!("{:032x}", rand::random::<u128>()));
-    std::fs::create_dir(&dir)?; // new: fails if it exists
-    Ok(RunFolder(dir))
+    fn launch_and_wait(&self, pipe_name: &str) -> Result<u32, LaunchError>;
 }
 
 /// Every item, left in place for one reason.
-fn all_left(items: &[JobItem], reason: &str) -> Vec<ItemOutcome> {
-    items.iter().map(|j| left(j, reason)).collect()
+fn all_left(items: &[JobItem], reason: &str) -> AdminAnswer {
+    AdminAnswer { items: items.iter().map(|j| left(j, reason)).collect(), stopped_early: None }
 }
 
-/// One elevated run for `items`: job folder, launch, wait, read what came back, delete the
-/// folder. Every item gets an outcome whatever happens.
-pub fn run_elevated(items: &[JobItem], user_sid: &str, window_pid: u32, base: &Path, launcher: &dyn Launcher) -> Vec<ItemOutcome> {
+/// One elevated run for `items`: the pipe, one launch, wait, read what came back. Every item gets
+/// an outcome whatever happens.
+pub fn run_elevated(items: &[JobItem], user_sid: &str, window_pid: u32, launcher: &dyn Launcher) -> AdminAnswer {
     let prepare_failed = |e: String| all_left(items, &format!("Seek couldn't prepare the admin step ({e}), so this was left in place."));
-    let folder = match new_run_folder(base) {
-        Ok(f) => f,
+    if items.len() > MAX_JOB_ITEMS {
+        return prepare_failed("too many items for one admin step".into());
+    }
+    let job = ElevatedJob { user_sid: user_sid.to_string(), window_pid, items: items.to_vec() };
+    let bytes = match serde_json::to_vec(&job) {
+        Ok(b) if b.len() as u64 <= MAX_JOB_BYTES => b,
+        Ok(_) => return prepare_failed("the job is too big".into()),
         Err(e) => return prepare_failed(e.to_string()),
     };
-    let job = ElevatedJob { user_sid: user_sid.to_string(), window_pid, items: items.to_vec() };
-    let job_file = folder.0.join(JOB_FILE);
-    let written = serde_json::to_vec(&job).map_err(|e| e.to_string()).and_then(|b| std::fs::write(&job_file, b).map_err(|e| e.to_string()));
-    if let Err(e) = written {
-        return prepare_failed(e);
+    let name = pipe::new_name();
+    let server = match pipe::Server::create(&name) {
+        Ok(s) => s,
+        Err(e) => return prepare_failed(e.to_string()),
+    };
+    let serving = std::thread::spawn(move || server.serve(&bytes, MAX_RESULT_BYTES));
+    let launched = launcher.launch_and_wait(&name);
+    // Whatever happened, a server still waiting for a client that never came is let go.
+    if !serving.is_finished() {
+        pipe::release(&name);
     }
-    match launcher.launch_and_wait(&job_file) {
+    let reply = serving.join().ok().and_then(Result::ok);
+    match launched {
         Err(LaunchError::Declined) => all_left(items, DECLINED),
         Err(LaunchError::Failed(e)) => all_left(items, &format!("Windows couldn't start the admin step ({e}), so this was left in place.")),
-        Ok(()) => {
-            let bytes = read_capped(&folder.0.join(RESULT_FILE));
-            match_results(items, bytes.as_deref())
-        }
+        Ok(code) => match_results(items, reply.as_deref(), code),
     }
-}
-
-fn read_capped(file: &Path) -> Option<Vec<u8>> {
-    let f = std::fs::File::open(file).ok()?;
-    let mut bytes = Vec::new();
-    f.take(MAX_RESULT_BYTES + 1).read_to_end(&mut bytes).ok()?;
-    (bytes.len() as u64 <= MAX_RESULT_BYTES).then_some(bytes)
 }
 
 /// What came back, matched to what was sent: only ids that were sent count, the first answer for
-/// an id wins, and the path and size are the ones sent. A missing, malformed or partial result
-/// leaves each item without an answer in place (with the elevated side's own reason, if it gave one).
-pub fn match_results(sent: &[JobItem], result: Option<&[u8]>) -> Vec<ItemOutcome> {
+/// an id wins, and the path and size are the ones sent. Exit code 2 means nothing was done, so an
+/// item without an answer is left, with the elevated side's own reason if it gave one. For any
+/// other exit code an item without an answer may have been moved before the process ended, so it
+/// gets the engine's "check the Recycle Bin" outcome and never one that says it was left alone.
+pub fn match_results(sent: &[JobItem], result: Option<&[u8]>, exit_code: u32) -> AdminAnswer {
     let parsed: Option<ElevatedResult> = result.and_then(|b| serde_json::from_slice(b).ok());
-    let silent = parsed.as_ref().and_then(|r| r.note.clone()).unwrap_or_else(|| NO_REPORT.to_string());
-    sent.iter()
-        .map(|j| {
-            let answer = parsed.as_ref().and_then(|r| r.items.iter().find(|a| a.id == j.id));
-            match answer {
-                Some(a) => ItemOutcome { id: j.id, path: j.path.clone(), size: j.size, outcome: a.outcome.clone() },
-                None => left(j, &silent),
-            }
+    let silent = if exit_code == EXIT_REFUSED as u32 {
+        parsed.as_ref().and_then(|r| r.note.clone()).unwrap_or_else(|| REFUSED_RUN.to_string())
+    } else {
+        ADMIN_SILENT.to_string()
+    };
+    let items = sent
+        .iter()
+        .map(|j| match parsed.as_ref().and_then(|r| r.items.iter().find(|a| a.id == j.id)) {
+            Some(a) => ItemOutcome { id: j.id, path: j.path.clone(), size: j.size, outcome: a.outcome.clone() },
+            None => left(j, &silent),
         })
-        .collect()
+        .collect();
+    AdminAnswer { items, stopped_early: parsed.and_then(|r| r.stopped_early) }
 }
 
-/// The real elevator's shape: asks `launcher` for admin once per `run`. Built in `cleanup::Core::real`.
+/// The real elevator's shape: asks `launcher` for admin once per `run`. Built in `cleanup::UacElevator`.
 pub struct JobElevator {
     pub launcher: Arc<dyn Launcher>,
-    /// Where the run folders go; `None` means `%LOCALAPPDATA%\Seek\elevated`.
-    pub base: Option<PathBuf>,
 }
 
 impl Elevator for JobElevator {
-    fn run(&self, items: &[JobItem]) -> Result<Vec<ItemOutcome>, String> {
+    fn run(&self, items: &[JobItem]) -> Result<AdminAnswer, String> {
         // Nothing has started yet, so a failure here leaves every item in place (not an Err, which
         // the engine reads as "the admin step may have removed some items").
         let sid = match account::current_user_sid() {
             Ok(s) => s,
             Err(e) => return Ok(all_left(items, &format!("Seek couldn't tell which Windows account this is ({e}), so nothing was sent to admin."))),
         };
-        let Some(base) = self.base.clone().or_else(jobs_base) else {
-            return Ok(all_left(items, "Windows didn't say where Seek's local data is kept, so nothing was sent to admin."));
-        };
-        Ok(run_elevated(items, &sid, std::process::id(), &base, self.launcher.as_ref()))
+        Ok(run_elevated(items, &sid, std::process::id(), self.launcher.as_ref()))
     }
 }
 

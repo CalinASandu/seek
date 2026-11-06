@@ -3,6 +3,8 @@ use std::time::Duration;
 
 use super::account::{check_account, current_user_sid, read_facts, AccountFacts};
 use super::*;
+use crate::engine::Engine;
+use crate::reasons::ADMIN_SILENT;
 use crate::paths::make_junction;
 
 const SID: &str = "S-1-5-21-1-2-3-1001";
@@ -99,11 +101,16 @@ impl Env {
             facts: Arc::new(RealFacts),
             recycler: self.rec.clone(),
             claims: self.claims.clone(),
+            guard: Arc::new(guard::ParentChainGuard::new(self.places.guarded_roots())),
             protected: Ok(vec![]),
             devices: Ok(self.live.lock().unwrap().clone()),
             account: Ok(()),
         }
     }
+}
+
+fn run(j: &ElevatedJob, c: &ElevatedContext) -> Vec<ItemOutcome> {
+    process_job(j, c).items
 }
 
 fn job(items: Vec<JobItem>) -> ElevatedJob {
@@ -280,7 +287,7 @@ fn an_item_that_passes_everything_is_recycled_and_its_neighbours_are_not_touched
     let other = env.folder("pf/Keep");
     let gone = DeviceId::new_v4();
     let stale = env.file(&format!("pd/Seek/indexes/{gone}.seekidx"), b"index");
-    let out = process_job(&job(vec![env.item(0, &app, Why::Leftover), env.item(1, &stale, Why::StaleData)]), &env.ctx());
+    let out = run(&job(vec![env.item(0, &app, Why::Leftover), env.item(1, &stale, Why::StaleData)]), &env.ctx());
     assert!(out.iter().all(is_moved), "{out:?}");
     assert!(!app.exists() && !stale.exists() && other.exists());
     assert_eq!(env.rec.calls.lock().unwrap().len(), 2);
@@ -290,7 +297,7 @@ fn an_item_that_passes_everything_is_recycled_and_its_neighbours_are_not_touched
 fn an_item_in_the_wrong_place_is_not_handed_to_the_recycler() {
     let env = Env::new();
     let docs = env.folder("users/me/docs/Mine");
-    let out = process_job(&job(vec![env.item(0, &docs, Why::Leftover)]), &env.ctx());
+    let out = run(&job(vec![env.item(0, &docs, Why::Leftover)]), &env.ctx());
     assert!(!is_moved(&out[0]));
     assert!(docs.exists() && env.rec.calls.lock().unwrap().is_empty());
 }
@@ -302,7 +309,7 @@ fn a_protected_folder_is_refused() {
     let inner_protected = env.folder("pf/Holder");
     let mut ctx = env.ctx();
     ctx.protected = Ok(vec![app.to_string_lossy().into_owned(), inner_protected.join("data.bin").to_string_lossy().into_owned()]);
-    let out = process_job(&job(vec![env.item(0, &app, Why::Leftover), env.item(1, &inner_protected, Why::Leftover)]), &ctx);
+    let out = run(&job(vec![env.item(0, &app, Why::Leftover), env.item(1, &inner_protected, Why::Leftover)]), &ctx);
     assert!(reason(&out[0]).contains("protected"), "{}", reason(&out[0]));
     assert!(reason(&out[1]).contains("protected"), "{}", reason(&out[1]));
     assert!(app.exists() && inner_protected.exists() && env.rec.calls.lock().unwrap().is_empty());
@@ -314,9 +321,22 @@ fn unreadable_settings_refuse_everything() {
     let app = env.folder("pf/App");
     let mut ctx = env.ctx();
     ctx.protected = Err("Your settings file couldn't be read.".into());
-    let out = process_job(&job(vec![env.item(0, &app, Why::Leftover)]), &ctx);
+    let out = run(&job(vec![env.item(0, &app, Why::Leftover)]), &ctx);
     assert!(reason(&out[0]).contains("settings file"));
     assert!(app.exists() && env.rec.calls.lock().unwrap().is_empty());
+}
+
+/// Says "not claimed" to the first two questions (what `check_item` asks about one folder) and
+/// "claimed" to every question after: a program that starts while the engine is looking.
+#[derive(Default)]
+struct LateClaims(Mutex<u32>);
+
+impl ClaimCheck for LateClaims {
+    fn is_claimed(&self, _folder: &Path) -> Option<String> {
+        let mut n = self.0.lock().unwrap();
+        *n += 1;
+        (*n > 2).then(|| "LateApp".to_string())
+    }
 }
 
 #[test]
@@ -324,17 +344,19 @@ fn the_engines_own_rules_apply_here_too() {
     let env = Env::new();
     // Two levels deep: the engine's scan-root rule for leftovers.
     let deep = env.folder("pf/App/Inner");
-    // Claimed, as the engine's claims see it (not the same fake `check_item` was given).
-    let claimed = env.folder("pf/Claimed");
-    env.claims.0.lock().unwrap().insert(claimed.clone());
     let mut ctx = env.ctx();
-    ctx.claims = env.claims.clone();
-    let out = process_job(&job(vec![env.item(0, &deep, Why::Leftover), env.item(1, &claimed, Why::Leftover)]), &ctx);
-    assert!(!is_moved(&out[0]) && !is_moved(&out[1]), "{out:?}");
-    assert!(deep.exists() && claimed.exists());
+    ctx.claims = Arc::new(LateClaims::default());
+    let late = env.folder("pf/Late");
+    // check_item accepts this folder; only the engine's own Claimed rule refuses it.
+    assert_eq!(check_item(&env.item(0, &late, Why::Leftover), &env.places, &LateClaims::default(), &HashSet::new()), Ok(()));
+    let out = run(&job(vec![env.item(0, &late, Why::Leftover)]), &ctx);
+    assert!(reason(&out[0]).contains("using this folder"), "{}", reason(&out[0]));
+    assert!(late.exists() && env.rec.calls.lock().unwrap().is_empty());
+    let out = run(&job(vec![env.item(0, &deep, Why::Leftover)]), &env.ctx());
+    assert!(!is_moved(&out[0]) && deep.exists(), "{out:?}");
     // Shared with Windows and other apps: an uninstall never offers anything in it.
     let shared = env.folder("pf/Common Files/Thing");
-    let out = process_job(&job(vec![env.item(0, &shared, Why::Uninstall)]), &env.ctx());
+    let out = run(&job(vec![env.item(0, &shared, Why::Uninstall)]), &env.ctx());
     assert!(!is_moved(&out[0]) && shared.exists(), "{out:?}");
 }
 
@@ -349,7 +371,7 @@ fn an_item_that_changed_since_review_is_left() {
     let mtime = std::fs::metadata(touched.join("data.bin")).unwrap().modified().unwrap() + Duration::from_secs(5);
     std::fs::File::options().write(true).open(touched.join("data.bin")).unwrap().set_modified(mtime).unwrap();
     std::fs::remove_dir_all(&gone).unwrap();
-    let out = process_job(&job(items), &env.ctx());
+    let out = run(&job(items), &env.ctx());
     assert_eq!(reason(&out[0]), CHANGED);
     assert_eq!(reason(&out[1]), CHANGED);
     assert_eq!(reason(&out[2]), GONE);
@@ -382,7 +404,7 @@ fn a_different_account_is_refused() {
     // The elevated token's user differs from the job's: nothing at all is removed.
     let mut ctx = env.ctx();
     ctx.account = check_account("S-1-5-21-9-9-9-500", &own);
-    let out = process_job(&job(vec![env.item(0, &app, Why::Leftover)]), &ctx);
+    let out = run(&job(vec![env.item(0, &app, Why::Leftover)]), &ctx);
     assert!(reason(&out[0]).contains("account"));
     assert!(app.exists() && env.rec.calls.lock().unwrap().is_empty());
 }
@@ -405,7 +427,7 @@ fn an_unreadable_device_list_refuses_stale_files_but_not_program_files() {
     let app = env.folder("pf/App");
     let mut ctx = env.ctx();
     ctx.devices = Err("Seek's device list couldn't be read.".into());
-    let out = process_job(&job(vec![env.item(0, &stale, Why::StaleData), env.item(1, &app, Why::Leftover)]), &ctx);
+    let out = run(&job(vec![env.item(0, &stale, Why::StaleData), env.item(1, &app, Why::Leftover)]), &ctx);
     assert!(reason(&out[0]).contains("device list"));
     assert!(is_moved(&out[1]));
     assert!(stale.exists());
@@ -417,7 +439,7 @@ fn a_move_that_cannot_be_confirmed_stops_the_rest() {
     let first = env.folder("pf/A");
     let second = env.folder("pf/B");
     env.rec.destroy.lock().unwrap().insert(first.clone());
-    let out = process_job(&job(vec![env.item(0, &first, Why::Leftover), env.item(1, &second, Why::Leftover)]), &env.ctx());
+    let out = run(&job(vec![env.item(0, &first, Why::Leftover), env.item(1, &second, Why::Leftover)]), &env.ctx());
     assert!(reason(&out[0]).contains("deleted for good"), "{}", reason(&out[0]));
     assert!(reason(&out[1]).contains("stopped"), "{}", reason(&out[1]));
     assert!(second.exists());
@@ -429,131 +451,293 @@ fn a_repeated_item_number_or_path_is_not_removed_twice() {
     let env = Env::new();
     let app = env.folder("pf/App");
     let it = env.item(0, &app, Why::Leftover);
-    let out = process_job(&job(vec![it.clone(), it.clone()]), &env.ctx());
+    let out = run(&job(vec![it.clone(), it.clone()]), &env.ctx());
     assert!(out.iter().all(|o| !is_moved(o)) && app.exists());
     let mut again = it.clone();
     again.id = 1;
-    let out = process_job(&job(vec![it, again]), &env.ctx());
+    let out = run(&job(vec![it, again]), &env.ctx());
     assert!(is_moved(&out[0]) && !is_moved(&out[1]), "{out:?}");
 }
 
-// ---- job and result files -------------------------------------------------------------------------------
 
-fn run_dir(base: &Path) -> PathBuf {
-    let d = base.join(format!("{:032x}", 0xabcdefu128));
-    std::fs::create_dir_all(&d).unwrap();
-    d
+// ---- I4: the all-users Start Menu ----------------------------------------------------------------------
+
+#[test]
+fn an_all_users_start_menu_shortcut_an_uninstall_left_is_accepted_and_nothing_else_in_program_data() {
+    let env = Env::new();
+    let menu = r"pd\Microsoft\Windows\Start Menu\Programs";
+    let lnk = env.file(&format!(r"{menu}\Old App\Old App.lnk"), b"lnk");
+    assert_eq!(env.check(&env.item(0, &lnk, Why::Uninstall)), Ok(()));
+    // Not an uninstall's, not a shortcut, not in the all-users menu, not in `Programs` at all.
+    assert!(env.check(&env.item(0, &lnk, Why::Leftover)).is_err());
+    let txt = env.file(&format!(r"{menu}\Old App\readme.txt"), b"x");
+    assert!(env.check(&env.item(0, &txt, Why::Uninstall)).is_err());
+    let user = env.file(r"users\me\appdata\Roaming\Microsoft\Windows\Start Menu\Programs\Mine.lnk", b"lnk");
+    assert!(env.check(&env.item(0, &user, Why::Uninstall)).is_err(), "the user's own menu is not admin's");
+    let outside = env.file(r"pd\Microsoft\Windows\Start Menu\Other.lnk", b"lnk");
+    assert!(env.check(&env.item(0, &outside, Why::Uninstall)).is_err());
+    let other = env.file(r"pd\SomeVendor\thing.lnk", b"lnk");
+    assert!(env.check(&env.item(0, &other, Why::Uninstall)).is_err());
+    let folder = env.folder(&format!(r"{menu}\Folder"));
+    assert!(env.check(&env.item(0, &folder, Why::Uninstall)).is_err(), "a folder there is not a shortcut");
+    // The whole run takes it to the Recycle Bin.
+    let out = run(&job(vec![env.item(0, &lnk, Why::Uninstall)]), &env.ctx());
+    assert!(is_moved(&out[0]), "{out:?}");
+    assert!(!lnk.exists());
 }
 
-fn refuse_everything_context(env: &Env) -> impl Fn(&ElevatedJob) -> Result<ElevatedContext, String> + '_ {
-    |_| Ok(env.ctx())
+// ---- M3 and M5 ------------------------------------------------------------------------------------------------
+
+/// The real facts, except every stat after the first of a path says the size grew by one: what
+/// changes while the engine is reading.
+#[derive(Default)]
+struct ChangingFacts(Mutex<HashMap<PathBuf, u32>>);
+
+impl FileFacts for ChangingFacts {
+    fn stat(&self, p: &Path) -> Option<crate::facts::Stat> {
+        let mut s = RealFacts.stat(p)?;
+        let mut seen = self.0.lock().unwrap();
+        let n = seen.entry(p.to_path_buf()).or_insert(0);
+        *n += 1;
+        if *n > 1 {
+            s.size += 1;
+        }
+        Some(s)
+    }
+    fn same_bytes(&self, a: &Path, b: &Path) -> Result<bool, String> {
+        RealFacts.same_bytes(a, b)
+    }
+    fn file_id(&self, p: &Path) -> Option<(u32, u64)> {
+        RealFacts.file_id(p)
+    }
+    fn recycle_block(&self, p: &Path, batch: u64) -> Option<crate::model::Lock> {
+        RealFacts.recycle_block(p, batch)
+    }
 }
 
 #[test]
-fn a_malformed_job_file_refuses_everything() {
+fn an_item_the_engine_reads_differently_from_the_job_is_left_as_changed() {
     let env = Env::new();
     let app = env.folder("pf/App");
-    let base = env.p("elevated");
-    let dir = run_dir(&base);
-    let file = dir.join(JOB_FILE);
+    let mut ctx = env.ctx();
+    ctx.facts = Arc::new(ChangingFacts::default());
+    let out = run(&job(vec![env.item(0, &app, Why::Leftover)]), &ctx);
+    assert_eq!(reason(&out[0]), CHANGED);
+    assert!(app.exists() && env.rec.calls.lock().unwrap().is_empty());
+}
+
+#[test]
+fn a_stop_is_carried_back_in_the_result() {
+    let env = Env::new();
+    let first = env.folder("pf/A");
+    let second = env.folder("pf/B");
+    env.rec.destroy.lock().unwrap().insert(first.clone());
+    let r = process_job(&job(vec![env.item(0, &first, Why::Leftover), env.item(1, &second, Why::Leftover)]), &env.ctx());
+    assert!(r.stopped_early.as_deref().unwrap().contains("could not be confirmed"));
+    let none = process_job(&job(vec![env.item(1, &second, Why::Leftover)]), &env.ctx());
+    assert_eq!(none.stopped_early, None);
+}
+
+// ---- I1: the folders above an item are held -----------------------------------------------------------
+
+fn elevated_engine(env: &Env) -> Engine {
+    Engine::new_elevated(env.places.clone(), env.rec.clone(), Arc::new(RealFacts), env.claims.clone())
+        .with_guard(Arc::new(guard::ParentChainGuard::new(env.places.guarded_roots())))
+}
+
+fn uninstall_candidate(p: &Path) -> Candidate {
+    Candidate::Folder { path: p.to_path_buf(), why: Why::Uninstall, level: None, reasons: vec![] }
+}
+
+#[test]
+fn a_parent_swapped_for_a_junction_after_prepare_leaves_the_item_in_place() {
+    let env = Env::new();
+    let item = env.folder("pf/Vendor/App");
+    let decoy = env.folder("elsewhere/Precious");
+    let engine = elevated_engine(&env);
+    let prep = engine.prepare(vec![uninstall_candidate(&item)], &[]);
+    assert_eq!(prep.items[0].lock, None, "{:?}", prep.items[0]);
+    // After review: `pf\Vendor` becomes a junction to where the same-named folder tree now is.
+    let moved = env.p("elsewhere/Vendor");
+    std::fs::rename(env.p("pf/Vendor"), &moved).unwrap();
+    assert!(make_junction(&env.p("pf/Vendor"), &moved), "needs a junction");
+    let r = engine.commit(&prep.token, &[0], &[]).unwrap();
+    assert_eq!(reason(&r.items[0]), guard::CHANGED_ABOVE);
+    assert!(env.rec.calls.lock().unwrap().is_empty(), "nothing was handed to the recycler");
+    assert!(moved.join("App").exists() && decoy.exists());
+}
+
+#[test]
+fn without_a_swap_the_same_item_is_recycled_with_its_parents_held() {
+    let env = Env::new();
+    let item = env.folder("pf/Vendor/App");
+    let engine = elevated_engine(&env);
+    let prep = engine.prepare(vec![uninstall_candidate(&item)], &[]);
+    let r = engine.commit(&prep.token, &[0], &[]).unwrap();
+    assert!(is_moved(&r.items[0]), "{r:?}");
+}
+
+#[test]
+fn holding_the_chain_stops_a_parent_being_renamed_until_it_is_released() {
+    let env = Env::new();
+    let item = env.folder("pf/Vendor/Sub/App");
+    let g = guard::ParentChainGuard::new(env.places.guarded_roots());
+    let held = g.hold(&item).unwrap();
+    assert!(std::fs::rename(env.p("pf/Vendor"), env.p("pf/Renamed")).is_err(), "a held parent can't be renamed");
+    assert!(std::fs::rename(env.p("pf/Vendor/Sub"), env.p("pf/Vendor/Sub2")).is_err(), "nor the one below it");
+    // The item's own folder is not held: it can be recycled.
+    drop(held);
+    assert!(std::fs::rename(env.p("pf/Vendor"), env.p("pf/Renamed")).is_ok());
+    // Items outside every root hold nothing.
+    let stale = env.file("pd/Seek/indexes/a.seekidx", b"x");
+    assert!(g.hold(&stale).is_ok());
+    // A parent that is not where the path says (a link) is refused.
+    let link_item = env.folder("elsewhere/Real/App");
+    assert!(make_junction(&env.p("pf/Linked"), &env.p("elsewhere/Real")));
+    let e = g.hold(&env.p("pf/Linked/App")).err().unwrap();
+    assert_eq!(e, guard::CHANGED_ABOVE);
+    assert!(link_item.exists());
+}
+
+// ---- I2: claims never trust the environment for system folders -----------------------------------------
+
+#[test]
+fn a_poisoned_program_files_variable_does_not_change_a_claim() {
+    use crate::claims::{location_paths, trusted_env};
+    let poisoned = |n: &str| match n {
+        "ProgramFiles" | "programfiles" => Some(r"C:\Users\me\Evil".to_string()),
+        "ProgramData" | "SystemRoot" | "windir" | "SystemDrive" | "ALLUSERSPROFILE" | "CommonProgramFiles(x86)" => Some(r"C:\Users\me\Evil".to_string()),
+        "LOCALAPPDATA" => Some(r"C:\Users\me\AppData\Local".to_string()),
+        _ => None,
+    };
+    let system = |n: &str| (n.eq_ignore_ascii_case("ProgramFiles")).then(|| r"C:\Program Files".to_string());
+    let env = |n: &str| trusted_env(n, &poisoned, &system);
+    assert_eq!(location_paths(r"%ProgramFiles%\Vendor App", &env), vec![r"C:\Program Files\Vendor App".to_string()]);
+    assert_eq!(location_paths(r"%programfiles%\Vendor App", &env), vec![r"C:\Program Files\Vendor App".to_string()]);
+    // A trusted name Windows can't answer is left unexpanded, never taken from the environment.
+    assert!(location_paths(r"%ProgramData%\Vendor", &env).is_empty());
+    assert!(location_paths(r"%windir%\x.exe", &env).is_empty());
+    // Every other variable still comes from the environment.
+    assert_eq!(location_paths(r"%LOCALAPPDATA%\Programs\X", &env), vec![r"C:\Users\me\AppData\Local\Programs\X".to_string()]);
+    // The real system answers for each name, and for no other.
+    for n in ["ProgramFiles", "ProgramW6432", "ProgramFiles(x86)", "CommonProgramFiles", "CommonProgramW6432", "CommonProgramFiles(x86)", "ProgramData", "ALLUSERSPROFILE", "SystemRoot", "windir", "SystemDrive"] {
+        let v = crate::protect::trusted_folder_env(n).unwrap_or_else(|| panic!("{n}"));
+        assert!(v.len() >= 2 && v.as_bytes()[1] == b':', "{n}: {v}");
+    }
+    assert_eq!(crate::protect::trusted_folder_env("LOCALAPPDATA"), None);
+}
+
+// ---- C1 and M1: the pipe -------------------------------------------------------------------------------------
+
+#[test]
+fn a_pipe_name_of_the_wrong_shape_is_refused() {
+    let good = pipe::new_name();
+    assert!(pipe::name_ok(&good), "{good}");
+    let hex = good.rsplit('-').next().unwrap().to_string();
+    for bad in [
+        String::new(),
+        "job.json".to_string(),
+        format!(r"\\.\pipe\seek-clean-{}", hex.to_uppercase()),
+        format!(r"\\.\pipe\seek-clean-{}0", hex),
+        format!(r"\\.\pipe\seek-clean-{}", &hex[..31]),
+        format!(r"\\.\pipe\other-{hex}"),
+        format!(r"\\server\pipe\seek-clean-{hex}"),
+        format!(r"\\.\pipe\seek-clean-{hex}\..\x"),
+        format!(r"C:\Temp\seek-clean-{hex}"),
+        format!(r"\\.\pipe\seek-clean-{}g", &hex[..31]),
+    ] {
+        assert!(!pipe::name_ok(&bad), "{bad}");
+        assert_eq!(run_main_with(&bad, &|_| panic!("no context for a bad name")), EXIT_REFUSED, "{bad}");
+    }
+}
+
+/// Runs the elevated side of `name` on this thread, as the launcher of a test.
+struct ClientLauncher(Box<dyn Fn(&str) -> u32 + Send + Sync>);
+
+impl Launcher for ClientLauncher {
+    fn launch_and_wait(&self, name: &str) -> Result<u32, LaunchError> {
+        Ok((self.0)(name))
+    }
+}
+
+fn client_of(env: &Arc<Env>) -> ClientLauncher {
+    let env = env.clone();
+    ClientLauncher(Box::new(move |name| run_main_with(name, &|_| Ok(env.ctx())) as u32))
+}
+
+#[test]
+fn a_good_job_over_a_real_pipe_is_processed_and_answered() {
+    let env = Arc::new(Env::new());
+    let app = env.folder("pf/App");
+    let docs = env.folder("users/me/docs/Mine");
+    let items = vec![env.item(0, &app, Why::Leftover), env.item(1, &docs, Why::Leftover)];
+    let out = run_elevated(&items, SID, std::process::id(), &client_of(&env));
+    assert!(is_moved(&out.items[0]) && !is_moved(&out.items[1]), "{out:?}");
+    assert!(!app.exists() && docs.exists());
+    assert_eq!(out.stopped_early, None);
+}
+
+#[test]
+fn a_server_pid_that_is_not_the_jobs_window_pid_refuses_everything() {
+    let env = Arc::new(Env::new());
+    let app = env.folder("pf/App");
+    let items = vec![env.item(0, &app, Why::Leftover)];
+    // The job says it comes from another process than the one serving the pipe.
+    let other_pid = std::process::id().wrapping_add(4);
+    let out = run_elevated(&items, SID, other_pid, &client_of(&env));
+    assert!(reason(&out.items[0]).contains("not asked for by the Seek window"), "{}", reason(&out.items[0]));
+    assert!(app.exists() && env.rec.calls.lock().unwrap().is_empty());
+    // And with no window named at all.
+    let out = run_elevated(&items, SID, 0, &client_of(&env));
+    assert!(!is_moved(&out.items[0]) && app.exists());
+}
+
+/// Serves `job` as raw bytes to the elevated side and returns its exit code and what it answered.
+fn serve_raw(env: &Arc<Env>, job: Vec<u8>) -> (i32, ElevatedResult) {
+    let name = pipe::new_name();
+    let server = pipe::Server::create(&name).unwrap();
+    let serving = std::thread::spawn(move || server.serve(&job, MAX_RESULT_BYTES));
+    let code = run_main_with(&name, &|_| Ok(env.ctx()));
+    let reply = serving.join().unwrap().unwrap();
+    (code, serde_json::from_slice(&reply).unwrap())
+}
+
+#[test]
+fn a_malformed_job_over_a_real_pipe_refuses_everything() {
+    let env = Arc::new(Env::new());
+    let app = env.folder("pf/App");
     for bad in [&b"{ nope"[..], b"[]", b"", br#"{"userSid":"x","items":[{"id":"a"}]}"#] {
-        std::fs::write(&file, bad).unwrap();
-        let _ = std::fs::remove_file(dir.join(RESULT_FILE));
-        let code = run_main_with(&file, &base, &refuse_everything_context(&env));
-        assert_eq!(code, 2);
-        let result: ElevatedResult = serde_json::from_slice(&std::fs::read(dir.join(RESULT_FILE)).unwrap()).unwrap();
+        let (code, result) = serve_raw(&env, bad.to_vec());
+        assert_eq!(code, EXIT_REFUSED);
         assert!(result.items.is_empty() && result.note.unwrap().contains("malformed"));
     }
-    assert!(app.exists() && env.rec.calls.lock().unwrap().is_empty());
-}
-
-#[test]
-fn a_job_over_the_caps_is_refused_unread() {
-    let env = Env::new();
-    let base = env.p("elevated");
-    let dir = run_dir(&base);
-    let file = dir.join(JOB_FILE);
-    std::fs::write(&file, vec![b' '; (MAX_JOB_BYTES + 1) as usize]).unwrap();
-    assert_eq!(run_main_with(&file, &base, &refuse_everything_context(&env)), 2);
+    // Too many items.
     let items: Vec<JobItem> = (0..=MAX_JOB_ITEMS as u32).map(|id| JobItem { id, path: "x".into(), size: 0, modified_ms: 0, why: Why::Leftover }).collect();
-    std::fs::write(&file, serde_json::to_vec(&job(items)).unwrap()).unwrap();
-    assert!(std::fs::metadata(&file).unwrap().len() < MAX_JOB_BYTES);
-    assert_eq!(run_main_with(&file, &base, &refuse_everything_context(&env)), 2);
-    let result: ElevatedResult = serde_json::from_slice(&std::fs::read(dir.join(RESULT_FILE)).unwrap()).unwrap();
+    let big = serde_json::to_vec(&job(items)).unwrap();
+    assert!((big.len() as u64) < MAX_JOB_BYTES);
+    let (code, result) = serve_raw(&env, big);
+    assert_eq!(code, EXIT_REFUSED);
     assert!(result.note.unwrap().contains("too many"));
-}
-
-#[test]
-fn a_job_file_outside_the_run_folder_layout_is_not_read() {
-    let env = Env::new();
-    let app = env.folder("pf/App");
-    let base = env.p("elevated");
-    let good = job(vec![env.item(0, &app, Why::Leftover)]);
-    let bytes = serde_json::to_vec(&good).unwrap();
-    let mut wrong: Vec<PathBuf> = Vec::new();
-    // Not named job.json, a folder name that is not 128-bit hex, a folder deeper or shallower, another base.
-    let d = run_dir(&base);
-    wrong.push(d.join("other.json"));
-    let short = base.join("abc");
-    std::fs::create_dir_all(&short).unwrap();
-    wrong.push(short.join(JOB_FILE));
-    let upper = base.join("ABCDEFABCDEFABCDEFABCDEFABCDEFAB");
-    std::fs::create_dir_all(&upper).unwrap();
-    wrong.push(upper.join(JOB_FILE));
-    wrong.push(base.join(JOB_FILE));
-    let deeper = d.join("sub");
-    std::fs::create_dir_all(&deeper).unwrap();
-    wrong.push(deeper.join(JOB_FILE));
-    let elsewhere = env.p("elsewhere").join(format!("{:032x}", 7u128));
-    std::fs::create_dir_all(&elsewhere).unwrap();
-    wrong.push(elsewhere.join(JOB_FILE));
-    for f in &wrong {
-        std::fs::write(f, &bytes).unwrap();
-        assert_eq!(run_main_with(f, &base, &refuse_everything_context(&env)), 2, "{f:?}");
-        assert!(!f.with_file_name(RESULT_FILE).exists(), "{f:?}");
-    }
+    // Too many bytes.
+    let (code, result) = serve_raw(&env, vec![b' '; (MAX_JOB_BYTES + 1) as usize]);
+    assert_eq!(code, EXIT_REFUSED);
+    assert!(result.note.unwrap().contains("too big"));
     assert!(app.exists() && env.rec.calls.lock().unwrap().is_empty());
-    // A job that is a link to a file somewhere else is not read either.
-    let real = d.join("real.json");
-    std::fs::write(&real, &bytes).unwrap();
-    let link = d.join(JOB_FILE);
-    if std::os::windows::fs::symlink_file(&real, &link).is_ok() {
-        assert_eq!(run_main_with(&link, &base, &refuse_everything_context(&env)), 2);
-    }
-    assert!(app.exists());
-}
-
-#[test]
-fn a_good_job_is_processed_and_its_result_written_beside_it() {
-    let env = Env::new();
-    let app = env.folder("pf/App");
-    let other = env.folder("users/me/docs/Mine");
-    let base = env.p("elevated");
-    let dir = run_dir(&base);
-    let file = dir.join(JOB_FILE);
-    let items = vec![env.item(0, &app, Why::Leftover), env.item(1, &other, Why::Leftover)];
-    std::fs::write(&file, serde_json::to_vec(&job(items.clone())).unwrap()).unwrap();
-    assert_eq!(run_main_with(&file, &base, &refuse_everything_context(&env)), 0);
-    let bytes = std::fs::read(dir.join(RESULT_FILE)).unwrap();
-    let back = match_results(&items, Some(&bytes));
-    assert!(is_moved(&back[0]) && !is_moved(&back[1]));
-    assert!(!app.exists() && other.exists());
-    let tmp_left: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).filter(|n| n.ends_with(".tmp")).collect();
-    assert!(tmp_left.is_empty(), "{tmp_left:?}");
 }
 
 #[test]
 fn a_context_that_cannot_be_built_refuses_every_item_with_its_reason() {
-    let env = Env::new();
+    let env = Arc::new(Env::new());
     let app = env.folder("pf/App");
-    let base = env.p("elevated");
-    let dir = run_dir(&base);
-    let file = dir.join(JOB_FILE);
     let items = vec![env.item(0, &app, Why::Leftover)];
-    std::fs::write(&file, serde_json::to_vec(&job(items.clone())).unwrap()).unwrap();
-    assert_eq!(run_main_with(&file, &base, &|_| Err("Windows can't name its folders.".into())), 2);
-    let back = match_results(&items, Some(&std::fs::read(dir.join(RESULT_FILE)).unwrap()));
-    assert!(reason(&back[0]).contains("can't name"));
+    let job = serde_json::to_vec(&ElevatedJob { user_sid: SID.into(), window_pid: std::process::id(), items }).unwrap();
+    let name = pipe::new_name();
+    let server = pipe::Server::create(&name).unwrap();
+    let serving = std::thread::spawn(move || server.serve(&job, MAX_RESULT_BYTES));
+    let code = run_main_with(&name, &|_| Err("Windows can't name its folders.".into()));
+    let reply: ElevatedResult = serde_json::from_slice(&serving.join().unwrap().unwrap()).unwrap();
+    assert_eq!(code, EXIT_REFUSED);
+    assert!(reason(&reply.items[0]).contains("can't name"));
     assert!(app.exists());
 }
 
@@ -568,7 +752,7 @@ fn answer(id: u32, outcome: Outcome) -> ItemOutcome {
 }
 
 fn result_bytes(items: Vec<ItemOutcome>, note: Option<&str>) -> Vec<u8> {
-    serde_json::to_vec(&ElevatedResult { items, note: note.map(str::to_string) }).unwrap()
+    serde_json::to_vec(&ElevatedResult { items, note: note.map(str::to_string), stopped_early: None }).unwrap()
 }
 
 #[test]
@@ -576,139 +760,106 @@ fn results_are_matched_to_the_ids_that_were_sent() {
     let sent = sent(3);
     let moved = || Outcome::Moved { bin_path: "bin".into() };
     let bytes = result_bytes(vec![answer(2, moved()), answer(99, moved()), answer(0, Outcome::Left { reason: "in use".into() }), answer(0, moved())], None);
-    let out = match_results(&sent, Some(&bytes));
+    let out = match_results(&sent, Some(&bytes), 0).items;
     assert_eq!(out.len(), 3, "one outcome per item sent, none for id 99");
     assert_eq!(reason(&out[0]), "in use", "the first answer for an id wins");
-    assert_eq!(reason(&out[1]), NO_REPORT);
+    assert_eq!(reason(&out[1]), ADMIN_SILENT);
     assert!(is_moved(&out[2]));
     assert_eq!((out[2].path.as_str(), out[2].size), (r"C:\Program Files\App2", 12), "path and size are what was sent");
 }
 
 #[test]
-fn a_missing_malformed_or_partial_result_leaves_the_rest_in_place() {
+fn an_item_with_no_answer_may_have_moved_unless_the_run_refused() {
     let sent = sent(2);
     for bytes in [None, Some(&b""[..]), Some(&b"{ half"[..]), Some(&b"[1,2]"[..]), Some(&br#"{"items":[{"id":0}]}"#[..])] {
-        let out = match_results(&sent, bytes);
-        assert!(out.iter().all(|o| reason(o) == NO_REPORT), "{bytes:?}");
+        for code in [0u32, 1, 3, 259, u32::MAX] {
+            let out = match_results(&sent, bytes, code).items;
+            assert!(out.iter().all(|o| reason(o) == ADMIN_SILENT), "{bytes:?} {code}");
+            assert!(ADMIN_SILENT.contains("Check the Recycle Bin") && !ADMIN_SILENT.contains("left in place"));
+        }
+        // Exit 2: nothing was done.
+        let out = match_results(&sent, bytes, 2).items;
+        assert!(out.iter().all(|o| reason(o) == REFUSED_RUN), "{bytes:?}");
     }
     let partial = result_bytes(vec![answer(1, Outcome::Moved { bin_path: "b".into() })], None);
-    let out = match_results(&sent, Some(&partial));
-    assert_eq!(reason(&out[0]), NO_REPORT);
+    let out = match_results(&sent, Some(&partial), 1).items;
+    assert_eq!(reason(&out[0]), ADMIN_SILENT);
     assert!(is_moved(&out[1]));
-    // The elevated side's own reason for refusing the whole job is passed on.
-    let noted = result_bytes(vec![], Some("The job file is malformed, so nothing was removed."));
-    assert!(reason(&match_results(&sent, Some(&noted))[0]).contains("malformed"));
-}
-
-type Launched = Result<Option<Vec<u8>>, LaunchError>;
-
-struct FakeLauncher {
-    result: Result<Option<Vec<u8>>, LaunchError>,
-    seen: Mutex<Vec<(PathBuf, String)>>,
-    calls: Mutex<u32>,
-}
-
-impl FakeLauncher {
-    fn new(result: Result<Option<Vec<u8>>, LaunchError>) -> FakeLauncher {
-        FakeLauncher { result, seen: Mutex::default(), calls: Mutex::new(0) }
-    }
-}
-
-impl Launcher for FakeLauncher {
-    fn launch_and_wait(&self, job_file: &Path) -> Result<(), LaunchError> {
-        *self.calls.lock().unwrap() += 1;
-        self.seen.lock().unwrap().push((job_file.to_path_buf(), std::fs::read_to_string(job_file).unwrap()));
-        match &self.result {
-            Err(e) => Err(e.clone()),
-            Ok(bytes) => {
-                if let Some(b) = bytes {
-                    std::fs::write(job_file.with_file_name(RESULT_FILE), b).unwrap();
-                }
-                Ok(())
-            }
-        }
-    }
-}
-
-fn leftovers_of(base: &Path) -> Vec<PathBuf> {
-    std::fs::read_dir(base).map(|d| d.map(|e| e.unwrap().path()).collect()).unwrap_or_default()
+    // Exit 2 with the elevated side's own reason passes it on.
+    let noted = result_bytes(vec![], Some("The job is malformed, so nothing was removed."));
+    assert!(reason(&match_results(&sent, Some(&noted), 2).items[0]).contains("malformed"));
+    // Even with exit 0 a note does not turn a silent item into "left".
+    assert_eq!(reason(&match_results(&sent, Some(&noted), 0).items[0]), ADMIN_SILENT);
 }
 
 #[test]
-fn one_launch_sends_one_job_and_the_folder_is_deleted_afterwards_on_every_path() {
-    let env = Env::new();
-    let base = env.p("elevated");
-    let items = sent(2);
-    let good = result_bytes(vec![answer(0, Outcome::Moved { bin_path: "b".into() }), answer(1, Outcome::Moved { bin_path: "b".into() })], None);
-    let cases: Vec<(Launched, &str)> = vec![
-        (Ok(Some(good)), "moved"),
-        (Ok(None), NO_REPORT),
-        (Ok(Some(b"{ bad".to_vec())), NO_REPORT),
-        (Err(LaunchError::Declined), DECLINED),
-        (Err(LaunchError::Failed("The file is blocked".into())), "The file is blocked"),
-    ];
-    for (result, expect) in cases {
-        let l = FakeLauncher::new(result);
-        let out = run_elevated(&items, SID, 4242, &base, &l);
-        assert_eq!(*l.calls.lock().unwrap(), 1);
-        assert_eq!(out.len(), 2);
-        for o in &out {
-            match (&o.outcome, expect) {
-                (Outcome::Moved { .. }, "moved") => {}
-                (Outcome::Left { reason }, e) if e != "moved" => assert!(reason.contains(e), "{reason}"),
-                other => panic!("{other:?} for {expect}"),
-            }
-        }
-        assert!(leftovers_of(&base).is_empty(), "the run folder is gone after {expect}");
-        let (job_file, text) = &l.seen.lock().unwrap()[0];
-        assert!(job_file.starts_with(&base) && job_file.file_name().unwrap() == JOB_FILE);
-        let hex = job_file.parent().unwrap().file_name().unwrap().to_string_lossy().into_owned();
-        assert!(hex.len() == 32 && hex.chars().all(|c| c.is_ascii_hexdigit()), "{hex}");
-        let sent_job: ElevatedJob = serde_json::from_str(text).unwrap();
-        assert_eq!((sent_job.user_sid.as_str(), sent_job.window_pid, sent_job.items.len()), (SID, 4242, 2));
+fn a_stop_reported_by_the_elevated_side_reaches_the_answer() {
+    let sent = sent(1);
+    let bytes = serde_json::to_vec(&ElevatedResult { items: vec![], note: None, stopped_early: Some("C:\\x could not be confirmed".into()) }).unwrap();
+    assert_eq!(match_results(&sent, Some(&bytes), 0).stopped_early.as_deref(), Some("C:\\x could not be confirmed"));
+    assert_eq!(match_results(&sent, None, 0).stopped_early, None);
+}
+
+struct FailingLauncher(LaunchError);
+
+impl Launcher for FailingLauncher {
+    fn launch_and_wait(&self, _name: &str) -> Result<u32, LaunchError> {
+        Err(self.0.clone())
     }
 }
 
 #[test]
 fn a_declined_prompt_says_so_for_each_item_and_a_failed_start_gives_the_error_text() {
-    let env = Env::new();
-    let base = env.p("elevated");
-    let out = run_elevated(&sent(2), SID, 1, &base, &FakeLauncher::new(Err(LaunchError::Declined)));
-    assert!(out.iter().all(|o| reason(o) == "Windows asked for admin and it was declined."));
-    let out = run_elevated(&sent(1), SID, 1, &base, &FakeLauncher::new(Err(LaunchError::Failed("Access is denied. (os error 5)".into()))));
-    assert!(reason(&out[0]).contains("Access is denied"));
+    let out = run_elevated(&sent(2), SID, 1, &FailingLauncher(LaunchError::Declined));
+    assert!(out.items.iter().all(|o| reason(o) == "Windows asked for admin and it was declined."));
+    let out = run_elevated(&sent(1), SID, 1, &FailingLauncher(LaunchError::Failed("Access is denied. (os error 5)".into())));
+    assert!(reason(&out.items[0]).contains("Access is denied"));
 }
 
 #[test]
-fn two_runs_never_share_a_folder() {
-    let env = Env::new();
-    let base = env.p("elevated");
-    let a = FakeLauncher::new(Ok(None));
-    run_elevated(&sent(1), SID, 1, &base, &a);
-    run_elevated(&sent(1), SID, 1, &base, &a);
-    let seen = a.seen.lock().unwrap();
-    assert_ne!(seen[0].0, seen[1].0);
+fn a_launch_that_never_connects_does_not_hang_and_leaves_the_items_to_the_exit_code() {
+    // The elevated copy started and exited without ever opening the pipe (exit code 1).
+    let l = ClientLauncher(Box::new(|_| 1));
+    let out = run_elevated(&sent(2), SID, std::process::id(), &l);
+    assert!(out.items.iter().all(|o| reason(o) == ADMIN_SILENT));
+    let l = ClientLauncher(Box::new(|_| 2));
+    let out = run_elevated(&sent(1), SID, std::process::id(), &l);
+    assert_eq!(reason(&out.items[0]), REFUSED_RUN);
 }
 
 #[test]
-fn a_run_folder_that_cannot_be_made_leaves_every_item_in_place() {
-    let env = Env::new();
-    let blocker = env.file("blocker", b"x"); // a file where the base folder should be
-    let l = FakeLauncher::new(Ok(None));
-    let out = run_elevated(&sent(2), SID, 1, &blocker.join("elevated"), &l);
-    assert_eq!(*l.calls.lock().unwrap(), 0, "no prompt for a job that could not be written");
-    assert!(out.iter().all(|o| reason(o).contains("couldn't prepare")));
+fn every_run_uses_its_own_pipe_and_makes_one_launch() {
+    let names = Arc::new(Mutex::new(Vec::new()));
+    let seen = names.clone();
+    let l = ClientLauncher(Box::new(move |n| {
+        seen.lock().unwrap().push(n.to_string());
+        1
+    }));
+    run_elevated(&sent(1), SID, 1, &l);
+    run_elevated(&sent(1), SID, 1, &l);
+    let names = names.lock().unwrap();
+    assert_eq!(names.len(), 2);
+    assert_ne!(names[0], names[1]);
+    assert!(names.iter().all(|n| pipe::name_ok(n)));
 }
 
 #[test]
 fn the_job_elevator_makes_one_launch_for_a_whole_batch() {
-    let env = Env::new();
-    let l = Arc::new(FakeLauncher::new(Err(LaunchError::Declined)));
-    let e = JobElevator { launcher: l.clone(), base: Some(env.p("elevated")) };
+    let calls = Arc::new(Mutex::new(0u32));
+    let c = calls.clone();
+    let e = JobElevator { launcher: Arc::new(ClientLauncher(Box::new(move |_| {
+        *c.lock().unwrap() += 1;
+        1
+    }))) };
     let out = e.run(&sent(3)).unwrap();
-    assert_eq!(*l.calls.lock().unwrap(), 1);
-    assert_eq!(out.len(), 3);
-    let job: ElevatedJob = serde_json::from_str(&l.seen.lock().unwrap()[0].1).unwrap();
-    assert_eq!(job.window_pid, std::process::id());
-    assert_eq!(job.user_sid, current_user_sid().unwrap());
+    assert_eq!(*calls.lock().unwrap(), 1);
+    assert_eq!(out.items.len(), 3);
 }
+
+#[test]
+fn the_pipe_cannot_be_made_twice() {
+    let name = pipe::new_name();
+    let _first = pipe::Server::create(&name).unwrap();
+    assert!(pipe::Server::create(&name).is_err(), "FILE_FLAG_FIRST_PIPE_INSTANCE: no squatting before the window");
+}
+

@@ -362,6 +362,33 @@ pub fn expand_short_spelling(path: &str) -> String {
     }
 }
 
+/// Set by the elevated process before it reads the claims: from then on the folder variables
+/// below come from Windows, not the environment.
+static TRUSTED_ENV: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Makes every later claims read take `ProgramFiles`, `ProgramData`, `SystemRoot` and the like from
+/// Windows instead of the environment. For the elevated process only: the cost is that a
+/// machine whose variables really differ from the system's folders is read as the system says.
+/// On a normal system they don't point into Program Files, so nothing changes there.
+pub fn trust_system_folders_only() {
+    TRUSTED_ENV.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// One variable for the elevated process: the folder variables a program could poison
+/// (`crate::protect::is_trusted_env_name`) come only from `known` (so an unknown one stays
+/// unexpanded and is never taken from the environment), everything else from `base`.
+pub fn trusted_env(
+    name: &str,
+    base: &dyn Fn(&str) -> Option<String>,
+    known: &dyn Fn(&str) -> Option<String>,
+) -> Option<String> {
+    if crate::protect::is_trusted_env_name(name) {
+        known(name)
+    } else {
+        base(name)
+    }
+}
+
 /// Replaces `%NAME%` with the value `env` gives. Unknown names and stray `%` stay as they are.
 pub fn expand_env(s: &str, env: &dyn Fn(&str) -> Option<String>) -> String {
     let mut out = String::with_capacity(s.len());
@@ -821,7 +848,12 @@ mod real {
     const WIN: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion";
 
     fn env(name: &str) -> Option<String> {
-        std::env::var(name).ok().filter(|v| !v.is_empty())
+        let base = |n: &str| std::env::var(n).ok().filter(|v| !v.is_empty());
+        if TRUSTED_ENV.load(std::sync::atomic::Ordering::Relaxed) {
+            trusted_env(name, &base, &crate::protect::trusted_folder_env)
+        } else {
+            base(name)
+        }
     }
 
     fn wide(s: &str) -> Vec<u16> {
