@@ -104,6 +104,9 @@ pub struct Engine {
     places: Places,
     recycler: Arc<dyn Recycler>,
     elevator: Option<Arc<dyn Elevator>>,
+    /// True only inside the elevated process: items that need admin are recycled there and then,
+    /// not handed to an elevator or locked as needing admin.
+    elevated: bool,
     facts: Arc<dyn FileFacts>,
     claims: Arc<dyn ClaimCheck>,
     tokens: Mutex<VecDeque<(String, Review)>>,
@@ -123,11 +126,26 @@ impl Engine {
             places,
             recycler,
             elevator,
+            elevated: false,
             facts,
             claims,
             tokens: Mutex::new(VecDeque::new()),
             serial: Mutex::new(()),
         }
+    }
+
+    /// The engine of the elevated process (`elevated::run_main`): the same rules and the same
+    /// recycling, but items that need admin are removed here, since this process has it. It has
+    /// no elevator, so it can never ask for another prompt.
+    pub fn new_elevated(
+        places: Places,
+        recycler: Arc<dyn Recycler>,
+        facts: Arc<dyn FileFacts>,
+        claims: Arc<dyn ClaimCheck>,
+    ) -> Engine {
+        let mut e = Engine::new(places, recycler, None, facts, claims);
+        e.elevated = true;
+        e
     }
 
     /// Rule 1: looks at each candidate on disk and returns what the review sheet shows, with a
@@ -442,7 +460,7 @@ impl Engine {
                         });
                         continue;
                     }
-                    Ok(c) if c.admin => left(NEEDS_ADMIN),
+                    Ok(c) if c.admin && !self.elevated => left(NEEDS_ADMIN),
                     // One path per call, straight after its own last look.
                     Ok(_) => match self.recycle_step(rec) {
                         Step::Moved(bin_path) => {

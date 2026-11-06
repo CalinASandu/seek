@@ -20,8 +20,9 @@ use std::time::{Duration, Instant};
 use seek_clean::apps::{self, ShellLauncher, UninstallPhase, Uninstalls};
 use seek_clean::claims::{self, LiveClaims};
 use seek_clean::dupes::{self, ScanEvent, SizeBatch, SizeFile, MIN_DUPLICATE_BYTES};
+use seek_clean::elevated::{JobElevator, LaunchError, Launcher};
 use seek_clean::engine::Engine;
-use seek_clean::facts::{FileFacts, RealFacts};
+use seek_clean::facts::{Elevator, FileFacts, RealFacts};
 use seek_clean::leftovers;
 use seek_clean::model::{AppRow, Candidate, CommitResult, DupGroup, Level, LeftoverRow, Outcome, Prepared, Reason, Why};
 use seek_clean::paths::canon;
@@ -792,9 +793,74 @@ impl Core {
     fn real(places: Places) -> Core {
         let facts: Arc<dyn FileFacts> = Arc::new(RealFacts);
         let claims = Arc::new(LiveClaims::new());
-        // No elevator until Task 14: Program Files leftovers are left with the admin reason.
-        let engine = Engine::new(places.clone(), Arc::new(ShellRecycler), None, facts.clone(), claims.clone());
+        // Program Files leftovers and Seek's stale data go through one UAC prompt per commit.
+        let engine = Engine::new(places.clone(), Arc::new(ShellRecycler), Some(Arc::new(UacElevator)), facts.clone(), claims.clone());
         Core { engine, places, facts, claims: Some(claims) }
+    }
+}
+
+/// Asks Windows for admin, once, to run `seek-app.exe --clean-elevated <job file>`. Built only in
+/// `Core::real`. Everything else about the admin step (the job and result files, matching the
+/// answers, cleaning up) is `seek_clean::elevated`.
+pub struct UacElevator;
+
+impl Elevator for UacElevator {
+    fn run(&self, items: &[seek_clean::model::JobItem]) -> Result<Vec<seek_clean::model::ItemOutcome>, String> {
+        JobElevator { launcher: Arc::new(ShellLaunch), base: None }.run(items)
+    }
+}
+
+/// `ShellExecuteExW` with the `runas` verb, then waits for the elevated copy to exit.
+struct ShellLaunch;
+
+/// Closes the process handle once, whatever way out.
+struct ProcessHandle(windows_sys::Win32::Foundation::HANDLE);
+
+impl Drop for ProcessHandle {
+    fn drop(&mut self) {
+        // SAFETY: the handle came from ShellExecuteExW with SEE_MASK_NOCLOSEPROCESS and is closed only here.
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
+    }
+}
+
+impl Launcher for ShellLaunch {
+    fn launch_and_wait(&self, job_file: &Path) -> Result<(), LaunchError> {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Foundation::{GetLastError, ERROR_CANCELLED};
+        use windows_sys::Win32::System::Threading::{WaitForSingleObject, INFINITE};
+        use windows_sys::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
+        use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
+
+        let wide = |s: &std::ffi::OsStr| -> Vec<u16> { s.encode_wide().chain(std::iter::once(0)).collect() };
+        let exe = std::env::current_exe().map_err(|e| LaunchError::Failed(e.to_string()))?;
+        let file = wide(exe.as_os_str());
+        let verb = wide(std::ffi::OsStr::new("runas"));
+        let mut params = std::ffi::OsString::from("--clean-elevated \"");
+        params.push(job_file);
+        params.push("\"");
+        let params = wide(&params);
+        // SAFETY: an all-zero SHELLEXECUTEINFOW is valid (null pointers, zero flags); fields are set below.
+        let mut info: SHELLEXECUTEINFOW = unsafe { std::mem::zeroed() };
+        info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
+        info.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_FLAG_NO_UI | SEE_MASK_NOASYNC;
+        info.lpVerb = verb.as_ptr();
+        info.lpFile = file.as_ptr();
+        info.lpParameters = params.as_ptr();
+        info.nShow = SW_HIDE;
+        // SAFETY: `info` and the strings it points to outlive the call.
+        if unsafe { ShellExecuteExW(&mut info) } == 0 {
+            // SAFETY: reads the calling thread's last error, straight after the failed call.
+            let err = unsafe { GetLastError() };
+            return Err(if err == ERROR_CANCELLED { LaunchError::Declined } else { LaunchError::Failed(std::io::Error::from_raw_os_error(err as i32).to_string()) });
+        }
+        if info.hProcess.is_null() {
+            return Err(LaunchError::Failed("Windows did not give a process to wait for".into()));
+        }
+        let process = ProcessHandle(info.hProcess);
+        // No timeout: the prompt can stay open as long as the user likes.
+        // SAFETY: a valid process handle owned by the guard.
+        unsafe { WaitForSingleObject(process.0, INFINITE) };
+        Ok(())
     }
 }
 

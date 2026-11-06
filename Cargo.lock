@@ -3621,6 +3621,7 @@ dependencies = [
  "blake3",
  "png 0.18.1",
  "rand",
+ "seek-core",
  "serde",
  "serde_json",
  "tempfile",

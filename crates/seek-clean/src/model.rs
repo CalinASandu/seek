@@ -154,6 +154,9 @@ pub struct JobItem {
 #[serde(rename_all = "camelCase")]
 pub struct ElevatedJob {
     pub user_sid: String,
+    /// The window's process id, so the elevated copy can check who started it. 0 when missing.
+    #[serde(default)]
+    pub window_pid: u32,
     pub items: Vec<JobItem>,
 }
 
