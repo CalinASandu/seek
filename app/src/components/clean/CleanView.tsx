@@ -1,5 +1,5 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { History } from "lucide-react";
+import { History, Zap } from "lucide-react";
 import { useApi } from "../../api/context";
 import type { AppRow, PrepareRequest } from "../../api/types";
 import { useCleanup, type CleanController } from "../../hooks/useCleanup";
@@ -107,7 +107,7 @@ export const CleanView = memo(function CleanView({ active, deviceId, deviceName,
     };
   }, [api, notify, onProtect, onUnprotect, protectedPaths]);
 
-  const scan = () => ctl.scanStart(deviceId ? [deviceId] : scanDeviceIds);
+  const scan = (renamed = ctl.dup.get().renamed) => ctl.scanStart(deviceId ? [deviceId] : scanDeviceIds, renamed);
 
   return (
     <RowActionsProvider value={rowActions}>
@@ -120,14 +120,14 @@ export const CleanView = memo(function CleanView({ active, deviceId, deviceName,
               Recently removed
             </button>
           </div>
-          {tab === "duplicates" && <DuplicatesHead ctl={ctl} deviceId={deviceId} deviceName={deviceName} onScan={scan} />}
+          {tab === "duplicates" && <DuplicatesHead ctl={ctl} deviceId={deviceId} deviceName={deviceName} onScan={() => scan()} />}
           {tab === "leftovers" && <LeftoversHead ctl={ctl} onScan={() => ctl.loadLeftovers()} />}
           {tab === "apps" && <AppsHead ctl={ctl} onScan={() => ctl.loadApps()} />}
         </header>
 
         <div className="clean-body" ref={body}>
           <div className="clean-panel" hidden={tab !== "duplicates"}>
-            <DuplicatesTab ctl={ctl} deviceId={deviceId} deviceName={deviceName} onReview={openSheet} />
+            <DuplicatesTab ctl={ctl} deviceId={deviceId} deviceName={deviceName} onReview={openSheet} onScanRenamed={() => scan(true)} />
           </div>
           {seen.leftovers && (
             <div className="clean-panel" hidden={tab !== "leftovers"}>
@@ -195,7 +195,19 @@ function Hero({
   );
 }
 
-function ScanLine({ fraction, text, current, onCancel }: { fraction: number | null; text: string; current?: string | null; onCancel?: () => void }) {
+function ScanLine({
+  fraction,
+  text,
+  current,
+  onCancel,
+  faster,
+}: {
+  fraction: number | null;
+  text: string;
+  current?: string | null;
+  onCancel?: () => void;
+  faster?: { on: boolean; toggle: () => void };
+}) {
   return (
     <div className="scanline is-on">
       <div className={`scanline-track${fraction === null ? " is-indeterminate" : ""}`} role="progressbar" aria-label="Progress" aria-valuenow={fraction === null ? undefined : Math.round(fraction * 100)}>
@@ -212,6 +224,17 @@ function ScanLine({ fraction, text, current, onCancel }: { fraction: number | nu
           )}
         </span>
         {fraction !== null && <span className="scanline-num tnum">{text}</span>}
+        {faster && (
+          <button
+            className={`link-btn scan-faster${faster.on ? " is-on" : ""}`}
+            aria-pressed={faster.on}
+            title="Uses more of your PC's disk and processor while it scans."
+            onClick={faster.toggle}
+          >
+            <Zap size={12} aria-hidden="true" fill={faster.on ? "currentColor" : "none"} />
+            Scan faster
+          </button>
+        )}
         {onCancel && (
           <button className="link-btn" onClick={onCancel}>
             Cancel
@@ -230,6 +253,7 @@ function DuplicatesHead({ ctl, deviceId, deviceName, onScan }: { ctl: CleanContr
   const checked = useStore(ctl.dup, (s) => s.checkedBytes);
   const total = useStore(ctl.dup, (s) => s.totalBytes);
   const current = useStore(ctl.dup, (s) => s.current);
+  const fast = useStore(ctl.dup, (s) => s.fast);
   const prot = useStore(ctl.protect, (s) => s);
   const shown = useMemo(() => visibleGroups(groups, deviceId, prot), [groups, deviceId, prot]);
   const free = useMemo(() => shown.reduce((s, g) => s + groupFreeable(g, prot), 0), [shown, prot]);
@@ -244,8 +268,8 @@ function DuplicatesHead({ ctl, deviceId, deviceName, onScan }: { ctl: CleanContr
       ? "None found in the last scan"
       : status === "idle"
       ? deviceName
-        ? `Finds exact copies on ${deviceName}.`
-        : "Finds files that are exact copies of each other."
+        ? `Finds exact copies with the same name on ${deviceName}, in seconds.`
+        : "Finds exact copies with the same name, in seconds."
       : status === "error"
         ? "The scan didn't start."
         : scanning
@@ -263,6 +287,7 @@ function DuplicatesHead({ ctl, deviceId, deviceName, onScan }: { ctl: CleanContr
           text={stopping ? "Stopping…" : total > 0 ? `${formatSize(checked)} of ${formatSize(total)}` : "Starting…"}
           current={stopping ? null : current}
           onCancel={stopping ? undefined : () => ctl.scanCancel()}
+          faster={stopping ? undefined : { on: fast, toggle: () => ctl.scanFaster(!fast) }}
         />
       ) : (
         <IdleLine />

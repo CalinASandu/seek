@@ -44,6 +44,9 @@ export type CleanApi = Pick<
   | "cleanScanStart"
   | "cleanScanCancel"
   | "cleanScanState"
+  | "cleanScanFaster"
+  | "cleanRemembered"
+  | "cleanForget"
   | "onCleanEvent"
   | "cleanLeftovers"
   | "cleanApps"
@@ -445,6 +448,17 @@ function seedHistory(scenario: CleanScenario, now: number): HistoryEntry[] {
   ];
 }
 
+/** A quick scan only compares copies that share their name with another copy. */
+function sameNameOnly(g: DupGroup): DupGroup[] {
+  const name = (p: string) => fileName(p).toLowerCase();
+  const counts = new Map<string, number>();
+  g.copies.forEach((c) => counts.set(name(c.path), (counts.get(name(c.path)) ?? 0) + 1));
+  let copies = g.copies.filter((c) => counts.get(name(c.path))! > 1);
+  if (!copies.some((c) => c.suggestedKeep)) copies = copies.map((c, i) => ({ ...c, suggestedKeep: i === 0 }));
+  const freeable = freeableOf(g.size, copies.map((c) => c.lock !== null));
+  return copies.length > 1 && freeable > 0 ? [{ ...g, copies, freeable }] : [];
+}
+
 // ---- the mock --------------------------------------------------------------------------------------------------
 
 export function createMockClean(opts: MockCleanOptions): CleanApi {
@@ -463,7 +477,8 @@ export function createMockClean(opts: MockCleanOptions): CleanApi {
   const listeners = new Set<(e: CleanEvent) => void>();
   const emit = (e: CleanEvent) => listeners.forEach((l) => l(e));
 
-  const scan = { running: false, found: [] as DupGroup[], checked: 0, total: 0, current: null as string | null };
+  const scan = { running: false, found: [] as DupGroup[], checked: 0, total: 0, current: null as string | null, renamed: false, fast: false };
+  let remembered = scenario === "empty" ? 0 : 14_876_672;
   let run = 0;
 
   const state = (): DupScanState => ({
@@ -473,16 +488,21 @@ export function createMockClean(opts: MockCleanOptions): CleanApi {
     checkedBytes: scan.checked,
     totalBytes: scan.total,
     current: scan.current,
+    renamed: scan.renamed,
+    fast: scan.fast,
   });
 
-  async function runScan(id: number, scope: string[]) {
-    const wanted = scope.length === 1 ? groups.filter((g) => g.copies.some((c) => c.deviceId === scope[0])) : groups;
+  async function runScan(id: number, scope: string[], renamed: boolean) {
+    const inScope = scope.length === 1 ? groups.filter((g) => g.copies.some((c) => c.deviceId === scope[0])) : groups;
+    const wanted = renamed ? inScope : inScope.flatMap((g) => sameNameOnly(g));
     const total = wanted.reduce((s, g) => s + g.size * g.copies.length, 0) * 3;
     scan.running = true;
     scan.found = [];
     scan.checked = 0;
     scan.total = total;
     scan.current = null;
+    scan.renamed = renamed;
+    scan.fast = false;
     if (!simulate) {
       await sleep(0);
       if (id !== run) return;
@@ -501,7 +521,7 @@ export function createMockClean(opts: MockCleanOptions): CleanApi {
     const per = Math.max(1, Math.ceil(wanted.length / ticks));
     const roots = ["C:\\Users\\Calin\\Documents", "D:\\Photos\\2023", "D:\\Backups\\Old laptop", "D:\\Programming\\web\\.cache", "C:\\Users\\Calin\\Downloads", "D:\\Uni\\Sem2"];
     for (let i = 0; i < wanted.length; i += per) {
-      await sleep(280);
+      await sleep((renamed ? 280 : 90) / (scan.fast ? 2 : 1));
       if (id !== run) return;
       for (const g of wanted.slice(i, i + per)) {
         scan.found.push(g);
@@ -553,10 +573,22 @@ export function createMockClean(opts: MockCleanOptions): CleanApi {
   }
 
   return {
-    async cleanScanStart(deviceIds) {
+    async cleanScanStart(deviceIds, renamed) {
       await delay();
       const id = ++run;
-      void runScan(id, deviceIds);
+      void runScan(id, deviceIds, renamed ?? false);
+    },
+    async cleanScanFaster(on) {
+      await delay();
+      if (scan.running) scan.fast = on;
+    },
+    async cleanRemembered() {
+      await delay();
+      return remembered;
+    },
+    async cleanForget() {
+      await delay();
+      remembered = 0;
     },
     async cleanScanCancel() {
       await delay();

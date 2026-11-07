@@ -42,6 +42,10 @@
 .link-btn { flex: none; padding: 3px 9px; border-radius: 6px; color: var(--accent-text); font-size: var(--fs-xs); font-weight: 550; transition: background var(--t), transform var(--t-fast) var(--ease); }
 .link-btn:hover { background: var(--accent-soft); }
 .link-btn:active { transform: scale(0.97); }
+/* Quiet until pressed: muted ink, accent once on. */
+.scan-faster { display: inline-flex; align-items: center; gap: 4px; color: var(--muted); }
+.scan-faster.is-on { color: var(--accent-text); }
+.cl-placeholder-action { display: block; margin-top: 10px; }
 
 /* ---- rows ---------------------------------------------------------------------------------------------------- */
 .cl-list { display: flex; flex-direction: column; }

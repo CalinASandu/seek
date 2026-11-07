@@ -7,7 +7,15 @@ Design: `docs/superpowers/specs/2026-10-04-seek-local-design.md`. Plan: `docs/su
 
 ## Rules
 - Never `git commit` (or let subagents commit) unless the user explicitly says so.
-- Ask all clarifying questions at once, numbered, with suggested defaults.
+- Ask all clarifying questions at once, numbered, with suggested defaults, and only when the answer changes what gets built.
+
+## Keep it simple
+- Pick the smallest change that meets the goal. If 200 lines can be 50, write 50.
+- Build only what was asked. No extra layers, options or "for later" code.
+- Logic used more than once becomes one function. Keep code readable and organized.
+- Plans fit the task: a small change gets a few steps, not a multi-task plan.
+- Before sending a plan or reply, ask: can this be half as long? If yes, cut it.
+- If a spec asks for something costly (background work, a new protocol, new service code), propose the cheaper way first.
 - `seek-core` must stay free of Windows dependencies. Timestamps are unix epoch **milliseconds** everywhere.
 - After running agents, delete stray empty files they leave in the repo root (from bad shell redirects).
 - x64 only (seek-clean refuses to build for 32-bit).

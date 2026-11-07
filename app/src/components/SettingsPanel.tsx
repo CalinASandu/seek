@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { Link2, Link2Off, Monitor, Moon, Plus, Sun, X } from "lucide-react";
 import type { HubStatus, Peers, Settings } from "../api/types";
+import { useApi } from "../api/context";
+import { formatSize } from "../lib/format";
 import { hubSyncedText, hubUnlinked, inHubMode } from "../lib/pcs";
 import { Dialog } from "./Dialog";
 import { Segmented, type SegmentedItem } from "./Segmented";
@@ -209,6 +211,8 @@ export function SettingsPanel({ settings, version, peers, hub, problem, onChange
             </form>
           </section>
 
+          <Remembered />
+
           <section className="setting-group" aria-labelledby="set-prot">
             <h3 id="set-prot">Protected from Cleanup</h3>
             <p className="setting-desc">Cleanup never moves these files or folders, or anything inside them.</p>
@@ -269,5 +273,34 @@ export function SettingsPanel({ settings, version, peers, hub, problem, onChange
         </Dialog>
       )}
     </div>
+  );
+}
+
+/** What duplicate scans remember, so files they already read aren't read again. */
+function Remembered() {
+  const api = useApi();
+  const [bytes, setBytes] = useState<number | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const fail = (e: unknown) => setError(e instanceof Error ? e.message : String(e));
+  useEffect(() => {
+    api.cleanRemembered().then(setBytes, fail);
+  }, [api]);
+  const forget = () => api.cleanForget().then(() => setBytes(0), fail);
+  return (
+    <section className="setting-group" aria-labelledby="set-remembered">
+      <h3 id="set-remembered">Duplicate scans</h3>
+      <p className="setting-desc">Seek remembers what scans have already read, so the next scan only reads files that changed.</p>
+      <div className="setting-row">
+        <span className="setting-desc tnum">{bytes ? `Uses ${formatSize(bytes)}` : "Nothing remembered yet"}</span>
+        <button className="btn" onClick={forget} disabled={!bytes}>
+          Clear
+        </button>
+      </div>
+      {error && (
+        <p className="setting-desc review-warn" role="alert">
+          {error}
+        </p>
+      )}
+    </section>
   );
 }
