@@ -623,6 +623,20 @@ fn a_scan_whose_service_calls_fail_stops_running_and_can_be_started_again() {
 }
 
 #[test]
+fn scan_faster_lasts_for_the_running_scan_only() {
+    let s = Shared::default();
+    s.set_fast(true);
+    assert!(!s.state().fast, "nothing running: nothing to speed up");
+    let (gen, _) = s.begin().unwrap();
+    s.set_fast(true);
+    assert!(s.state().fast);
+    let (_, emit) = counting();
+    s.finish(gen, &*emit);
+    s.begin().unwrap();
+    assert!(!s.state().fast, "off again for the next scan");
+}
+
+#[test]
 fn done_is_sent_once_and_the_scan_stops_running_even_if_the_scan_panics() {
     let s = Shared::default();
     let (seen, emit) = counting();

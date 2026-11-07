@@ -27,6 +27,7 @@ use seek_clean::history::{self, History, PutBackResult, ShellBin};
 use seek_clean::leftovers;
 use seek_clean::model::{AppRow, Candidate, CommitResult, DupGroup, Level, LeftoverRow, Outcome, Prepared, Reason, Why};
 use seek_clean::paths::canon;
+use seek_clean::remember::{self, Remembered};
 use seek_clean::protect::Places;
 use seek_clean::recycle::ShellRecycler;
 use seek_core::{Device, DeviceId, DeviceState, HostId};
@@ -612,6 +613,10 @@ struct Inner {
     done_sent: bool,
     finished_at: Option<Instant>,
     cancel: Arc<AtomicBool>,
+    /// The scan also compares files saved under another name.
+    renamed: bool,
+    /// *Scan faster*, for this scan only: a fresh flag with every scan.
+    fast: Arc<AtomicBool>,
 }
 
 /// What `clean_scan_state` returns; the shape of `DupScanState` in `types.ts`.
@@ -625,6 +630,8 @@ pub struct ScanState {
     pub total_bytes: u64,
     pub current: Option<String>,
     pub notice: Option<String>,
+    pub renamed: bool,
+    pub fast: bool,
 }
 
 #[derive(Default)]
@@ -668,6 +675,16 @@ impl Shared {
             total_bytes: i.total,
             current: i.current.clone(),
             notice: i.notice.clone(),
+            renamed: i.renamed,
+            fast: i.fast.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Turns *Scan faster* on or off for the running scan; the next scan starts with it off.
+    pub fn set_fast(&self, on: bool) {
+        let i = self.lock();
+        if i.running {
+            i.fast.store(on, Ordering::Relaxed);
         }
     }
 
@@ -1100,8 +1117,8 @@ async fn fetch_stale(link: &ServiceLink) -> Result<Vec<StaleFile>, String> {
     }
 }
 
-async fn fetch_page(link: &ServiceLink, ids: Vec<DeviceId>, cursor: Option<u64>) -> Page {
-    let req = Request::SameSizeFiles { min_size: MIN_DUPLICATE_BYTES, device_ids: ids, cursor, limit: PAGE_LIMIT, same_name: false };
+async fn fetch_page(link: &ServiceLink, ids: Vec<DeviceId>, cursor: Option<u64>, renamed: bool) -> Page {
+    let req = Request::SameSizeFiles { min_size: MIN_DUPLICATE_BYTES, device_ids: ids, cursor, limit: PAGE_LIMIT, same_name: !renamed };
     match link.request(req).await? {
         Response::SameSizeFiles { groups, next } => Ok((groups, next)),
         other => Err(unexpected(other)),
@@ -1126,13 +1143,15 @@ async fn scan_job(
     plan: ScanPlan,
     protected: Vec<PathBuf>,
     cancel: Arc<AtomicBool>,
+    renamed: bool,
+    fast: Arc<AtomicBool>,
 ) {
     if plan.nothing_local {
         return;
     }
     let collected = {
         let conn = &*link;
-        collect(|ids, cursor| fetch_page(conn, ids, cursor), &plan, &cancel).await
+        collect(|ids, cursor| fetch_page(conn, ids, cursor, renamed), &plan, &cancel).await
     };
     drop(link);
     for notice in [&collected.local_notice, &collected.linked_notice].into_iter().flatten() {
@@ -1150,9 +1169,16 @@ async fn scan_job(
             gen,
             &*emit,
             std::panic::AssertUnwindSafe(|| {
-                let complete = dupes::scan(batches, &core.places, &protected, &*core.facts, &downloads_like(), &cancel, |e| {
-                    sh.on_event(gen, e, &*emit)
-                });
+                // What earlier scans read, for this scan only, then written back and let go.
+                let path = remember::default_path();
+                let mut memory = Remembered::load(&path);
+                let complete =
+                    dupes::scan(batches, &core.places, &protected, &*core.facts, &downloads_like(), &mut memory, &fast, &cancel, |e| {
+                        sh.on_event(gen, e, &*emit)
+                    });
+                if let Err(e) = memory.save(&path) {
+                    tracing::warn!("couldn't remember what the scan read: {e}");
+                }
                 if !complete {
                     tracing::error!("the duplicate scan stopped on a panic of its own");
                     sh.add_notice(gen, SCAN_STOPPED, &*emit);
@@ -1168,12 +1194,17 @@ async fn scan_job(
 type Clean<'a> = State<'a, Arc<CleanState>>;
 
 #[tauri::command]
-pub async fn clean_scan_start(clean: Clean<'_>, device_ids: Vec<DeviceId>) -> Result<(), String> {
+pub async fn clean_scan_start(clean: Clean<'_>, device_ids: Vec<DeviceId>, renamed: bool) -> Result<(), String> {
     let core = clean.core()?;
     let protected: Vec<PathBuf> = settings::protected_paths_strict()?.into_iter().map(PathBuf::from).collect();
     let emit = clean.emitter();
     // Running, with its cancel flag, from now: a Cancel while the service is being asked stops the scan.
     let (gen, cancel) = clean.shared.begin()?;
+    let fast = {
+        let mut i = clean.shared.lock();
+        i.renamed = renamed;
+        i.fast.clone()
+    };
     // The paging has a connection of its own, closed when the paging is over.
     let link = Arc::new(ServiceLink::default());
     let plan = match fetch_context(&link).await {
@@ -1188,7 +1219,7 @@ pub async fn clean_scan_start(clean: Clean<'_>, device_ids: Vec<DeviceId>) -> Re
     }
     let shared = clean.shared.clone();
     tauri::async_runtime::spawn(async move {
-        let worker = tauri::async_runtime::spawn(scan_job(shared.clone(), gen, emit.clone(), core, link, plan, protected, cancel));
+        let worker = tauri::async_runtime::spawn(scan_job(shared.clone(), gen, emit.clone(), core, link, plan, protected, cancel, renamed, fast));
         // Whatever happened to the worker, a panic included, the window hears `done` and the scan stops running.
         if let Err(e) = worker.await {
             tracing::error!("the duplicate scan job failed: {e}");
@@ -1202,6 +1233,22 @@ pub async fn clean_scan_start(clean: Clean<'_>, device_ids: Vec<DeviceId>) -> Re
 #[tauri::command(async)]
 pub fn clean_scan_cancel(clean: Clean<'_>) {
     clean.shared.cancel();
+}
+
+#[tauri::command(async)]
+pub fn clean_scan_faster(clean: Clean<'_>, on: bool) {
+    clean.shared.set_fast(on);
+}
+
+/// Bytes used by what scans remember.
+#[tauri::command(async)]
+pub fn clean_remembered() -> u64 {
+    remember::bytes(&remember::default_path())
+}
+
+#[tauri::command(async)]
+pub fn clean_forget() -> Result<(), String> {
+    remember::forget(&remember::default_path()).map_err(|e| format!("Couldn't clear it: {e}"))
 }
 
 #[tauri::command(async)]

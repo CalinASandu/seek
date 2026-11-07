@@ -137,14 +137,7 @@ The first version read every file of 1 MB or more that shared a size with anothe
 - an SSD reads up to 4 files at once; a hard drive stays at one at a time, since parallel reads make it slower;
 - it lasts for the current scan only and is off again for the next one.
 
-**3. Fingerprints built in the background, like the index (user).** The service slowly works out a content fingerprint for candidate files and keeps it, so later scans don't read those files again.
-- Which files: on this PC's own drives only, files of 1 MB or more whose size matches another file's, largest first. Never linked PCs, never cloud placeholders, never links.
-- When: only while the PC is idle and on mains power, at the lowest I/O priority, one file at a time per physical drive. It pauses within a second when the PC is used again and resumes where it left off.
-- What is kept, per device on disk next to its index: file ID, size, modified time, the head-and-tail hash and the full BLAKE3 hash. Nothing of it stays in memory while idle, so the service's near-zero idle RAM is kept.
-- A fingerprint is used only while the file's ID, size and modified time still match. A change seen by the index (USN or rescan) drops it, to be redone later.
-- A scan uses the fingerprints it has and reads only the files without one.
-- Safety is unchanged: a fingerprint only helps decide what to list. The engine still compares the kept copy with the one being removed, byte for byte, right before it moves (rule 4).
-- Settings → Decimator: *Prepare duplicate scans in the background* (on by default), with the space the fingerprints use and *Clear*.
+**3. Scans remember what they read (user, simplified 2026-11-07 from a background builder in the service).** Every file a scan hashes in full is remembered in `%LOCALAPPDATA%\Seek\dupe-prints.txt`: path, size, modified time, the head-and-tail hash and the full BLAKE3 hash. A later scan doesn't read a file whose size and modified time still match; it uses those hashes. The file is loaded for a scan and let go after it, so nothing stays in memory. Safety is unchanged: this only decides what is listed, and the engine still compares bytes right before it moves (rule 4). Settings → *Duplicate scans* shows the space it uses and *Clear*.
 
 **Hiding the window.** The candidates are fetched once at the start, in seconds. After that the scan reads files and needs nothing from the service, so its indexes unload on the usual 60 s timer. The scan lives in the app's Rust process and keeps running while the window is hidden, and the view picks it back up on return. Once the scan has finished and the window has been hidden for 5 minutes, its results are dropped and the tab offers *Scan* again.
 
