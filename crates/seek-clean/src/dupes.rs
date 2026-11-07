@@ -2,6 +2,7 @@
 //! content: first and last 64 KB to narrow, then the full BLAKE3 hash of the whole file, which is
 //! the only thing that makes two files equal.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::fs::File;
@@ -11,7 +12,8 @@ use std::os::windows::io::AsRawHandle;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use windows::core::PCWSTR;
@@ -20,7 +22,10 @@ use windows::Win32::Storage::FileSystem::{
     CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
     OPEN_EXISTING,
 };
-use windows::Win32::System::Ioctl::{IOCTL_STORAGE_GET_DEVICE_NUMBER, STORAGE_DEVICE_NUMBER};
+use windows::Win32::System::Ioctl::{
+    PropertyStandardQuery, StorageDeviceSeekPenaltyProperty, DEVICE_SEEK_PENALTY_DESCRIPTOR, IOCTL_STORAGE_GET_DEVICE_NUMBER,
+    IOCTL_STORAGE_QUERY_PROPERTY, STORAGE_DEVICE_NUMBER, STORAGE_PROPERTY_QUERY,
+};
 use windows::Win32::System::Threading::{
     GetCurrentThread, SetThreadPriority, THREAD_MODE_BACKGROUND_BEGIN, THREAD_MODE_BACKGROUND_END,
 };
@@ -30,6 +35,7 @@ use crate::facts::{is_cloud, FileFacts, ATTR_DIRECTORY, ATTR_REPARSE};
 use crate::model::{DupCopy, DupGroup, Lock, Why};
 use crate::paths::{canon, is_inside};
 use crate::protect::{lock_for, Places};
+use crate::remember::{Known, Remembered};
 
 /// The narrowing read: this much from the start and from the end. It only ever narrows; two
 /// files are equal only when their whole-file hashes are.
@@ -44,6 +50,11 @@ const PROGRESS_EVERY: Duration = Duration::from_millis(100);
 const FILE_FLAG_OPEN_NO_RECALL: u32 = 0x0010_0000;
 const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 const FILE_FLAG_SEQUENTIAL_SCAN: u32 = 0x0800_0000;
+
+/// Readers per SSD while *Scan faster* is on. A hard drive always gets one: parallel reads make it slower.
+pub const FAST_READERS: usize = 4;
+/// How often an idle reader looks again for work or for the end of the scan.
+const POLL: Duration = Duration::from_millis(50);
 
 /// Anything smaller is skipped, even if handed in. A fixed minimum: small files are many and save little.
 pub const MIN_DUPLICATE_BYTES: u64 = 1_048_576;
@@ -71,7 +82,11 @@ pub enum ScanEvent {
 /// and each group is sent as soon as it is confirmed. `Done` is always sent, exactly once, last.
 ///
 /// Reading is one long-lived worker per physical drive, each with one reused 1 MB buffer, in
-/// background I/O mode and never more than one file at a time on a drive. The workers stop when
+/// background I/O mode and never more than one file at a time on a drive. While `fast` is set,
+/// reads run at normal priority and an SSD gets up to [`FAST_READERS`] at once.
+///
+/// A file in `remembered` with the same size and modified time isn't read: its hashes are used.
+/// Every file hashed in full is added to it. The workers stop when
 /// this returns; nothing is kept afterwards. Cancel is checked between files and between buffer
 /// reads; groups already sent stay valid.
 ///
@@ -87,11 +102,21 @@ pub fn scan(
     protected: &[PathBuf],
     facts: &dyn FileFacts,
     downloads_like: &[String],
+    remembered: &mut Remembered,
+    fast: &AtomicBool,
     cancel: &AtomicBool,
     mut on_event: impl FnMut(ScanEvent) + Send,
 ) -> bool {
     let mut meter = Meter::new(&mut on_event);
-    let ctx = Ctx { places, protected: protected.iter().map(|p| p.to_string_lossy().into_owned()).collect(), facts, downloads_like, cancel };
+    let ctx = Ctx {
+        places,
+        protected: protected.iter().map(|p| p.to_string_lossy().into_owned()).collect(),
+        facts,
+        downloads_like,
+        memory: RefCell::new(remembered),
+        fast,
+        cancel,
+    };
     let outcome = catch_unwind(AssertUnwindSafe(|| {
         run(input, &ctx, &mut meter);
         if !cancel.load(Ordering::Relaxed) {
@@ -167,6 +192,8 @@ struct Ctx<'a> {
     protected: Vec<String>,
     facts: &'a dyn FileFacts,
     downloads_like: &'a [String],
+    memory: RefCell<&'a mut Remembered>,
+    fast: &'a AtomicBool,
     cancel: &'a AtomicBool,
 }
 
@@ -182,7 +209,14 @@ struct Cand {
     canon: String,
     device_id: String,
     modified_ms: i64,
-    drive: String,
+    drive: Drive,
+}
+
+/// A physical disk: one queue of reads, and how many readers it gets while scanning faster.
+#[derive(Clone)]
+struct Drive {
+    key: String,
+    readers: usize,
 }
 
 struct Prepared {
@@ -234,9 +268,10 @@ fn in_system_store(canon_path: &str) -> bool {
 }
 
 /// The physical disk a drive letter sits on, so that two letters on one disk share a worker.
-/// A drive whose number can't be read falls back to its own volume.
-fn physical_key(letter: char) -> String {
-    let fallback = || format!("volume:{}", letter.to_ascii_lowercase());
+/// A drive whose number can't be read falls back to its own volume. Only a disk that says it
+/// doesn't seek (an SSD) gets more than one reader.
+fn physical_drive(letter: char) -> Drive {
+    let fallback = || Drive { key: format!("volume:{}", letter.to_ascii_lowercase()), readers: 1 };
     let wide: Vec<u16> = format!("\\\\.\\{letter}:").encode_utf16().chain(std::iter::once(0)).collect();
     // SAFETY: `wide` is NUL-terminated and outlives the call. Access 0: the volume is only asked a question.
     let handle = unsafe {
@@ -268,24 +303,47 @@ fn physical_key(letter: char) -> String {
             None,
         )
     };
+    let readers = if seeks_slowly(handle) == Some(false) { FAST_READERS } else { 1 };
     // SAFETY: closing the handle opened above, once.
     unsafe {
         let _ = CloseHandle(handle);
     }
     match asked {
-        Ok(()) => format!("disk:{}:{}", number.DeviceType, number.DeviceNumber),
-        Err(_) => fallback(),
+        Ok(()) => Drive { key: format!("disk:{}:{}", number.DeviceType, number.DeviceNumber), readers },
+        Err(_) => Drive { readers, ..fallback() },
     }
 }
 
-fn drive_key(canon_path: &str, cache: &mut HashMap<char, String>) -> String {
+/// Whether the disk behind a volume handle has a seek penalty (a hard drive). `None` when it won't say.
+fn seeks_slowly(volume: HANDLE) -> Option<bool> {
+    let query = STORAGE_PROPERTY_QUERY { PropertyId: StorageDeviceSeekPenaltyProperty, QueryType: PropertyStandardQuery, ..Default::default() };
+    let mut out = DEVICE_SEEK_PENALTY_DESCRIPTOR::default();
+    let mut returned = 0u32;
+    // SAFETY: `volume` is valid; the in and out buffers are the structures named, sized exactly.
+    unsafe {
+        DeviceIoControl(
+            volume,
+            IOCTL_STORAGE_QUERY_PROPERTY,
+            Some(&query as *const STORAGE_PROPERTY_QUERY as *const c_void),
+            std::mem::size_of::<STORAGE_PROPERTY_QUERY>() as u32,
+            Some(&mut out as *mut DEVICE_SEEK_PENALTY_DESCRIPTOR as *mut c_void),
+            std::mem::size_of::<DEVICE_SEEK_PENALTY_DESCRIPTOR>() as u32,
+            Some(&mut returned),
+            None,
+        )
+    }
+    .ok()?;
+    Some(out.IncursSeekPenalty)
+}
+
+fn drive_of(canon_path: &str, cache: &mut HashMap<char, Drive>) -> Drive {
     let b = canon_path.as_bytes();
     if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
         let letter = b[0] as char;
-        cache.entry(letter).or_insert_with(|| physical_key(letter)).clone()
+        cache.entry(letter).or_insert_with(|| physical_drive(letter)).clone()
     } else {
         // A network share or another kind of path: one worker per server and share.
-        format!("path:{}", canon_path.split('\\').take(4).collect::<Vec<_>>().join("\\"))
+        Drive { key: format!("path:{}", canon_path.split('\\').take(4).collect::<Vec<_>>().join("\\")), readers: 1 }
     }
 }
 
@@ -319,7 +377,7 @@ fn prepare(input: Vec<SizeBatch>, ctx: &Ctx) -> Vec<Prepared> {
                 continue;
             }
             // Hard links are refused when the file is opened (see `handle_ok`), where the link count is read.
-            let drive = drive_key(&c, &mut drives);
+            let drive = drive_of(&c, &mut drives);
             files.push(Cand { path: f.path, canon: c, device_id: f.device_id, modified_ms: st.modified_ms, drive });
         }
         if files.len() >= 2 {
@@ -390,24 +448,30 @@ fn run(input: Vec<SizeBatch>, ctx: &Ctx, meter: &mut Meter) {
     if meter.total > 0 {
         meter.touch();
     }
+    let closed = AtomicBool::new(false);
     std::thread::scope(|scope| {
+        // Set however this ends, a panic included, so idle extra readers stop and the scope can end.
+        let _close = Close(&closed);
         let mut workers: HashMap<String, Sender<Job>> = HashMap::new();
         let mut next_id = 1u32;
         for batch in &batches {
             if ctx.cancelled() {
                 break;
             }
-            let mut dispatch = |job: Job, drive: &str| {
-                let tx = workers.entry(drive.to_string()).or_insert_with(|| {
+            let mut dispatch = |job: Job, drive: &Drive| {
+                let tx = workers.entry(drive.key.clone()).or_insert_with(|| {
                     let (tx, rx) = channel::<Job>();
-                    let cancel = ctx.cancel;
-                    let spawned = std::thread::Builder::new()
-                        .name("seek-dupes-reader".into())
-                        .spawn_scoped(scope, move || worker(rx, cancel));
-                    if spawned.is_err() {
-                        // Nothing to read with: the jobs below fail and their files are dropped.
-                        let (dead, _) = channel::<Job>();
-                        return dead;
+                    let rx = std::sync::Arc::new(Mutex::new(rx));
+                    for n in 0..drive.readers {
+                        let (rx, fast, cancel, closed) = (rx.clone(), ctx.fast, ctx.cancel, &closed);
+                        let spawned = std::thread::Builder::new()
+                            .name("seek-dupes-reader".into())
+                            .spawn_scoped(scope, move || worker(&rx, n > 0, fast, cancel, closed));
+                        if spawned.is_err() && n == 0 {
+                            // Nothing to read with: the jobs below fail and their files are dropped.
+                            let (dead, _) = channel::<Job>();
+                            return dead;
+                        }
                     }
                     tx
                 });
@@ -422,13 +486,21 @@ fn run(input: Vec<SizeBatch>, ctx: &Ctx, meter: &mut Meter) {
     });
 }
 
+struct Close<'a>(&'a AtomicBool);
+
+impl Drop for Close<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
 /// Narrow, then hash, then confirm, one batch.
 fn process(
     batch: &Prepared,
     ctx: &Ctx,
     meter: &mut Meter,
     next_id: &mut u32,
-    dispatch: &mut dyn FnMut(Job, &str),
+    dispatch: &mut dyn FnMut(Job, &Drive),
 ) {
     let n = batch.files.len();
     // Nothing here could ever be removed (every file is locked): don't spend any reading on it.
@@ -437,10 +509,27 @@ fn process(
         meter.touch();
         return;
     }
-    let mut counted = vec![0u64; n];
+    // A remembered file isn't read: its hashes are known, and its bytes leave the total.
+    let known: Vec<Option<Known>> = batch.files.iter().map(|c| ctx.memory.borrow().get(&c.canon, batch.size, c.modified_ms)).collect();
+    let mut counted: Vec<u64> = known.iter().map(|k| if k.is_some() { batch.size } else { 0 }).collect();
+    meter.total -= counted.iter().sum::<u64>();
+    // Reads the files of `which` that aren't remembered, and fills in the rest from memory.
+    let mut hash = |which: &[usize], kind: Kind, meter: &mut Meter, counted: &mut [u64]| {
+        let unknown: Vec<usize> = which.iter().copied().filter(|&i| known[i].is_none()).collect();
+        let mut got = read_phase(batch, &unknown, kind, meter, counted, dispatch);
+        for &i in which {
+            if let Some(k) = known[i] {
+                got[i] = Some(match kind {
+                    Kind::Narrow => k.ends,
+                    Kind::Full => k.full,
+                });
+            }
+        }
+        got
+    };
 
     // 1. First and last 64 KB. Files whose ends differ are not copies of each other.
-    let ends = read_phase(batch, &(0..n).collect::<Vec<_>>(), Kind::Narrow, meter, &mut counted, dispatch);
+    let ends = hash(&(0..n).collect::<Vec<_>>(), Kind::Narrow, meter, &mut counted);
     if ctx.cancelled() {
         return;
     }
@@ -459,7 +548,7 @@ fn process(
     meter.touch();
 
     // 2. The whole file. This is the only thing that makes two files equal.
-    let hashes = read_phase(batch, &survivors, Kind::Full, meter, &mut counted, dispatch);
+    let hashes = hash(&survivors, Kind::Full, meter, &mut counted);
     if ctx.cancelled() {
         return;
     }
@@ -477,6 +566,10 @@ fn process(
             .is_some_and(|s| !s.is_dir && !s.reparse && !s.cloud && s.size == batch.size && s.modified_ms == c.modified_ms);
         if same {
             confirmed.entry(h).or_default().push(i);
+            if known[i].is_none() {
+                let k = Known { size: batch.size, modified: c.modified_ms, ends: ends[i].expect("a survivor has its ends"), full: h };
+                ctx.memory.borrow_mut().put(c.canon.clone(), k);
+            }
         }
     }
     meter.touch();
@@ -505,7 +598,7 @@ fn read_phase(
     kind: Kind,
     meter: &mut Meter,
     counted: &mut [u64],
-    dispatch: &mut dyn FnMut(Job, &str),
+    dispatch: &mut dyn FnMut(Job, &Drive),
 ) -> Vec<Option<blake3::Hash>> {
     let mut results = vec![None; batch.files.len()];
     let (tx, rx) = channel::<Msg>();
@@ -590,15 +683,31 @@ enum Fail {
     Unreadable,
 }
 
-/// One per physical drive, alive for the whole scan: takes jobs one at a time, so a drive is never
-/// asked for two files at once. Ends when the scan drops its sender.
-fn worker(jobs: Receiver<Job>, cancel: &AtomicBool) {
-    // SAFETY: only changes the I/O and memory priority of this thread, which ends it with the loop.
-    unsafe {
-        let _ = SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
-    }
+/// Alive for the whole scan, taking one job at a time from its drive's queue. The first reader of
+/// a drive always works; the `extra` ones only while `fast` is set, so a drive is read one file at
+/// a time unless the user asked for more. Background I/O priority unless `fast`. Ends when the
+/// scan drops its sender, or for an idle extra reader, once the scan has `closed`.
+fn worker(jobs: &Mutex<Receiver<Job>>, extra: bool, fast: &AtomicBool, cancel: &AtomicBool, closed: &AtomicBool) {
     let mut buf = vec![0u8; BUFFER];
-    for job in jobs {
+    let mut background = false;
+    loop {
+        let quick = fast.load(Ordering::Relaxed);
+        if extra && !quick {
+            if closed.load(Ordering::Relaxed) {
+                break;
+            }
+            std::thread::sleep(POLL);
+            continue;
+        }
+        let job = match jobs.lock().unwrap_or_else(|e| e.into_inner()).recv_timeout(POLL) {
+            Ok(job) => job,
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => break,
+        };
+        if background == quick {
+            background = !quick;
+            set_background(background);
+        }
         let result = catch_unwind(AssertUnwindSafe(|| match job.kind {
             Kind::Narrow => read_ends(&job, &mut buf, cancel),
             Kind::Full => read_all(&job, &mut buf, cancel),
@@ -606,9 +715,17 @@ fn worker(jobs: Receiver<Job>, cancel: &AtomicBool) {
         .unwrap_or(Err(Fail::Unreadable));
         let _ = job.reply.send(Msg::Finished { idx: job.idx, result });
     }
-    // SAFETY: as above.
+    if background {
+        set_background(false);
+    }
+}
+
+/// Background I/O and memory priority for this thread, or back to normal.
+fn set_background(on: bool) {
+    let mode = if on { THREAD_MODE_BACKGROUND_BEGIN } else { THREAD_MODE_BACKGROUND_END };
+    // SAFETY: only changes the priority of the calling thread.
     unsafe {
-        let _ = SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END);
+        let _ = SetThreadPriority(GetCurrentThread(), mode);
     }
 }
 
@@ -787,7 +904,8 @@ mod tests {
         mut on_event: impl FnMut(&ScanEvent) + Send,
     ) -> Vec<ScanEvent> {
         let mut events = Vec::new();
-        scan(batches, places, protected, facts, &["downloads".into(), "temp".into()], cancel, |e| {
+        let (mut memory, fast) = (Remembered::default(), AtomicBool::new(false));
+        scan(batches, places, protected, facts, &["downloads".into(), "temp".into()], &mut memory, &fast, cancel, |e| {
             on_event(&e);
             events.push(e);
         });
@@ -1061,7 +1179,8 @@ mod tests {
         let (a, b) = (write(d.path(), "a", &bytes), write(d.path(), "b", &bytes));
         let mut seen = Vec::new();
         let r = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            scan(vec![batch(2 * MB, &[&a, &b])], &places(), &[], &Fake::default(), &[], &AtomicBool::new(false), |e| {
+            let (mut memory, no) = (Remembered::default(), AtomicBool::new(false));
+            scan(vec![batch(2 * MB, &[&a, &b])], &places(), &[], &Fake::default(), &[], &mut memory, &no, &no, |e| {
                 let is_group = matches!(e, ScanEvent::Group(_));
                 seen.push(e);
                 assert!(!is_group, "the receiver gave up");
@@ -1122,10 +1241,12 @@ mod tests {
     #[test]
     fn a_drive_maps_to_one_stable_worker_key() {
         let mut cache = HashMap::new();
-        let k = drive_key("c:\\a\\b", &mut cache);
-        assert!(!k.is_empty());
-        assert_eq!(k, drive_key("c:\\other", &mut cache));
-        assert!(drive_key("\\\\server\\share\\x\\y", &mut cache).starts_with("path:"));
+        let k = drive_of("c:\\a\\b", &mut cache);
+        assert!(!k.key.is_empty());
+        assert!([1, FAST_READERS].contains(&k.readers));
+        assert_eq!(k.key, drive_of("c:\\other", &mut cache).key);
+        let share = drive_of("\\\\server\\share\\x\\y", &mut cache);
+        assert!(share.key.starts_with("path:") && share.readers == 1, "a share gets one reader");
     }
 
     #[test]
@@ -1457,5 +1578,72 @@ mod tests {
         assert!(without_copies(&locked, |p| p == "D:\\c", &[]).is_none());
         // with the unlocked copy still there, the locked ones stay and it can go
         assert_eq!(without_copies(&locked, |_| false, &[]).unwrap().freeable, 5);
+    }
+
+    /// One scan with the given memory and speed; its events.
+    fn scan_with(batches: Vec<SizeBatch>, memory: &mut Remembered, fast: &AtomicBool, on: impl Fn(&ScanEvent) + Send + Sync) -> Vec<ScanEvent> {
+        let mut events = Vec::new();
+        scan(batches, &places(), &[], &Fake::default(), &[], memory, fast, &AtomicBool::new(false), |e| {
+            on(&e);
+            events.push(e);
+        });
+        events
+    }
+
+    #[test]
+    fn a_remembered_file_is_not_read_and_still_groups() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let bytes = data(2 * MB, 3);
+        let (a, b) = (write(d.path(), "a.bin", &bytes), write(d.path(), "b.bin", &bytes));
+        let (mut memory, slow) = (Remembered::default(), AtomicBool::new(false));
+        assert_eq!(groups(&scan_with(vec![batch(2 * MB, &[&a, &b])], &mut memory, &slow, |_| {})).len(), 1);
+        // locked so that nothing can open them: only memory can say what is inside
+        let _locks: Vec<_> = [&a, &b].iter().map(|p| File::options().read(true).share_mode(0).open(p).unwrap()).collect();
+        let events = scan_with(vec![batch(2 * MB, &[&a, &b])], &mut memory, &slow, |_| {});
+        assert_eq!(groups(&events).len(), 1, "grouped from memory");
+        let last = events.iter().rev().find_map(|e| match e {
+            ScanEvent::Progress { total_bytes, .. } => Some(*total_bytes),
+            _ => None,
+        });
+        assert_eq!(last, Some(0), "nothing left to read");
+    }
+
+    #[test]
+    fn a_file_changed_since_it_was_remembered_is_read_again() {
+        let d = tempfile::tempdir().unwrap();
+        let bytes = data(2 * MB, 4);
+        let (a, b) = (write(d.path(), "a.bin", &bytes), write(d.path(), "b.bin", &bytes));
+        let mut memory = Remembered::default();
+        // what an older file at these paths looked like: other contents, another modified time
+        let stale = Known { size: 2 * MB as u64, modified: 1, ends: blake3::hash(b"x"), full: blake3::hash(b"y") };
+        for p in [&a, &b] {
+            memory.put(canon(p), stale);
+        }
+        let events = scan_with(vec![batch(2 * MB, &[&a, &b])], &mut memory, &AtomicBool::new(false), |_| {});
+        assert_eq!(groups(&events).len(), 1, "read again, not believed");
+        let now = modified_on_disk(&a);
+        assert_eq!(memory.get(&canon(&a), 2 * MB as u64, now).map(|k| k.full), Some(blake3::hash(&bytes)));
+    }
+
+    #[test]
+    fn scan_faster_switched_on_and_off_mid_scan_finishes_and_finds_everything() {
+        let d = tempfile::tempdir().unwrap();
+        let mut batches = Vec::new();
+        for i in 0..8u8 {
+            let size = 2 * MB + usize::from(i);
+            let bytes = data(size, i);
+            let (a, b, c) = (write(d.path(), &format!("{i}a"), &bytes), write(d.path(), &format!("{i}b"), &bytes), write(d.path(), &format!("{i}c"), &bytes));
+            batches.push(batch(size, &[&a, &b, &c]));
+        }
+        let fast = AtomicBool::new(false);
+        let events = scan_with(batches, &mut Remembered::default(), &fast, |e| {
+            if matches!(e, ScanEvent::Progress { .. }) {
+                fast.fetch_xor(true, Ordering::Relaxed);
+            }
+        });
+        assert_eq!(groups(&events).len(), 8);
+        assert!(groups(&events).iter().all(|g| g.copies.len() == 3));
+        assert_eq!(done_count(&events), 1);
     }
 }
