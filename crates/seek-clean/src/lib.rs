@@ -21,4 +21,5 @@ pub mod model;
 pub mod paths;
 pub mod protect;
 pub mod recycle;
+pub mod remember;
 mod reasons;
