@@ -22,7 +22,7 @@ use seek_clean::claims::{self, LiveClaims};
 use seek_clean::dupes::{self, ScanEvent, SizeBatch, SizeFile, MIN_DUPLICATE_BYTES};
 use seek_clean::elevated::{JobElevator, LaunchError, Launcher};
 use seek_clean::engine::Engine;
-use seek_clean::facts::{Elevator, FileFacts, RealFacts};
+use seek_clean::facts::{Elevator, FileFacts, RealFacts, ScanFacts};
 use seek_clean::history::{self, History, PutBackResult, ShellBin};
 use seek_clean::leftovers;
 use seek_clean::model::{AppRow, Candidate, CommitResult, DupGroup, Level, LeftoverRow, Outcome, Prepared, Reason, Why};
@@ -1168,7 +1168,7 @@ async fn scan_job(
                 let path = remember::default_path();
                 let mut memory = Remembered::load(&path);
                 let complete =
-                    dupes::scan(batches, &core.places, &protected, &*core.facts, &downloads_like(), &mut memory, &fast, &cancel, |e| {
+                    dupes::scan(batches, &core.places, &protected, &ScanFacts::default(), &downloads_like(), &mut memory, &fast, &cancel, |e| {
                         sh.on_event(gen, e, &*emit)
                     });
                 if let Err(e) = memory.save(&path) {
