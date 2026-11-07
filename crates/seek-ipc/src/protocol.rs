@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 pub use seek_core::{Device, DeviceId, FolderFact, ResultRow, SortKey, SpaceNode, TypeTotal};
 
 pub const PIPE_NAME: &str = r"\\.\pipe\seek-v1";
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 /// Largest accepted frame (share index uploads can be big).
 pub const MAX_FRAME_BYTES: usize = 256 * 1024 * 1024;
 
@@ -73,8 +73,9 @@ pub enum Request {
     SpaceTypes { device_id: DeviceId, path: String },
     /// Files that share a size (at least `min_size` bytes) across `device_ids`, largest size first; only
     /// sizes held by two or more files. `cursor` is the largest size still to return (`None` = from the top).
-    /// A page is whole size groups, about `limit` files, and always at least one group.
-    SameSizeFiles { min_size: u64, device_ids: Vec<DeviceId>, cursor: Option<u64>, limit: u32 },
+    /// A page is whole size groups, about `limit` files, and always at least one group. With `same_name`,
+    /// only files whose lowercase name and size are shared by another file.
+    SameSizeFiles { min_size: u64, device_ids: Vec<DeviceId>, cursor: Option<u64>, limit: u32, same_name: bool },
     /// Seek's own index and journal files that no known drive owns. Read-only.
     StaleData,
     /// What the index knows about each folder (full paths), parallel to `paths`; `None` where the
@@ -366,11 +367,11 @@ mod tests {
 
     #[test]
     fn same_size_json_shapes() {
-        let r = Request::SameSizeFiles { min_size: 1_048_576, device_ids: vec![uuid::Uuid::nil()], cursor: None, limit: 200 };
+        let r = Request::SameSizeFiles { min_size: 1_048_576, device_ids: vec![uuid::Uuid::nil()], cursor: None, limit: 200, same_name: true };
         let js = serde_json::to_string(&r).unwrap();
         assert_eq!(
             js,
-            r#"{"type":"sameSizeFiles","minSize":1048576,"deviceIds":["00000000-0000-0000-0000-000000000000"],"cursor":null,"limit":200}"#
+            r#"{"type":"sameSizeFiles","minSize":1048576,"deviceIds":["00000000-0000-0000-0000-000000000000"],"cursor":null,"limit":200,"sameName":true}"#
         );
         assert_eq!(serde_json::from_str::<Request>(&js).unwrap(), r);
         let resp = Response::SameSizeFiles { groups: vec![SizeGroup { size: 5, files: vec![] }], next: Some(4) };

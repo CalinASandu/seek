@@ -281,8 +281,8 @@ async fn handle(state: Arc<State>, conn: Arc<Conn>, req: Request) -> Response {
             })
             .await
         }
-        Request::SameSizeFiles { min_size, device_ids, cursor, limit } => {
-            same_size_files(state, conn, min_size, device_ids, cursor, limit).await
+        Request::SameSizeFiles { min_size, device_ids, cursor, limit, same_name } => {
+            same_size_files(state, conn, min_size, device_ids, cursor, limit, same_name).await
         }
         Request::StaleData => tokio::task::spawn_blocking(move || Response::StaleData { files: state.stale_data() })
             .await
@@ -565,6 +565,7 @@ async fn same_size_files(
     device_ids: Vec<DeviceId>,
     cursor: Option<u64>,
     limit: u32,
+    same_name: bool,
 ) -> Response {
     if device_ids.is_empty() {
         return Response::SameSizeFiles { groups: Vec::new(), next: None };
@@ -593,11 +594,26 @@ async fn same_size_files(
             .collect();
         let mask_of = |d: usize| masks[d].as_deref().map(Vec::as_slice);
 
-        // files per size over all chosen drives; only sizes held by two or more files are candidates
+        // files per size over all chosen drives; only sizes held by two or more files are candidates.
+        // With `same_name`, only (size, name) pairs held by two or more files count.
         let mut counts: HashMap<u64, u64> = HashMap::new();
-        for (d, g) in guards.iter().enumerate() {
-            for (size, n) in seek_core::sizes_with_files(g, mask_of(d), min_size) {
-                *counts.entry(size).or_default() += u64::from(n);
+        let mut names: HashSet<(u64, String)> = HashSet::new();
+        if same_name {
+            let mut by_name: HashMap<(u64, String), u64> = HashMap::new();
+            for (d, g) in guards.iter().enumerate() {
+                for (key, n) in seek_core::name_size_counts(g, mask_of(d), min_size) {
+                    *by_name.entry(key).or_default() += u64::from(n);
+                }
+            }
+            for (key, n) in by_name.into_iter().filter(|&(_, n)| n >= 2) {
+                *counts.entry(key.0).or_default() += n;
+                names.insert(key);
+            }
+        } else {
+            for (d, g) in guards.iter().enumerate() {
+                for (size, n) in seek_core::sizes_with_files(g, mask_of(d), min_size) {
+                    *counts.entry(size).or_default() += u64::from(n);
+                }
             }
         }
         let mut sizes: Vec<(u64, u64)> = counts
@@ -622,9 +638,15 @@ async fn same_size_files(
                 pc: &s.pc,
             })
             .collect();
+        names.retain(|k| wanted.contains(&k.0));
         let mut by_size: HashMap<u64, Vec<ResultRow>> = HashMap::new();
         for (d, g) in guards.iter().enumerate() {
-            for (size, rows) in seek_core::files_of_size(g, mask_of(d), &wanted) {
+            let rows_by_size = if same_name {
+                seek_core::files_of_name_size(g, mask_of(d), &names)
+            } else {
+                seek_core::files_of_size(g, mask_of(d), &wanted)
+            };
+            for (size, rows) in rows_by_size {
                 by_size
                     .entry(size)
                     .or_default()
