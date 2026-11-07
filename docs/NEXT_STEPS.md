@@ -319,7 +319,7 @@ it costs if wrong, is in the ledger `.superpowers/sdd/2026-11-05-seek-decimator/
 - Running an older Seek build and saving settings drops the Always protect list.
 
 **Real-window checks (user), after `Stop Seek.bat` then `Rebuild Seek.bat`:**
-1. Look and feel, light and dark: each tab, the review sheet, Recently removed, the beam colour (`#aeaeb2`), the motion. Not yet seen
+1. Look and feel, light and dark: each tab, the review sheet, Recently removed, the beam colour (back to `#f5f5f7`, user 2026-11-07), the motion. Not yet seen
    in a real window (the session's browser pane couldn't draw).
 2. A USB stick or other non-NTFS drive shows its items locked, with the reason.
 3. A Program Files leftover: exactly one admin prompt, no false "system folders don't match" refusal, and it lands in the

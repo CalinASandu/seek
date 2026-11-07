@@ -10,13 +10,12 @@ button.seg-btn:hover { color: var(--text-2); }
 button.seg-btn:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 1px; border-radius: 999px; }
 /* position and width are written by Segmented, frame by frame */
 .seg-thumb { position: absolute; z-index: 0; top: var(--pad); bottom: var(--pad); left: 0; width: 0; border-radius: 999px; will-change: transform, width; }
-.seg-face { display: block; height: 100%; border-radius: inherit; background: light-dark(#1d1d1f, #aeaeb2); box-shadow: 0 2px 10px light-dark(#00000033, #00000059); transition: transform 220ms var(--spring); }
+.seg-face { display: block; height: 100%; border-radius: inherit; background: light-dark(#1d1d1f, #f5f5f7); box-shadow: 0 2px 10px light-dark(#00000033, #ffffff1f); transition: transform 220ms var(--spring); }
 .seg:has(button.is-active:active) .seg-face { transform: scale(0.95); transition-duration: 60ms; }
 .seg-halo { position: absolute; z-index: 0; top: var(--pad); bottom: var(--pad); left: 0; width: 0; border-radius: 999px; background: light-dark(#0000000a, #ffffff0d); opacity: 0; pointer-events: none; transition: transform 280ms var(--spring), width 280ms var(--spring), opacity 120ms linear; }
 /* the labels again in the capsule's ink colour, clipped to the capsule */
 .seg-ink { position: absolute; z-index: 3; inset: 0; display: grid; grid-auto-flow: column; grid-auto-columns: 1fr; padding: var(--pad); pointer-events: none; }
-/* the label on the beam: a soft white in light mode, near black in dark, never pure white (user, 2026-11-06) */
-.seg-ink .seg-btn { color: light-dark(#d8d8dd, #0b0b0c); transition: none; }
+.seg-ink .seg-btn { color: light-dark(#ffffff, #1d1d1f); transition: none; }
 @media (prefers-reduced-motion: reduce) {
   .seg-face, .seg-halo { transition: none; }
 }

@@ -272,7 +272,7 @@ Under reduced motion, movement is dropped and fades stay, matching the existing 
 
 ### Selectors
 
-- The dark-mode beam changes from `#f5f5f7` to **`#aeaeb2`**. The user asked for darker than the `#c7c7cc` first suggested. Label ink on the beam is near black `#0b0b0c` in dark mode and a soft white `#d8d8dd` in light mode, never pure white (user, 2026-11-07: the selected label read poorly), and the white glow becomes a soft dark shadow. Light mode keeps its dark beam. The colour is one line in `.seg-face`, to be judged in the real window.
+- **Reverted (user, 2026-11-07 evening): the beam is `#f5f5f7` again with its white label ink; the gray below was tried and dropped.** The dark-mode beam changes from `#f5f5f7` to **`#aeaeb2`**. The user asked for darker than the `#c7c7cc` first suggested. Label ink on the beam is near black `#0b0b0c` in dark mode and a soft white `#d8d8dd` in light mode, never pure white (user, 2026-11-07: the selected label read poorly), and the white glow becomes a soft dark shadow. Light mode keeps its dark beam. The colour is one line in `.seg-face`, to be judged in the real window.
 - `Segmented` gains optional icons on items (the theme selector has them) and a full-width style for dialogs.
 - Settings' theme selector and the Link dialog move to it. The old `.segmented` CSS and `.link-tabs` are deleted.
 - Link dialog **(user)**: steadier spacing, a dialog height that doesn't change between tabs, tabs ordered Show a code, Enter a code, Hub. The current two-column override is what wraps Hub onto its own row.
