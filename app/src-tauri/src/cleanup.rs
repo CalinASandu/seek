@@ -1101,7 +1101,7 @@ async fn fetch_stale(link: &ServiceLink) -> Result<Vec<StaleFile>, String> {
 }
 
 async fn fetch_page(link: &ServiceLink, ids: Vec<DeviceId>, cursor: Option<u64>) -> Page {
-    let req = Request::SameSizeFiles { min_size: MIN_DUPLICATE_BYTES, device_ids: ids, cursor, limit: PAGE_LIMIT };
+    let req = Request::SameSizeFiles { min_size: MIN_DUPLICATE_BYTES, device_ids: ids, cursor, limit: PAGE_LIMIT, same_name: false };
     match link.request(req).await? {
         Response::SameSizeFiles { groups, next } => Ok((groups, next)),
         other => Err(unexpected(other)),

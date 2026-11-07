@@ -35,6 +35,25 @@ pub fn files_of_size(ix: &DeviceIndex, hidden: Option<&[bool]>, sizes: &HashSet<
     out
 }
 
+/// How many live, visible files (at least `min_size`) share each size and lowercase name.
+pub fn name_size_counts(ix: &DeviceIndex, hidden: Option<&[bool]>, min_size: u64) -> HashMap<(u64, String), u32> {
+    let mut out: HashMap<(u64, String), u32> = HashMap::new();
+    counts(ix, hidden, |s| s >= min_size, |s, r| *out.entry((s, ix.name_lower(r).to_string())).or_default() += 1);
+    out
+}
+
+/// The rows (ascending) of live, visible files whose size and lowercase name are in `keys`, by size.
+pub fn files_of_name_size(ix: &DeviceIndex, hidden: Option<&[bool]>, keys: &HashSet<(u64, String)>) -> HashMap<u64, Vec<u32>> {
+    let sizes: HashSet<u64> = keys.iter().map(|k| k.0).collect();
+    let mut out: HashMap<u64, Vec<u32>> = HashMap::new();
+    counts(ix, hidden, |s| sizes.contains(&s), |s, r| {
+        if keys.contains(&(s, ix.name_lower(r).to_string())) {
+            out.entry(s).or_default().push(r);
+        }
+    });
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -95,5 +114,25 @@ mod tests {
         assert_eq!(sizes_with_files(&ix, None, 3001), []);
         let files = files_of_size(&ix, None, &HashSet::from([3000]));
         assert_eq!(files[&3000], [row(&ix, "b"), row(&ix, "e"), row(&ix, "f")]);
+    }
+
+    #[test]
+    fn same_name_is_case_insensitive_and_needs_the_same_size() {
+        let ix = DeviceIndex::from_raw(
+            0,
+            vec![
+                file(1, 0, "Report.PDF", 2000),
+                file(2, 0, "report.pdf", 2000),
+                file(3, 0, "report.pdf", 3000),
+                file(4, 0, "other.pdf", 2000),
+            ],
+        );
+        let counts = name_size_counts(&ix, None, 0);
+        assert_eq!(counts[&(2000, "report.pdf".to_string())], 2);
+        assert_eq!(counts[&(3000, "report.pdf".to_string())], 1);
+        assert_eq!(counts[&(2000, "other.pdf".to_string())], 1);
+        let files = files_of_name_size(&ix, None, &HashSet::from([(2000, "report.pdf".to_string())]));
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[&2000], [row(&ix, "Report.PDF"), row(&ix, "report.pdf")]);
     }
 }
