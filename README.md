@@ -125,6 +125,26 @@ your other PCs' drives too.
 - Right-click: *Show in Explorer*, *Copy path*, or *Search in this folder*.
 - Other users' folders are counted but never named: they show as one *Other users* item.
 
+## Decimator
+
+Switch to **Decimator** (or press <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>D</kbd>) to win space back. Nothing is ever
+deleted outright: everything goes to the Recycle Bin, and **Recently removed** puts it back in one click.
+
+<div align="center">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/decimator-dark.svg">
+  <source media="(prefers-color-scheme: light)" srcset="docs/assets/decimator-light.svg">
+  <img src="docs/assets/decimator-dark.svg" width="860" alt="Decimator: a scan finds three groups of duplicate files, then the extra copies turn to dust on their way to the Recycle Bin and 15.6 GB is freed">
+</picture>
+</div>
+
+- **Duplicates** compares what's inside files, not their names, so renamed copies are found too. Seek suggests
+  which copy to keep, selects nothing for you, and remembers what it has read so the next scan only reads
+  files that changed. *Scan faster* uses more of the disk while a scan runs.
+- **Leftovers** finds folders that uninstalled apps left behind, each with how sure Seek is that it's unused.
+- **Apps** lists installed programs by size and runs their own uninstaller.
+- Every removal lists exactly what will go first, and any item can be protected so it's never offered again.
+
 ## Search syntax
 
 | Query | Finds |
@@ -308,10 +328,10 @@ A value in `docker/.env` (`SEEK_HUB_PUBLIC`, `SEEK_HUB_LAN`) overrides what `ini
 - [x] Windows installer with background service
 - [x] Sync between your own PCs on the local network
 - [x] Space view: what fills each drive, including offline drives and other PCs
-- [ ] Cleanup: duplicates across PCs, leftovers of uninstalled apps, reversible deletes
+- [x] Decimator: duplicates, leftovers of uninstalled apps and apps, every removal reversible
 - [x] Optional self-hosted sync hub (Docker + Tailscale Funnel; not yet verified on a Pi)
 - [ ] macOS and Linux
-- [ ] Content search and duplicate finder
+- [ ] Content search
 
 ## License
 
