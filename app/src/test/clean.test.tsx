@@ -235,7 +235,7 @@ describe("Decimator view", () => {
 
   it("explains scanning and zero results instead of showing a blank list", async () => {
     const user = await openClean(makeApi({}, { clean: "empty" }));
-    expect(screen.getByText(/compares what's inside your files/i)).toBeInTheDocument();
+    expect(screen.getByText(/compares what's inside files that share a name/i)).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "Scan" }));
     expect(await screen.findByText("No duplicates found")).toBeInTheDocument();
     await user.click(tab("Leftovers"));

@@ -17,6 +17,9 @@ export interface DupState {
   error: string | null;
   /** What the scan left out or couldn't read; kept after it ends. */
   notice: string | null;
+  /** The scan also compared files saved under another name. */
+  renamed: boolean;
+  fast: boolean;
 }
 export interface ListState<T> {
   status: LoadStatus;
@@ -27,7 +30,7 @@ export interface ListState<T> {
 const NONE: ReadonlySet<string> = new Set();
 const NO_PROTECTED: readonly string[] = [];
 const NO_LEAVING: ReadonlyMap<string, number> = new Map();
-const IDLE_DUP: DupState = { status: "idle", groups: [], otherPcs: [], checkedBytes: 0, totalBytes: 0, current: null, error: null, notice: null };
+const IDLE_DUP: DupState = { status: "idle", groups: [], otherPcs: [], checkedBytes: 0, totalBytes: 0, current: null, error: null, notice: null, renamed: false, fast: false };
 
 /** How long a row takes to leave (CSS: 200 ms) plus the longest stagger, plus a little. */
 const LEAVE_MS = 200 + 30 * 8 + 80;
@@ -49,7 +52,8 @@ export interface CleanController {
   listEl: { current: HTMLElement | null };
   attach(): void;
   detach(): void;
-  scanStart(deviceIds: string[]): void;
+  scanStart(deviceIds: string[], renamed?: boolean): void;
+  scanFaster(on: boolean): void;
   scanCancel(): void;
   loadLeftovers(): void;
   loadApps(): void;
@@ -195,6 +199,8 @@ export function createCleanController(api: SeekApi): CleanController {
         current: st.current,
         error: null,
         notice: st.notice ?? null,
+        renamed: st.renamed ?? false,
+        fast: st.fast ?? false,
       };
     });
     if (dup.get().status === "idle") {
@@ -309,7 +315,7 @@ export function createCleanController(api: SeekApi): CleanController {
       finished = false;
     },
 
-    scanStart(deviceIds) {
+    scanStart(deviceIds, renamed = false) {
       // events carry no scan id, so a new scan waits until the old one has said it is done
       const now = dup.get().status;
       if (now === "scanning" || now === "cancelling") return;
@@ -317,9 +323,9 @@ export function createCleanController(api: SeekApi): CleanController {
       fresh.clear();
       pending = [];
       dupTicks.set(NONE);
-      dup.set({ ...IDLE_DUP, status: "scanning" });
+      dup.set({ ...IDLE_DUP, status: "scanning", renamed });
       const mine = gen;
-      api.cleanScanStart(deviceIds).then(
+      api.cleanScanStart(deviceIds, renamed).then(
         // the backend knows by now which drives it left out
         () =>
           api.cleanScanState().then(
@@ -328,6 +334,10 @@ export function createCleanController(api: SeekApi): CleanController {
           ),
         (e: unknown) => dup.set((cur) => ({ ...cur, status: "error", error: errText(e) })),
       );
+    },
+    scanFaster(on) {
+      dup.set((cur) => (cur.status === "scanning" ? { ...cur, fast: on } : cur));
+      api.cleanScanFaster(on).catch(() => dup.set((cur) => ({ ...cur, fast: !on })));
     },
     scanCancel() {
       flush();
