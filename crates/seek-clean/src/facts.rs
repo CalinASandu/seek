@@ -151,55 +151,107 @@ impl FileFacts for RealFacts {
 
     /// Reads the facts from this PC, then decides with `decide`. Anything it cannot read blocks.
     fn recycle_block(&self, path: &Path, batch_bytes: u64) -> Option<Lock> {
-        use std::os::windows::ffi::OsStrExt;
-        let written_units = path.as_os_str().encode_wide().count();
-        let name_units = path.file_name().map_or(0, |n| n.encode_wide().count());
-        let Ok(md) = std::fs::symlink_metadata(path) else {
-            return Some(Lock::UnsupportedPath);
-        };
-        let attrs = md.file_attributes();
-        let is_dir = attrs & ATTR_DIRECTORY != 0 && attrs & ATTR_REPARSE == 0;
-        let Ok(inner_suffix) = longest_inner_suffix(path, is_dir) else {
-            return Some(Lock::UnsupportedPath); // an unreadable entry: an unknown folder is not one to remove
-        };
-        // The drive of the real location: a link into another volume is judged by that volume.
-        let real = crate::paths::real_location(path);
-        let real_units = real.as_deref().map_or(0, |r| r.encode_utf16().count());
-        let drive = real.as_deref().and_then(drive_root);
-        let mut i = Inputs {
-            top_units: written_units.max(real_units),
-            name_units,
-            inner_suffix,
-            attrs,
-            drive: DriveType::Unknown,
-            same_root: real
-                .as_deref()
-                .is_some_and(|r| same_drive(&path.to_string_lossy(), r)),
-            volume_root_ok: false,
-            fs_ok: false,
-            bin_used: None,
-            settings: BinSettings::default(),
-            policies: Policies::default(),
-            volume_total: None,
-            batch_bytes,
-        };
-        let Some(root) = drive else {
-            return decide(&i);
-        };
-        i.drive = DriveType::from_raw(drive_type(&root));
-        if !drive_allows(i.drive) {
-            return decide(&i);
-        }
-        i.volume_root_ok = real.as_deref().is_some_and(|r| volume_path_name(r).is_some_and(|v| v.eq_ignore_ascii_case(&root)));
-        i.fs_ok = file_system(&root).is_some_and(|f| fs_allows(&f));
-        i.bin_used = bin_used_bytes(&root);
-        i.settings = read_bin_settings(&root);
-        i.policies = read_policies();
-        if i.policies.recycle_bin_size != PolicyValue::Absent {
-            i.volume_total = volume_total_bytes(&root);
-        }
-        decide(&i)
+        recycle_block_with(path, batch_bytes, volume)
     }
+}
+
+/// `RealFacts` for one duplicate scan: what a drive says about its bin is asked once per drive, not
+/// once per file, one drive at a time. Removals use `RealFacts`, which asks fresh every time.
+#[derive(Default)]
+pub struct ScanFacts(std::sync::Mutex<std::collections::HashMap<String, Volume>>);
+
+impl FileFacts for ScanFacts {
+    fn stat(&self, path: &Path) -> Option<Stat> {
+        RealFacts.stat(path)
+    }
+    fn same_bytes(&self, a: &Path, b: &Path) -> Result<bool, String> {
+        RealFacts.same_bytes(a, b)
+    }
+    fn file_id(&self, path: &Path) -> Option<(u32, u64)> {
+        RealFacts.file_id(path)
+    }
+    fn recycle_block(&self, path: &Path, batch_bytes: u64) -> Option<Lock> {
+        recycle_block_with(path, batch_bytes, |root| {
+            let mut known = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            *known.entry(root.to_string()).or_insert_with(|| volume(root))
+        })
+    }
+}
+
+/// What a drive says about recycling: its type, file system and bin.
+#[derive(Clone, Copy)]
+pub struct Volume {
+    drive: DriveType,
+    fs_ok: bool,
+    bin_used: Option<u64>,
+    settings: BinSettings,
+    policies: Policies,
+    volume_total: Option<u64>,
+}
+
+fn volume(root: &str) -> Volume {
+    let drive = DriveType::from_raw(drive_type(root));
+    let mut v = Volume { drive, fs_ok: false, bin_used: None, settings: BinSettings::default(), policies: Policies::default(), volume_total: None };
+    if drive_allows(drive) {
+        v.fs_ok = file_system(root).is_some_and(|f| fs_allows(&f));
+        v.bin_used = bin_used_bytes(root);
+        v.settings = read_bin_settings(root);
+        v.policies = read_policies();
+        if v.policies.recycle_bin_size != PolicyValue::Absent {
+            v.volume_total = volume_total_bytes(root);
+        }
+    }
+    v
+}
+
+fn recycle_block_with(path: &Path, batch_bytes: u64, volume: impl Fn(&str) -> Volume) -> Option<Lock> {
+    use std::os::windows::ffi::OsStrExt;
+    let written_units = path.as_os_str().encode_wide().count();
+    let name_units = path.file_name().map_or(0, |n| n.encode_wide().count());
+    let Ok(md) = std::fs::symlink_metadata(path) else {
+        return Some(Lock::UnsupportedPath);
+    };
+    let attrs = md.file_attributes();
+    let is_dir = attrs & ATTR_DIRECTORY != 0 && attrs & ATTR_REPARSE == 0;
+    let Ok(inner_suffix) = longest_inner_suffix(path, is_dir) else {
+        return Some(Lock::UnsupportedPath); // an unreadable entry: an unknown folder is not one to remove
+    };
+    // The drive of the real location: a link into another volume is judged by that volume.
+    let real = crate::paths::real_location(path);
+    let real_units = real.as_deref().map_or(0, |r| r.encode_utf16().count());
+    let drive = real.as_deref().and_then(drive_root);
+    let mut i = Inputs {
+        top_units: written_units.max(real_units),
+        name_units,
+        inner_suffix,
+        attrs,
+        drive: DriveType::Unknown,
+        same_root: real
+            .as_deref()
+            .is_some_and(|r| same_drive(&path.to_string_lossy(), r)),
+        volume_root_ok: false,
+        fs_ok: false,
+        bin_used: None,
+        settings: BinSettings::default(),
+        policies: Policies::default(),
+        volume_total: None,
+        batch_bytes,
+    };
+    let Some(root) = drive else {
+        return decide(&i);
+    };
+    let v = volume(&root);
+    i.drive = v.drive;
+    if !drive_allows(i.drive) {
+        return decide(&i);
+    }
+    i.volume_root_ok = real.as_deref().is_some_and(|r| volume_path_name(r).is_some_and(|v| v.eq_ignore_ascii_case(&root)));
+    i.fs_ok = v.fs_ok;
+    i.bin_used = v.bin_used;
+    i.settings = v.settings;
+    i.policies = v.policies;
+    i.volume_total = v.volume_total;
+    decide(&i)
 }
 
 /// The longest original path, in UTF-16 units, that Seek will send to the bin. The bin stores the
@@ -892,6 +944,9 @@ mod tests {
         let f = d.path().join("a.txt");
         std::fs::write(&f, b"x").unwrap();
         assert_eq!(RealFacts.recycle_block(&f, 1), None);
+        let scan = ScanFacts::default();
+        assert_eq!(scan.recycle_block(&f, 1), None, "a scan judges it the same way");
+        assert_eq!(scan.recycle_block(&f, 1), None, "and again from what it remembers of the drive");
         assert_eq!(
             RealFacts.recycle_block(&d.path().join("missing"), 1),
             Some(Lock::UnsupportedPath)
