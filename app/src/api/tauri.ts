@@ -41,7 +41,7 @@ export function createTauriApi(): SeekApi {
     // Decimator. Rust has clean_scan_start / _cancel / _state, clean_leftovers, clean_apps, clean_prepare,
     // clean_commit, clean_history, clean_put_back, uninstall_start / _state / _leftovers and open_recycle_bin.
     // Nothing here runs at load. Each argument is the camelCase of the Rust parameter (app_id is appId).
-    cleanScanStart: (deviceIds, renamed) => invoke("clean_scan_start", { deviceIds, renamed }),
+    cleanScanStart: (deviceIds) => invoke("clean_scan_start", { deviceIds }),
     cleanScanFaster: (on) => invoke("clean_scan_faster", { on }),
     cleanRemembered: () => invoke("clean_remembered"),
     cleanForget: () => invoke("clean_forget"),

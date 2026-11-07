@@ -130,14 +130,14 @@ The window then narrows each same-size group: compare the first and last 64 KB, 
 
 The first version read every file of 1 MB or more that shared a size with another, in full, every scan. On a big disk that is tens of GB at background priority. Three changes:
 
-**1. Quick scan by default.** *Scan* first takes files with the **same name and the same size** from the index (name compared without case), and reads only those to confirm. Same name and size never makes a group by itself: contents are still compared. This finds the obvious copies in seconds. A second button, *Include renamed copies*, runs the size-only matching above, for copies saved under another name (`report (1).pdf`, re-imported photos). The service request gains `same_name: bool`; `PROTOCOL_VERSION` goes up.
+**1. Quick scan (dropped 2026-11-07, user).** A default scan of only same-name, same-size files was built and measured: on the user's PC it still read 405 of 604 GB, and a remembered full scan was faster. Removed; `PROTOCOL_VERSION` 5.
 
 **2. Scan faster (user).** A *Scan faster* button beside the scan's progress, with the tooltip "Uses more of your PC's disk and processor while it scans." While on:
 - reads run at normal I/O priority instead of background;
 - an SSD reads up to 4 files at once; a hard drive stays at one at a time, since parallel reads make it slower;
 - it lasts for the current scan only and is off again for the next one.
 
-**3. Scans remember what they read (user, simplified 2026-11-07 from a background builder in the service).** Every file a scan hashes in full is remembered in `%LOCALAPPDATA%\Seek\dupe-prints.txt`: path, size, modified time, the head-and-tail hash and the full BLAKE3 hash. A later scan doesn't read a file whose size and modified time still match; it uses those hashes. The file is loaded for a scan and let go after it, so nothing stays in memory. Safety is unchanged: this only decides what is listed, and the engine still compares bytes right before it moves (rule 4). Settings → *Duplicate scans* shows the space it uses and *Clear*.
+**3. Scans remember what they read (user, simplified 2026-11-07 from a background builder in the service).** Every file a scan hashes in full is remembered in `%TEMP%\Seek\dupe-prints.txt` (a cache; the Scan button's tooltip says so): path, size, modified time, the head-and-tail hash and the full BLAKE3 hash. A later scan doesn't read a file whose size and modified time still match; it uses those hashes. The file is loaded for a scan and let go after it, so nothing stays in memory. Safety is unchanged: this only decides what is listed, and the engine still compares bytes right before it moves (rule 4). Settings → *Duplicate scans* shows the space it uses and *Clear*.
 
 **Hiding the window.** The candidates are fetched once at the start, in seconds. After that the scan reads files and needs nothing from the service, so its indexes unload on the usual 60 s timer. The scan lives in the app's Rust process and keeps running while the window is hidden, and the view picks it back up on return. Once the scan has finished and the window has been hidden for 5 minutes, its results are dropped and the tab offers *Scan* again.
 

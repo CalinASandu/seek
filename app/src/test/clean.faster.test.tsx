@@ -1,4 +1,4 @@
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import { App } from "../App";
@@ -18,23 +18,11 @@ async function openClean(api: SeekApi) {
 }
 
 describe("Faster scans", () => {
-  it("scans same-name copies by default, and Rescan repeats a renamed-copies scan", async () => {
-    const base = makeApi();
-    const start = vi.fn(base.cleanScanStart);
-    const user = await openClean({ ...base, cleanScanStart: start });
-    await user.click(screen.getByRole("button", { name: "Include renamed copies" }));
-    expect(start).toHaveBeenLastCalledWith(expect.any(Array), true);
-    await user.click(await screen.findByRole("button", { name: "Rescan" }, { timeout: 3000 }));
-    await waitFor(() => expect(start).toHaveBeenCalledTimes(2));
-    expect(start).toHaveBeenLastCalledWith(expect.any(Array), true);
-  });
-
-  it("Scan starts a quick scan, and the head keeps one button", async () => {
-    const base = makeApi();
-    const start = vi.fn(base.cleanScanStart);
-    const user = await openClean({ ...base, cleanScanStart: start });
-    await user.click(screen.getByRole("button", { name: "Scan" }));
-    expect(start).toHaveBeenLastCalledWith(expect.any(Array), false);
+  it("Scan says what it remembers, and the head keeps one button", async () => {
+    const user = await openClean(makeApi());
+    const scan = screen.getByRole("button", { name: "Scan" });
+    expect(scan.title).toMatch(/remembers files it has already compared, in your temp folder/);
+    await user.click(scan);
     const head = document.querySelector(".clean-hero")!;
     expect(within(head as HTMLElement).getAllByRole("button")).toHaveLength(1);
   });

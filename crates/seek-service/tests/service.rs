@@ -1046,20 +1046,11 @@ async fn same_size(
     limit: u32,
 ) -> (Vec<seek_ipc::SizeGroup>, Option<u64>) {
     match c
-        .request(Request::SameSizeFiles { min_size, device_ids: device_ids.to_vec(), cursor, limit, same_name: false })
+        .request(Request::SameSizeFiles { min_size, device_ids: device_ids.to_vec(), cursor, limit })
         .await
         .unwrap()
     {
         Response::SameSizeFiles { groups, next } => (groups, next),
-        other => panic!("expected SameSizeFiles, got {other:?}"),
-    }
-}
-
-/// One page of same-name files: same size and the same name, case aside.
-async fn same_name(c: &mut Client, device_ids: &[seek_core::DeviceId]) -> Vec<seek_ipc::SizeGroup> {
-    let req = Request::SameSizeFiles { min_size: 1, device_ids: device_ids.to_vec(), cursor: None, limit: 100_000, same_name: true };
-    match c.request(req).await.unwrap() {
-        Response::SameSizeFiles { groups, .. } => groups,
         other => panic!("expected SameSizeFiles, got {other:?}"),
     }
 }
@@ -1108,8 +1099,6 @@ async fn same_size_files_pages_through_every_group() {
     wait_for(&mut c, "device scanned", scanned_online).await;
     let id = device_id(&mut c).await;
 
-    // every name is different, so the same sizes alone are no same-name group
-    assert_eq!(same_name(&mut c, &[id]).await, vec![]);
     let all = same_size_all(&mut c, &[id], 1, 25).await;
     let sizes: Vec<u64> = all.iter().map(|g| g.size).collect();
     assert_eq!(sizes, (1..=99).rev().collect::<Vec<u64>>());
@@ -1313,11 +1302,6 @@ async fn same_size_counts_across_two_drives() {
         assert_eq!((g.files[0].device_id, g.files[1].device_id), (ids[0], ids[1]), "ordered by device");
         assert!(g.files.iter().all(|f| f.size == g.size));
     }
-
-    // the two drives hold the same names, so a same-name scan finds the same groups
-    let named = same_name(&mut c, &ids).await;
-    assert_eq!(named.len(), 990);
-    assert!(named.iter().all(|g| g.files.len() == 2 && g.files[0].name == g.files[1].name));
 
     // no drives chosen means no groups; unknown ids are skipped
     assert_eq!(same_size(&mut c, &[], 1, None, 100).await, (vec![], None));

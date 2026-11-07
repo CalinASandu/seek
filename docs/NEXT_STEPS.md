@@ -303,12 +303,12 @@ it costs if wrong, is in the ledger `.superpowers/sdd/2026-11-05-seek-decimator/
 - **Seek's own uninstaller** asks "Also delete Seek's index and settings? This is permanent." (No by default; skipped when silent,
   passive or updating).
 - **One Seek at a time** now (`tauri-plugin-single-instance`): a second launch focuses the running window.
-- **Faster scans (2026-11-07):** *Scan* compares only files with the same name and size (`same_name`, protocol v4);
-  *Include renamed copies* runs the full size-only scan; *Scan faster* (progress line) reads at normal priority, up to 4
-  files at once on an SSD; scans remember what they read in `%LOCALAPPDATA%\Seek\dupe-prints.txt` (Settings → Duplicate
-  scans: size and *Clear*). Plan: `docs/superpowers/plans/2026-11-07-faster-duplicate-scans.md`.
-- The app and service must be rebuilt together (protocol v4).
-- Tests: `cargo test --workspace` 824 passed; `pnpm test` 169; clippy clean. Real-Recycle-Bin flows:
+- **Faster scans (2026-11-07):** *Scan faster* (progress line) reads at normal priority, up to 4 files at once on an SSD;
+  scans remember what they read in `%TEMP%\Seek\dupe-prints.txt` (the Scan button's tooltip says so; Settings → Duplicate
+  scans: size and *Clear*). A same-name quick scan was tried and dropped: on the user's PC it still read 405 of 604 GB.
+  Plan: `docs/superpowers/plans/2026-11-07-faster-duplicate-scans.md`.
+- The app and service must be rebuilt together (protocol v5).
+- Tests: `cargo test --workspace` 823 passed; `pnpm test` 168; clippy clean. Real-Recycle-Bin flows:
   `cargo test -p seek-clean --test flows -- --ignored` (temp files only).
 
 **Limits the user should know (rulings):**
@@ -332,8 +332,7 @@ it costs if wrong, is in the ledger `.superpowers/sdd/2026-11-05-seek-decimator/
 8. A second double-click on `Seek.bat` brings up the running window.
 9. Installer: `.\scripts\build-installer.ps1` (Seek stopped), install, uninstall: the data question defaults to No.
 10. Index timing for Leftovers: `cargo test -p seek-app real_leftovers_list_with_index -- --ignored --nocapture`.
-11. Faster scans: *Scan* finds same-name copies in seconds; *Include renamed copies* finds a copy you renamed; *Scan
-    faster* raises disk reads in Task Manager; a second scan is much quicker; edit a file and it is read again; Settings
+11. Faster scans: *Scan faster* raises disk reads in Task Manager; a second scan is much quicker; edit a file and it is read again; Settings
     → Duplicate scans → *Clear* shows "Nothing remembered yet".
 
 ## Pairing race (fixed 2026-11-04)

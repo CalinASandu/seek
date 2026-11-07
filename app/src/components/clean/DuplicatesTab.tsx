@@ -18,7 +18,6 @@ interface Props {
   deviceId: string | null;
   deviceName: string | null;
   onReview: (spec: SheetSpec) => void;
-  onScanRenamed: () => void;
 }
 
 const tickedIn = (group: DupGroup, ticked: ReadonlySet<string>) => {
@@ -27,18 +26,11 @@ const tickedIn = (group: DupGroup, ticked: ReadonlySet<string>) => {
   return n;
 };
 
-export function DuplicatesTab({ ctl, deviceId, deviceName, onReview, onScanRenamed }: Props) {
+export function DuplicatesTab({ ctl, deviceId, deviceName, onReview }: Props) {
   const status = useStore(ctl.dup, (s) => s.status);
   const groups = useStore(ctl.dup, (s) => s.groups);
   const error = useStore(ctl.dup, (s) => s.error);
   const notice = useStore(ctl.dup, (s) => s.notice);
-  const renamed = useStore(ctl.dup, (s) => s.renamed);
-  const finished = status === "done" || status === "cancelled";
-  const renamedLink = (
-    <button className="link-btn" title="Also compares files saved under another name. Takes longer." onClick={onScanRenamed}>
-      Include renamed copies
-    </button>
-  );
   const prot = useStore(ctl.protect, (s) => s);
   const shown = useMemo(() => visibleGroups(groups, deviceId, prot), [groups, deviceId, prot]);
 
@@ -52,9 +44,8 @@ export function DuplicatesTab({ ctl, deviceId, deviceName, onReview, onScanRenam
         )}
         {status === "idle" ? (
           <Placeholder icon={<ScanSearch size={26} />} title="Find files you have twice">
-            Seek compares what's inside files that share a name and size, so it's quick. Copies saved under another name need a
-            longer scan. Nothing is selected for you.
-            <span className="cl-placeholder-action">{renamedLink}</span>
+            Seek compares what's inside your files, not only their names. The first scan reads your drives, so it takes a while;
+            later scans only read files that changed. Nothing is selected for you.
           </Placeholder>
         ) : status === "error" ? (
           <Placeholder icon={<ScanSearch size={26} />} title="The scan couldn't start">
@@ -69,13 +60,11 @@ export function DuplicatesTab({ ctl, deviceId, deviceName, onReview, onScanRenam
             {deviceName
               ? `Nothing over 1 MB on ${deviceName} is an exact copy of another file.`
               : "Nothing over 1 MB on your drives is an exact copy of another file."}
-            {!renamed && finished && <span className="cl-placeholder-action">{renamedLink}</span>}
           </Placeholder>
         ) : (
           <>
             <div className="cl-toolbar">
               <span className="cl-toolbar-note">{pluralize(shown.length, "group")}, largest first. Sizes are what you can free.</span>
-              {!renamed && finished && renamedLink}
               <button className="link-btn" onClick={() => ctl.applySuggestions(shown)}>
                 Use suggestions
               </button>

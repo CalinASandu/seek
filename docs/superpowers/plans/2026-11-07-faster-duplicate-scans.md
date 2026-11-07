@@ -4,6 +4,8 @@
 
 **Goal:** scans finish fast: same-name quick scan by default, *Scan faster* during a scan, and files already read aren't read again.
 
+**Update (2026-11-07):** the quick scan (Task 2, *Include renamed copies*) was dropped after measuring; protocol is v5 and the remembered file lives in `%TEMP%\Seek\`.
+
 **Spec:** `docs/superpowers/specs/2026-11-04-seek-cleanup-design.md` → *Duplicates → Faster scans*.
 
 **Constraints:** safety rule 4 unchanged (no change to `engine.rs`/`recycle.rs`); contents are always compared; tooltip exactly `Uses more of your PC's disk and processor while it scans.`; Duplicates head keeps one button; `PROTOCOL_VERSION` 3 → 4; nothing kept in memory after a scan.

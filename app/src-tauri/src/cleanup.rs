@@ -613,8 +613,6 @@ struct Inner {
     done_sent: bool,
     finished_at: Option<Instant>,
     cancel: Arc<AtomicBool>,
-    /// The scan also compares files saved under another name.
-    renamed: bool,
     /// *Scan faster*, for this scan only: a fresh flag with every scan.
     fast: Arc<AtomicBool>,
 }
@@ -630,7 +628,6 @@ pub struct ScanState {
     pub total_bytes: u64,
     pub current: Option<String>,
     pub notice: Option<String>,
-    pub renamed: bool,
     pub fast: bool,
 }
 
@@ -675,7 +672,6 @@ impl Shared {
             total_bytes: i.total,
             current: i.current.clone(),
             notice: i.notice.clone(),
-            renamed: i.renamed,
             fast: i.fast.load(Ordering::Relaxed),
         }
     }
@@ -1117,8 +1113,8 @@ async fn fetch_stale(link: &ServiceLink) -> Result<Vec<StaleFile>, String> {
     }
 }
 
-async fn fetch_page(link: &ServiceLink, ids: Vec<DeviceId>, cursor: Option<u64>, renamed: bool) -> Page {
-    let req = Request::SameSizeFiles { min_size: MIN_DUPLICATE_BYTES, device_ids: ids, cursor, limit: PAGE_LIMIT, same_name: !renamed };
+async fn fetch_page(link: &ServiceLink, ids: Vec<DeviceId>, cursor: Option<u64>) -> Page {
+    let req = Request::SameSizeFiles { min_size: MIN_DUPLICATE_BYTES, device_ids: ids, cursor, limit: PAGE_LIMIT };
     match link.request(req).await? {
         Response::SameSizeFiles { groups, next } => Ok((groups, next)),
         other => Err(unexpected(other)),
@@ -1143,7 +1139,6 @@ async fn scan_job(
     plan: ScanPlan,
     protected: Vec<PathBuf>,
     cancel: Arc<AtomicBool>,
-    renamed: bool,
     fast: Arc<AtomicBool>,
 ) {
     if plan.nothing_local {
@@ -1151,7 +1146,7 @@ async fn scan_job(
     }
     let collected = {
         let conn = &*link;
-        collect(|ids, cursor| fetch_page(conn, ids, cursor, renamed), &plan, &cancel).await
+        collect(|ids, cursor| fetch_page(conn, ids, cursor), &plan, &cancel).await
     };
     drop(link);
     for notice in [&collected.local_notice, &collected.linked_notice].into_iter().flatten() {
@@ -1194,17 +1189,13 @@ async fn scan_job(
 type Clean<'a> = State<'a, Arc<CleanState>>;
 
 #[tauri::command]
-pub async fn clean_scan_start(clean: Clean<'_>, device_ids: Vec<DeviceId>, renamed: bool) -> Result<(), String> {
+pub async fn clean_scan_start(clean: Clean<'_>, device_ids: Vec<DeviceId>) -> Result<(), String> {
     let core = clean.core()?;
     let protected: Vec<PathBuf> = settings::protected_paths_strict()?.into_iter().map(PathBuf::from).collect();
     let emit = clean.emitter();
     // Running, with its cancel flag, from now: a Cancel while the service is being asked stops the scan.
     let (gen, cancel) = clean.shared.begin()?;
-    let fast = {
-        let mut i = clean.shared.lock();
-        i.renamed = renamed;
-        i.fast.clone()
-    };
+    let fast = clean.shared.lock().fast.clone();
     // The paging has a connection of its own, closed when the paging is over.
     let link = Arc::new(ServiceLink::default());
     let plan = match fetch_context(&link).await {
@@ -1219,7 +1210,7 @@ pub async fn clean_scan_start(clean: Clean<'_>, device_ids: Vec<DeviceId>, renam
     }
     let shared = clean.shared.clone();
     tauri::async_runtime::spawn(async move {
-        let worker = tauri::async_runtime::spawn(scan_job(shared.clone(), gen, emit.clone(), core, link, plan, protected, cancel, renamed, fast));
+        let worker = tauri::async_runtime::spawn(scan_job(shared.clone(), gen, emit.clone(), core, link, plan, protected, cancel, fast));
         // Whatever happened to the worker, a panic included, the window hears `done` and the scan stops running.
         if let Err(e) = worker.await {
             tracing::error!("the duplicate scan job failed: {e}");

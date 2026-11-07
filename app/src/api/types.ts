@@ -198,8 +198,6 @@ export interface DupScanState {
   checkedBytes: number;
   totalBytes: number;
   current: string | null;
-  /** True when the scan also compares files saved under another name. */
-  renamed?: boolean;
   /** Scan faster is on for this scan. */
   fast?: boolean;
   /** Something the scan left out or couldn't read, in plain words; kept after the scan ends. */
@@ -348,8 +346,7 @@ export interface SeekApi {
   onEvent(cb: (e: SeekEvent) => void): () => void;
 
   // ---- Decimator (Cleanup) ----
-  /** `renamed`: also compare files with different names (slower). */
-  cleanScanStart(deviceIds: string[], renamed?: boolean): Promise<void>;
+  cleanScanStart(deviceIds: string[]): Promise<void>;
   cleanScanFaster(on: boolean): Promise<void>;
   /** Bytes used by remembered scan results. */
   cleanRemembered(): Promise<number>;
