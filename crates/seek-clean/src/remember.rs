@@ -17,10 +17,9 @@ pub struct Known {
 #[derive(Default)]
 pub struct Remembered(HashMap<String, Known>);
 
-/// `%LOCALAPPDATA%\Seek\dupe-prints.txt`.
+/// `%TEMP%\Seek\dupe-prints.txt`: a cache, so Windows may clear it, which only costs a slower scan.
 pub fn default_path() -> PathBuf {
-    let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
-    base.join("Seek").join("dupe-prints.txt")
+    std::env::temp_dir().join("Seek").join("dupe-prints.txt")
 }
 
 /// Bytes the file takes; 0 when there is none.

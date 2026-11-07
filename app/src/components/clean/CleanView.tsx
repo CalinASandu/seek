@@ -107,7 +107,7 @@ export const CleanView = memo(function CleanView({ active, deviceId, deviceName,
     };
   }, [api, notify, onProtect, onUnprotect, protectedPaths]);
 
-  const scan = (renamed = ctl.dup.get().renamed) => ctl.scanStart(deviceId ? [deviceId] : scanDeviceIds, renamed);
+  const scan = () => ctl.scanStart(deviceId ? [deviceId] : scanDeviceIds);
 
   return (
     <RowActionsProvider value={rowActions}>
@@ -120,14 +120,14 @@ export const CleanView = memo(function CleanView({ active, deviceId, deviceName,
               Recently removed
             </button>
           </div>
-          {tab === "duplicates" && <DuplicatesHead ctl={ctl} deviceId={deviceId} deviceName={deviceName} onScan={() => scan()} />}
+          {tab === "duplicates" && <DuplicatesHead ctl={ctl} deviceId={deviceId} deviceName={deviceName} onScan={scan} />}
           {tab === "leftovers" && <LeftoversHead ctl={ctl} onScan={() => ctl.loadLeftovers()} />}
           {tab === "apps" && <AppsHead ctl={ctl} onScan={() => ctl.loadApps()} />}
         </header>
 
         <div className="clean-body" ref={body}>
           <div className="clean-panel" hidden={tab !== "duplicates"}>
-            <DuplicatesTab ctl={ctl} deviceId={deviceId} deviceName={deviceName} onReview={openSheet} onScanRenamed={() => scan(true)} />
+            <DuplicatesTab ctl={ctl} deviceId={deviceId} deviceName={deviceName} onReview={openSheet} />
           </div>
           {seen.leftovers && (
             <div className="clean-panel" hidden={tab !== "leftovers"}>
@@ -173,12 +173,14 @@ function Hero({
   action,
   disabled,
   onAction,
+  title,
 }: {
   figure: string;
   caption: string;
   action: string;
   disabled: boolean;
   onAction: () => void;
+  title?: string;
 }) {
   return (
     <div className="clean-hero">
@@ -188,7 +190,7 @@ function Hero({
         </div>
         <div className="clean-caption">{caption}</div>
       </div>
-      <button className="btn btn-primary clean-action" disabled={disabled} onClick={onAction}>
+      <button className="btn btn-primary clean-action" disabled={disabled} onClick={onAction} title={title}>
         {action}
       </button>
     </div>
@@ -245,6 +247,9 @@ function ScanLine({
   );
 }
 
+/** What duplicate scans keep between runs, said where the user starts one. */
+export const REMEMBERS = "Seek remembers files it has already compared, in your temp folder, so the next scan only reads files that changed.";
+
 const IdleLine = () => <div className="scanline" aria-hidden="true" />;
 
 function DuplicatesHead({ ctl, deviceId, deviceName, onScan }: { ctl: CleanController; deviceId: string | null; deviceName: string | null; onScan: () => void }) {
@@ -268,8 +273,8 @@ function DuplicatesHead({ ctl, deviceId, deviceName, onScan }: { ctl: CleanContr
       ? "None found in the last scan"
       : status === "idle"
       ? deviceName
-        ? `Finds exact copies with the same name on ${deviceName}, in seconds.`
-        : "Finds exact copies with the same name, in seconds."
+        ? `Finds exact copies on ${deviceName}.`
+        : "Finds files that are exact copies of each other."
       : status === "error"
         ? "The scan didn't start."
         : scanning
@@ -280,7 +285,7 @@ function DuplicatesHead({ ctl, deviceId, deviceName, onScan }: { ctl: CleanContr
 
   return (
     <>
-      <Hero figure={figure} caption={caption} action={status === "idle" || status === "error" ? "Scan" : "Rescan"} disabled={scanning} onAction={onScan} />
+      <Hero figure={figure} caption={caption} action={status === "idle" || status === "error" ? "Scan" : "Rescan"} disabled={scanning} onAction={onScan} title={REMEMBERS} />
       {scanning ? (
         <ScanLine
           fraction={total > 0 ? Math.min(1, checked / total) : null}

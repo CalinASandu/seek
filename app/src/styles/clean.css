@@ -45,7 +45,6 @@
 /* Quiet until pressed: muted ink, accent once on. */
 .scan-faster { display: inline-flex; align-items: center; gap: 4px; color: var(--muted); }
 .scan-faster.is-on { color: var(--accent-text); }
-.cl-placeholder-action { display: block; margin-top: 10px; }
 
 /* ---- rows ---------------------------------------------------------------------------------------------------- */
 .cl-list { display: flex; flex-direction: column; }
