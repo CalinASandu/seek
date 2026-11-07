@@ -126,6 +126,26 @@ The window then narrows each same-size group: compare the first and last 64 KB, 
 
 **Cost.** Largest groups first, a small fixed buffer, one thread per physical drive, background I/O priority. Groups appear as they are confirmed, so the most useful results come first. Cancel keeps what was found.
 
+### Faster scans (added 2026-11-07, user)
+
+The first version read every file of 1 MB or more that shared a size with another, in full, every scan. On a big disk that is tens of GB at background priority. Three changes:
+
+**1. Quick scan by default.** *Scan* first takes files with the **same name and the same size** from the index (name compared without case), and reads only those to confirm. Same name and size never makes a group by itself: contents are still compared. This finds the obvious copies in seconds. A second button, *Include renamed copies*, runs the size-only matching above, for copies saved under another name (`report (1).pdf`, re-imported photos). The service request gains `same_name: bool`; `PROTOCOL_VERSION` goes up.
+
+**2. Scan faster (user).** A *Scan faster* button beside the scan's progress, with the tooltip "Uses more of your PC's disk and processor while it scans." While on:
+- reads run at normal I/O priority instead of background;
+- an SSD reads up to 4 files at once; a hard drive stays at one at a time, since parallel reads make it slower;
+- it lasts for the current scan only and is off again for the next one.
+
+**3. Fingerprints built in the background, like the index (user).** The service slowly works out a content fingerprint for candidate files and keeps it, so later scans don't read those files again.
+- Which files: on this PC's own drives only, files of 1 MB or more whose size matches another file's, largest first. Never linked PCs, never cloud placeholders, never links.
+- When: only while the PC is idle and on mains power, at the lowest I/O priority, one file at a time per physical drive. It pauses within a second when the PC is used again and resumes where it left off.
+- What is kept, per device on disk next to its index: file ID, size, modified time, the head-and-tail hash and the full BLAKE3 hash. Nothing of it stays in memory while idle, so the service's near-zero idle RAM is kept.
+- A fingerprint is used only while the file's ID, size and modified time still match. A change seen by the index (USN or rescan) drops it, to be redone later.
+- A scan uses the fingerprints it has and reads only the files without one.
+- Safety is unchanged: a fingerprint only helps decide what to list. The engine still compares the kept copy with the one being removed, byte for byte, right before it moves (rule 4).
+- Settings → Decimator: *Prepare duplicate scans in the background* (on by default), with the space the fingerprints use and *Clear*.
+
 **Hiding the window.** The candidates are fetched once at the start, in seconds. After that the scan reads files and needs nothing from the service, so its indexes unload on the usual 60 s timer. The scan lives in the app's Rust process and keeps running while the window is hidden, and the view picks it back up on return. Once the scan has finished and the window has been hidden for 5 minutes, its results are dropped and the tab offers *Scan* again.
 
 **What counts.** A group is shown only if at least one copy can be removed. The headline and the group's figure count only space that can really be freed: removable copies, leaving one copy if none is locked.
@@ -259,7 +279,7 @@ Under reduced motion, movement is dropped and fades stay, matching the existing 
 
 ### Selectors
 
-- The dark-mode beam changes from `#f5f5f7` to **`#aeaeb2`**. The user asked for darker than the `#c7c7cc` first suggested. Label ink stays `#1d1d1f` (contrast about 8:1), and the white glow becomes a soft dark shadow. Light mode keeps its dark beam. The colour is one line in `.seg-face`, to be judged in the real window.
+- The dark-mode beam changes from `#f5f5f7` to **`#aeaeb2`**. The user asked for darker than the `#c7c7cc` first suggested. Label ink on the beam is near black `#0b0b0c` in dark mode and a soft white `#d8d8dd` in light mode, never pure white (user, 2026-11-07: the selected label read poorly), and the white glow becomes a soft dark shadow. Light mode keeps its dark beam. The colour is one line in `.seg-face`, to be judged in the real window.
 - `Segmented` gains optional icons on items (the theme selector has them) and a full-width style for dialogs.
 - Settings' theme selector and the Link dialog move to it. The old `.segmented` CSS and `.link-tabs` are deleted.
 - Link dialog **(user)**: steadier spacing, a dialog height that doesn't change between tabs, tabs ordered Show a code, Enter a code, Hub. The current two-column override is what wraps Hub onto its own row.
