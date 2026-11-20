@@ -1,5 +1,6 @@
 //! `seek` — developer CLI: list volumes, scan, query an index file, query the running service, perf.
 
+mod dupes;
 mod perf;
 
 use std::path::{Path, PathBuf};
@@ -53,6 +54,15 @@ enum Cmd {
     },
     /// Show the service's devices.
     Devices,
+    /// Run the duplicate scan on this PC's online drives and say where the time went.
+    Dupes {
+        /// Read like *Scan faster* (normal priority, more readers on an SSD).
+        #[arg(long)]
+        fast: bool,
+        /// Ignore the remembered scan results (and don't save them).
+        #[arg(long)]
+        fresh: bool,
+    },
     /// Show what the service's memory is made of, and which code last used each index.
     Memory,
     /// Show the hub link: when this PC and the others last synced, and each drive's dates.
@@ -112,6 +122,7 @@ fn main() -> anyhow::Result<()> {
         Cmd::Query { file, query, limit } => query_file(&file, &query, limit),
         Cmd::Remote { query, limit, sort, desc } => remote(&query, limit, sort.into(), desc),
         Cmd::Devices => devices(),
+        Cmd::Dupes { fast, fresh } => dupes::run(fast, fresh),
         Cmd::Memory => memory(),
         Cmd::Hub => hub(),
         Cmd::HubCompact { dir, device } => perf::hub_compact(&dir, device),

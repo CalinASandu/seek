@@ -31,7 +31,7 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::System::IO::DeviceIoControl;
 
-use crate::facts::{is_cloud, FileFacts, ATTR_DIRECTORY, ATTR_REPARSE};
+use crate::facts::{drive_can_recycle, is_cloud, FileFacts, ATTR_DIRECTORY, ATTR_REPARSE};
 use crate::model::{DupCopy, DupGroup, Lock, Why};
 use crate::paths::{canon, is_inside};
 use crate::protect::{lock_for, Places};
@@ -217,6 +217,9 @@ struct Cand {
 struct Drive {
     key: String,
     readers: usize,
+    /// False for a drive whose files can never go to the bin (a network share, Google Drive's
+    /// FAT32-looking G:, a USB stick): its files are left out before anything on it is asked.
+    cleanable: bool,
 }
 
 struct Prepared {
@@ -271,7 +274,8 @@ fn in_system_store(canon_path: &str) -> bool {
 /// A drive whose number can't be read falls back to its own volume. Only a disk that says it
 /// doesn't seek (an SSD) gets more than one reader.
 fn physical_drive(letter: char) -> Drive {
-    let fallback = || Drive { key: format!("volume:{}", letter.to_ascii_lowercase()), readers: 1 };
+    let cleanable = drive_can_recycle(&format!("{letter}:\\"));
+    let fallback = || Drive { key: format!("volume:{}", letter.to_ascii_lowercase()), readers: 1, cleanable };
     let wide: Vec<u16> = format!("\\\\.\\{letter}:").encode_utf16().chain(std::iter::once(0)).collect();
     // SAFETY: `wide` is NUL-terminated and outlives the call. Access 0: the volume is only asked a question.
     let handle = unsafe {
@@ -309,7 +313,7 @@ fn physical_drive(letter: char) -> Drive {
         let _ = CloseHandle(handle);
     }
     match asked {
-        Ok(()) => Drive { key: format!("disk:{}:{}", number.DeviceType, number.DeviceNumber), readers },
+        Ok(()) => Drive { key: format!("disk:{}:{}", number.DeviceType, number.DeviceNumber), readers, cleanable },
         Err(_) => Drive { readers, ..fallback() },
     }
 }
@@ -343,7 +347,7 @@ fn drive_of(canon_path: &str, cache: &mut HashMap<char, Drive>) -> Drive {
         cache.entry(letter).or_insert_with(|| physical_drive(letter)).clone()
     } else {
         // A network share or another kind of path: one worker per server and share.
-        Drive { key: format!("path:{}", canon_path.split('\\').take(4).collect::<Vec<_>>().join("\\")), readers: 1 }
+        Drive { key: format!("path:{}", canon_path.split('\\').take(4).collect::<Vec<_>>().join("\\")), readers: 1, cleanable: false }
     }
 }
 
@@ -369,7 +373,8 @@ fn prepare(input: Vec<SizeBatch>, ctx: &Ctx) -> Vec<Prepared> {
                 return out;
             }
             let c = canon(&f.path);
-            if in_system_store(&c) {
+            let drive = drive_of(&c, &mut drives);
+            if in_system_store(&c) || !drive.cleanable {
                 continue;
             }
             let Some(st) = ctx.facts.stat(&f.path) else { continue };
@@ -377,7 +382,6 @@ fn prepare(input: Vec<SizeBatch>, ctx: &Ctx) -> Vec<Prepared> {
                 continue;
             }
             // Hard links are refused when the file is opened (see `handle_ok`), where the link count is read.
-            let drive = drive_of(&c, &mut drives);
             files.push(Cand { path: f.path, canon: c, device_id: f.device_id, modified_ms: st.modified_ms, drive });
         }
         if files.len() >= 2 {

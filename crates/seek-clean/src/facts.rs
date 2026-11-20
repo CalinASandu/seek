@@ -298,6 +298,12 @@ impl DriveType {
     }
 }
 
+/// Whether files on the drive at `root` (`x:\`) can ever go to the bin: a fixed drive with NTFS or
+/// ReFS. Asked once per drive, so a scan never touches the files of a drive that can't be cleaned.
+pub fn drive_can_recycle(root: &str) -> bool {
+    drive_allows(DriveType::from_raw(drive_type(root))) && file_system(root).is_some_and(|f| fs_allows(&f))
+}
+
 /// Only a fixed local drive has a bin Seek can rely on.
 pub(crate) fn drive_allows(kind: DriveType) -> bool {
     kind == DriveType::Fixed

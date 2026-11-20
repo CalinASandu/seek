@@ -80,7 +80,13 @@ fn is_ntfs(v: &VolumeInfo) -> bool {
     v.filesystem.eq_ignore_ascii_case("NTFS")
 }
 
-/// One pass: detect new, returning and removed volumes.
+/// The volume's size or free space differs from the stored device by at least 1 GB.
+fn space_moved(d: Option<&Device>, v: &VolumeInfo) -> bool {
+    const GB: u64 = 1 << 30;
+    d.is_some_and(|d| d.total_bytes != v.total_bytes || d.free_bytes.abs_diff(v.free_bytes) >= GB)
+}
+
+/// One pass: detect new, returning and removed volumes, and refresh free space.
 pub fn poll_volumes(state: &Arc<State>) {
     let vols = state.source.list();
     let mut present = HashSet::new();
@@ -116,6 +122,14 @@ pub fn poll_volumes(state: &Arc<State>) {
             });
             state.invalidate();
             bring_online(state, id, &v);
+        } else if space_moved(state.device(id).as_ref(), &v) {
+            // Free space changes while the drive stays online; keep it current (saved only
+            // when it moved by a gigabyte, so the registry isn't rewritten every poll).
+            state.update_device(id, |d| {
+                d.total_bytes = v.total_bytes;
+                d.free_bytes = v.free_bytes;
+            });
+            state.invalidate();
         }
     }
     let gone: Vec<DeviceId> = state
