@@ -321,6 +321,23 @@ async fn unplugged_device_stays_searchable_and_survives_restart() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn free_space_follows_the_drive_while_it_stays_online() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = Arc::new(Fake::default());
+    let v = VolumeInfo { total_bytes: 8 << 30, free_bytes: 6 << 30, ..volume() };
+    fake.vols.lock().unwrap().push(v);
+    let svc = start(dir.path(), fake.clone()).await;
+    let mut c = connect(&svc.pipe).await;
+    wait_for(&mut c, "device scanned", scanned_online).await;
+
+    let free = 4 << 30; // 2 GB written to the drive
+    fake.vols.lock().unwrap()[0].free_bytes = free;
+    wait_for(&mut c, "free space refreshed", |ds| ds[0].free_bytes == free).await;
+    let _ = svc.stop.send(true);
+    svc.task.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn idle_indexes_unload_and_come_back_for_the_next_search() {
     let dir = tempfile::tempdir().unwrap();
     let fake = Arc::new(Fake::default());

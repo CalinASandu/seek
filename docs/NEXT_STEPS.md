@@ -1,6 +1,6 @@
 # Seek — Status & Next Steps
 
-_Last updated: 2026-11-07 (Decimator built and reviewed, faster duplicate scans added; real-window check by the user next). Read this first when starting a new session in this repo._
+_Last updated: 2026-11-20 (Decimator tried by the user in the real window: works well; slimming it next). Read this first when starting a new session in this repo._
 
 ## Where we are
 
@@ -287,7 +287,7 @@ optional `init`, `compose up -d`, `compose logs`, `openssl s_client` (the certif
   and the Link dialog keep the older `.segmented` control.
 - Maybe later (user): a shortcuts page in Settings.
 
-## Decimator (Cleanup): built 2026-11-05 … 11-06, waiting for the user's real-window check
+## Decimator (Cleanup): built 2026-11-05 … 11-06, tried by the user 2026-11-20 (works well; full checklist below not run yet)
 
 Spec `docs/superpowers/specs/2026-11-04-seek-cleanup-design.md`, plan `docs/superpowers/plans/2026-11-05-seek-decimator.md`, all 18
 tasks plus a final whole-branch review and fix pass, committed on `feat/v1` (not pushed). Every ruling made along the way, with what
@@ -307,6 +307,9 @@ it costs if wrong, is in the ledger `.superpowers/sdd/2026-11-05-seek-decimator/
   scans remember what they read in `%TEMP%\Seek\dupe-prints.txt` (the Scan button's tooltip says so; Settings → Duplicate
   scans: size and *Clear*). A same-name quick scan was tried and dropped: on the user's PC it still read 405 of 604 GB.
   Plan: `docs/superpowers/plans/2026-11-07-faster-duplicate-scans.md`.
+- **Slow scan fix (2026-11-09):** files on a drive that can't be cleaned (Google Drive's G:, network shares, USB sticks)
+  are left out before any per-file check; G: alone cost 4–8 s per file and held 370 of 410 GB. Real scan on the user's
+  PC: 43 s with remembered results, 2 min without. Measure with `seek dupes [--fast] [--fresh]`.
 - The app and service must be rebuilt together (protocol v5).
 - Tests: `cargo test --workspace` 823 passed; `pnpm test` 168; clippy clean. Real-Recycle-Bin flows:
   `cargo test -p seek-clean --test flows -- --ignored` (temp files only).
@@ -411,6 +414,9 @@ now counts as seen when that PC last synced (`apply_remote_devices`), and when a
 saved or announced.
 
 ## Next step
+
+**Now (2026-11-20): Decimator slimming**, `docs/superpowers/plans/2026-11-07-decimator-slimming.md`. The faster-scans work it
+waited for has landed.
 
 0. **Space view in the real window (user)** — the release binaries were locked while the session ran:
    elevated: `Stop-Service SeekService`; close the Seek window; `cargo build --release -p seek-service -p seek-cli`;

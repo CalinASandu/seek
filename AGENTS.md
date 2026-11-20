@@ -28,5 +28,6 @@ Design: `docs/superpowers/specs/2026-10-04-seek-local-design.md`. Plan: `docs/su
 - Run everything: double-click `Seek.bat` (service + window); `Stop Seek.bat` to stop
 - Rebuild and run the latest source on this PC: double-click `Rebuild Seek.bat`
 - UI: `cd app; pnpm test; pnpm build; pnpm tauri build --no-bundle` (`pnpm dev` = browser preview with mock data)
+- Time a real duplicate scan (needs the service): `.\target\release\seek.exe dupes --fast` (`--fresh` = ignore remembered results)
 - Perf (every metric, compares with last run): `.\scripts\perf.ps1` or `.\target\release\seek.exe perf --scan D:\ --remote`
 - Installer: `.\scripts\build-installer.ps1` → `target\release\bundle\nsis\Seek_<ver>_x64-setup.exe`

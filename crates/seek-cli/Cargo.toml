@@ -16,6 +16,7 @@ seek-scan.workspace = true
 seek-ipc.workspace = true
 seek-sync.workspace = true
 seek-hub.workspace = true
+seek-clean.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 tokio.workspace = true

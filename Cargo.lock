@@ -3890,6 +3890,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "seek-clean",
  "seek-core",
  "seek-hub",
  "seek-ipc",
