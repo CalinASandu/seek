@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/seek-core", "crates/seek-scan", "crates/seek-ipc", "crates/seek-service", "crates/seek-cli", "crates/seek-sync", "app/src-tauri"]
+members = ["crates/seek-core", "crates/seek-scan", "crates/seek-ipc", "crates/seek-service", "crates/seek-cli", "crates/seek-sync", "crates/seek-hub", "crates/seek-clean", "app/src-tauri"]
 
 [workspace.package]
 version = "0.1.0"
@@ -13,6 +13,10 @@ seek-core = { path = "crates/seek-core" }
 seek-scan = { path = "crates/seek-scan" }
 seek-ipc = { path = "crates/seek-ipc" }
 seek-sync = { path = "crates/seek-sync" }
+seek-hub = { path = "crates/seek-hub" }
+seek-clean = { path = "crates/seek-clean" }
+windows = "0.62"
+blake3 = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
@@ -32,15 +36,20 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 jwalk = "0.8"
 notify = "8"
 windows-service = "0.8"
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Ioctl", "Win32_System_IO", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Memory", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_System_Threading", "Win32_System_ProcessStatus", "Win32_System_Pipes", "Win32_System_Registry"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Ioctl", "Win32_System_IO", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Memory", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_System_Threading", "Win32_System_ProcessStatus", "Win32_System_Pipes", "Win32_System_Registry", "Win32_System_Com", "Win32_System_LibraryLoader"] }
 criterion = "0.5"
 tempfile = "3"
 snow = "0.9"
 spake2 = "0.4"
 chacha20poly1305 = "0.10"
+blake2 = "0.10"
 postcard = { version = "1", features = ["use-std"] }
 rand = "0.8"
 mdns-sd = "0.13"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+webpki-roots = "1"
+rcgen = { version = "0.13", default-features = false, features = ["ring"] }
 
 # Everyday release builds compile in parallel and incrementally. The installer script turns on
 # thin LTO and a single codegen unit (a few percent faster, much slower to build) via env vars.

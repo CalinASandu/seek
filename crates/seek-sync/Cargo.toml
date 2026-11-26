@@ -21,6 +21,14 @@ spake2.workspace = true
 chacha20poly1305.workspace = true
 postcard.workspace = true
 rand.workspace = true
+rustls.workspace = true
+tokio-rustls.workspace = true
+webpki-roots.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+rcgen.workspace = true
+# the tests run a TLS 1.2-only server to prove the dialer refuses it
+rustls = { workspace = true, features = ["tls12"] }
+# paused clock for the hub session's polling tests
+tokio = { workspace = true, features = ["test-util"] }

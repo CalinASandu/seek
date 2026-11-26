@@ -9,7 +9,7 @@ use seek_core::{
     encode_index, Change, Checkpoint, DeviceIdentity, DeviceIndex, DeviceKind, DeviceState,
     IndexHeader, RawEntry, SortKey, ATTR_DIRECTORY,
 };
-use seek_ipc::{Client, MuxClient, Request, Response, UserVolume};
+use seek_ipc::{Client, MuxClient, Request, Response, UserVolume, PROTOCOL_VERSION};
 use seek_scan::{Changed, DirWatcher, FollowError, ScanError, ScanResult, UsnFollower, VolumeInfo};
 use seek_service::access::Caller;
 use seek_service::{Config, VolumeSource};
@@ -17,7 +17,8 @@ use tokio::net::windows::named_pipe::NamedPipeServer;
 
 const ENTRIES: u64 = 1000;
 
-fn entries() -> Vec<RawEntry> {
+/// `size_mod` > 0 makes file sizes repeat: size = id % size_mod (instead of every size being unique).
+fn entries_sized(size_mod: u64) -> Vec<RawEntry> {
     (1..=ENTRIES)
         .map(|id| {
             let dir = id <= 10;
@@ -29,7 +30,11 @@ fn entries() -> Vec<RawEntry> {
                 } else {
                     format!("file{id}.txt")
                 },
-                size: if dir { 0 } else { id },
+                size: match (dir, size_mod) {
+                    (true, _) => 0,
+                    (false, 0) => id,
+                    (false, m) => id % m,
+                },
                 modified: 1_700_000_000_000,
                 created: 1_700_000_000_000,
                 attrs: if dir { ATTR_DIRECTORY } else { 0 },
@@ -67,6 +72,10 @@ struct Fake {
     /// Every client is this non-elevated user unless `elevated`; `profiles` = (SID, folder).
     elevated: Mutex<bool>,
     profiles: Mutex<Vec<(String, String)>>,
+    /// See `entries_sized`.
+    size_mod: Mutex<u64>,
+    /// (file id, size) pairs applied on top of `size_mod`.
+    size_of: Mutex<Vec<(u64, u64)>>,
 }
 
 const ME: &str = "S-1-5-21-me";
@@ -83,7 +92,13 @@ impl VolumeSource for Fake {
         *self.scans.lock().unwrap() += 1;
         progress(ENTRIES);
         Ok(ScanResult {
-            index: DeviceIndex::from_raw(0, entries()),
+            index: DeviceIndex::from_raw(0, {
+                let mut e = entries_sized(*self.size_mod.lock().unwrap());
+                for &(id, size) in self.size_of.lock().unwrap().iter() {
+                    e[id as usize - 1].size = size;
+                }
+                e
+            }),
             checkpoint: None,
             skipped: 0,
         })
@@ -122,12 +137,17 @@ struct Running {
 }
 
 async fn start(dir: &Path, fake: Arc<Fake>) -> Running {
+    start_idle(dir, fake, None).await
+}
+
+async fn start_idle(dir: &Path, fake: Arc<Fake>, idle_unload: Option<Duration>) -> Running {
     let pipe = format!(r"\\.\pipe\seek-test-{}", uuid::Uuid::new_v4());
     let (stop, rx) = tokio::sync::watch::channel(false);
     let cfg = Config {
         data_dir: dir.to_path_buf(),
         pipe_name: pipe.clone(),
         sync: None,
+        idle_unload,
     };
     let task = tokio::spawn(seek_service::run(cfg, fake, rx));
     Running { pipe, stop, task }
@@ -188,14 +208,14 @@ async fn hello_search_and_paging() {
 
     let hello = c
         .request(Request::Hello {
-            protocol_version: 1,
+            protocol_version: PROTOCOL_VERSION,
         })
         .await
         .unwrap();
     assert!(matches!(
         hello,
         Response::Hello {
-            protocol_version: 1,
+            protocol_version: PROTOCOL_VERSION,
             ..
         }
     ));
@@ -296,6 +316,53 @@ async fn unplugged_device_stays_searchable_and_survives_restart() {
     let mut c = connect(&svc.pipe).await;
     assert_eq!(total(search(&mut c, "file").await).1, ENTRIES - 10);
     assert_eq!(*fake2.scans.lock().unwrap(), 0);
+    let _ = svc.stop.send(true);
+    svc.task.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn free_space_follows_the_drive_while_it_stays_online() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = Arc::new(Fake::default());
+    let v = VolumeInfo { total_bytes: 8 << 30, free_bytes: 6 << 30, ..volume() };
+    fake.vols.lock().unwrap().push(v);
+    let svc = start(dir.path(), fake.clone()).await;
+    let mut c = connect(&svc.pipe).await;
+    wait_for(&mut c, "device scanned", scanned_online).await;
+
+    let free = 4 << 30; // 2 GB written to the drive
+    fake.vols.lock().unwrap()[0].free_bytes = free;
+    wait_for(&mut c, "free space refreshed", |ds| ds[0].free_bytes == free).await;
+    let _ = svc.stop.send(true);
+    svc.task.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn idle_indexes_unload_and_come_back_for_the_next_search() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = Arc::new(Fake::default());
+    fake.vols.lock().unwrap().push(volume());
+    let svc = start_idle(dir.path(), fake.clone(), Some(Duration::from_millis(1))).await;
+    let mut c = connect(&svc.pipe).await;
+    wait_for(&mut c, "device scanned", scanned_online).await;
+    let (id, found) = total(search(&mut c, "file").await);
+
+    // the stored results go with the index, and the client is told to search again
+    let mut gone = false;
+    for _ in 0..240 {
+        let r = c.request(Request::FetchRows { search_id: id, offset: 0, limit: 1 }).await.unwrap();
+        if let Response::Error { message } = r {
+            assert!(message.contains("results changed"), "{message}");
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(gone, "the index was never unloaded");
+
+    assert_eq!(total(search(&mut c, "file").await).1, found);
+    assert!(matches!(c.request(Request::Wake).await.unwrap(), Response::Ok));
+    assert_eq!(*fake.scans.lock().unwrap(), 1, "reloading is not rescanning");
     let _ = svc.stop.send(true);
     svc.task.await.unwrap().unwrap();
 }
@@ -983,6 +1050,349 @@ async fn space_view_hides_other_users_folders() {
     let root = node(space_tree(&mut admin, id, "T:\\", 1).await);
     assert!(root.children.iter().any(|n| n.name == "folder2"));
     assert!(!root.children.iter().any(|n| n.kind == seek_core::SpaceKind::Hidden));
+
+    let _ = svc.stop.send(true);
+    svc.task.await.unwrap().unwrap();
+}
+
+async fn same_size(
+    c: &mut Client,
+    device_ids: &[seek_core::DeviceId],
+    min_size: u64,
+    cursor: Option<u64>,
+    limit: u32,
+) -> (Vec<seek_ipc::SizeGroup>, Option<u64>) {
+    match c
+        .request(Request::SameSizeFiles { min_size, device_ids: device_ids.to_vec(), cursor, limit })
+        .await
+        .unwrap()
+    {
+        Response::SameSizeFiles { groups, next } => (groups, next),
+        other => panic!("expected SameSizeFiles, got {other:?}"),
+    }
+}
+
+/// Every page of a query, following `next`; also checks each page against the paging rules.
+async fn same_size_all(
+    c: &mut Client,
+    ids: &[seek_core::DeviceId],
+    min_size: u64,
+    limit: u32,
+) -> Vec<seek_ipc::SizeGroup> {
+    let (mut all, mut cursor) = (Vec::new(), None);
+    for _ in 0..2000 {
+        let (groups, next) = same_size(c, ids, min_size, cursor, limit).await;
+        assert!(!groups.is_empty(), "a page always holds a group");
+        let files: usize = groups.iter().map(|g| g.files.len()).sum();
+        assert!(files <= limit.max(1) as usize || groups.len() == 1, "{files} files > limit {limit}");
+        if let (Some(n), Some(last)) = (next, groups.last()) {
+            assert!(n < last.size, "the cursor moves down");
+        }
+        all.extend(groups);
+        match next {
+            Some(n) => cursor = Some(n),
+            None => return all,
+        }
+    }
+    panic!("paging never finished");
+}
+
+fn file_number(row: &seek_core::ResultRow) -> u64 {
+    row.name.trim_start_matches("file").trim_end_matches(".txt").parse().unwrap()
+}
+
+// With size_mod 100, file ids s, s+100, … share size s: sizes 1..=10 hold 9 files (ids 1..=10 are
+// folders), sizes 11..=99 hold 10. Size 0 (ids 100, 200, …) is left out by min_size 1.
+const SAME_SIZE_FILES: usize = 10 * 9 + 89 * 10;
+
+#[tokio::test(flavor = "multi_thread")]
+async fn same_size_files_pages_through_every_group() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = Arc::new(Fake::default());
+    *fake.size_mod.lock().unwrap() = 100;
+    fake.vols.lock().unwrap().push(volume());
+    let svc = start(dir.path(), fake.clone()).await;
+    let mut c = connect(&svc.pipe).await;
+    wait_for(&mut c, "device scanned", scanned_online).await;
+    let id = device_id(&mut c).await;
+
+    let all = same_size_all(&mut c, &[id], 1, 25).await;
+    let sizes: Vec<u64> = all.iter().map(|g| g.size).collect();
+    assert_eq!(sizes, (1..=99).rev().collect::<Vec<u64>>());
+    assert_eq!(all.iter().map(|g| g.files.len()).sum::<usize>(), SAME_SIZE_FILES);
+    for g in &all {
+        assert_eq!(g.files.len(), if g.size <= 10 { 9 } else { 10 }, "size {}", g.size);
+        assert!(g.files.iter().all(|f| f.size == g.size && !f.is_dir && f.device_id == id));
+        let nums: Vec<u64> = g.files.iter().map(file_number).collect();
+        assert!(nums.windows(2).all(|w| w[0] < w[1]), "rows in order: {nums:?}");
+    }
+    assert_eq!(all[0].files[0].full_path, r"T:\folder10\file99.txt");
+
+    // an enormous limit is capped by the server (far above this data, so everything fits one page)
+    let (page, next) = same_size(&mut c, &[id], 1, None, u32::MAX).await;
+    assert_eq!((page.len(), next), (99, None));
+
+    // a group alone can be bigger than the limit: one group per page then
+    let one = same_size_all(&mut c, &[id], 1, 1).await;
+    assert_eq!(one, all);
+    let (page, next) = same_size(&mut c, &[id], 1, Some(50), 0).await;
+    assert_eq!((page.len(), page[0].size, next), (1, 50, Some(49)));
+    let (page, next) = same_size(&mut c, &[id], 1, Some(1), 1000).await;
+    assert_eq!((page.len(), page[0].size, next), (1, 1, None));
+    // the minimum is inclusive, and a page past the end is empty
+    let (page, next) = same_size(&mut c, &[id], 99, None, 1000).await;
+    assert_eq!((page.len(), next), (1, None));
+    assert_eq!(same_size(&mut c, &[id], 100, None, 1000).await, (vec![], None));
+    assert_eq!(same_size(&mut c, &[id], 1, Some(0), 10).await, (vec![], None));
+
+    let _ = svc.stop.send(true);
+    svc.task.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn same_size_files_survives_an_idle_unload_between_pages() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = Arc::new(Fake::default());
+    *fake.size_mod.lock().unwrap() = 100;
+    fake.vols.lock().unwrap().push(volume());
+    let svc = start_idle(dir.path(), fake.clone(), Some(Duration::from_millis(1))).await;
+    let mut c = connect(&svc.pipe).await;
+    wait_for(&mut c, "device scanned", scanned_online).await;
+    let id = device_id(&mut c).await;
+
+    let (first, next) = same_size(&mut c, &[id], 1, None, 25).await;
+    let next = next.expect("more pages");
+
+    // wait until the index is gone (a stored search disappears with it)
+    let (search_id, _) = total(search(&mut c, "file").await);
+    let mut gone = false;
+    for _ in 0..240 {
+        if let Response::Error { .. } = c.request(Request::FetchRows { search_id, offset: 0, limit: 1 }).await.unwrap() {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(gone, "the index was never unloaded");
+
+    let (second, _) = same_size(&mut c, &[id], 1, Some(next), 25).await;
+    assert_eq!(second[0].size, next);
+    assert!(second[0].size < first.last().unwrap().size);
+    let all = same_size_all(&mut c, &[id], 1, 25).await;
+    assert_eq!(all.len(), 99);
+
+    let _ = svc.stop.send(true);
+    svc.task.await.unwrap().unwrap();
+}
+
+async fn stale_files(c: &mut Client) -> Vec<seek_ipc::StaleFile> {
+    match c.request(Request::StaleData).await.unwrap() {
+        Response::StaleData { files } => files,
+        other => panic!("expected StaleData, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stale_data_lists_only_files_no_known_drive_owns() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = Arc::new(Fake::default());
+    fake.vols.lock().unwrap().push(volume());
+    let svc = start(dir.path(), fake.clone()).await;
+    let mut c = connect(&svc.pipe).await;
+    wait_for(&mut c, "device scanned", scanned_online).await;
+    let live = device_id(&mut c).await;
+
+    let unknown = uuid::Uuid::new_v4();
+    let (indexes, journal) = (dir.path().join("indexes"), dir.path().join("journal"));
+    std::fs::write(indexes.join(format!("{unknown}.seekidx")), vec![0u8; 1234]).unwrap();
+    std::fs::write(journal.join(format!("{unknown}.log")), vec![0u8; 77]).unwrap();
+    // A live drive's files, a stranger's file name and a half-written index are none of its business.
+    std::fs::write(indexes.join(format!("{live}.seekidx")), b"live").unwrap();
+    std::fs::write(journal.join(format!("{live}.log")), b"live").unwrap();
+    std::fs::write(indexes.join("notes.txt"), b"x").unwrap();
+    std::fs::write(indexes.join(format!("{unknown}.seekidx.tmp")), b"x").unwrap();
+    std::fs::write(dir.path().join("devices.json"), b"{}").unwrap();
+
+    let mut files = stale_files(&mut c).await;
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    let mut want = vec![
+        (indexes.join(format!("{unknown}.seekidx")), 1234u64),
+        (journal.join(format!("{unknown}.log")), 77u64),
+    ];
+    want.sort();
+    assert_eq!(
+        files.iter().map(|f| (std::path::PathBuf::from(&f.path), f.size)).collect::<Vec<_>>(),
+        want
+    );
+    // Epoch milliseconds, and recent: the files were just written.
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
+    assert!(files.iter().all(|f| (now - f.modified).abs() < 60_000), "{files:?}");
+
+    let _ = svc.stop.send(true);
+    svc.task.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn same_size_files_hides_other_users_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = Arc::new(Fake::default());
+    *fake.size_mod.lock().unwrap() = 100;
+    fake.vols.lock().unwrap().push(volume());
+    *fake.profiles.lock().unwrap() = vec![(ME.into(), r"T:\folder1".into()), ("S-1-5-21-bob".into(), r"T:\FOLDER2\".into())];
+    let svc = start(dir.path(), fake.clone()).await;
+    let mut c = connect(&svc.pipe).await;
+    wait_for(&mut c, "device scanned", scanned_online).await;
+    let id = device_id(&mut c).await;
+
+    // folder2 holds every file whose id ends in 1, so the sizes ending in 1 vanish entirely
+    let all = same_size_all(&mut c, &[id], 1, 1000).await;
+    assert_eq!(all.len(), 99 - 10);
+    assert!(all.iter().all(|g| g.size % 10 != 1));
+    assert!(all.iter().flat_map(|g| &g.files).all(|f| !f.folder.to_lowercase().ends_with("folder2")));
+
+    *fake.elevated.lock().unwrap() = true;
+    let mut admin = connect(&svc.pipe).await;
+    let all = same_size_all(&mut admin, &[id], 1, 1000).await;
+    assert_eq!(all.len(), 99);
+    assert_eq!(all.iter().map(|g| g.files.len()).sum::<usize>(), SAME_SIZE_FILES);
+
+    let _ = svc.stop.send(true);
+    svc.task.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn same_size_with_one_visible_and_one_hidden_file_is_not_a_group() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = Arc::new(Fake::default());
+    // file11 is in folder2 (hidden from me), file12 in folder3: size 7777 has one visible file only
+    *fake.size_of.lock().unwrap() = vec![(11, 7777), (12, 7777), (13, 7000), (14, 7000), (15, 8000), (16, 8000)];
+    fake.vols.lock().unwrap().push(volume());
+    *fake.profiles.lock().unwrap() = vec![(ME.into(), r"T:\folder1".into()), ("S-1-5-21-bob".into(), r"T:\FOLDER2\".into())];
+    let svc = start(dir.path(), fake.clone()).await;
+    let mut c = connect(&svc.pipe).await;
+    wait_for(&mut c, "device scanned", scanned_online).await;
+    let id = device_id(&mut c).await;
+
+    let sizes = |g: &[seek_ipc::SizeGroup]| g.iter().map(|g| g.size).collect::<Vec<_>>();
+    // one group per page: the 7777 gap in the middle must not end the walk early
+    assert_eq!(sizes(&same_size_all(&mut c, &[id], 1, 2).await), [8000, 7000]);
+    assert_eq!(sizes(&same_size_all(&mut c, &[id], 1, 1000).await), [8000, 7000]);
+    let (page, next) = same_size(&mut c, &[id], 1, None, 2).await;
+    assert_eq!((sizes(&page), next), (vec![8000], Some(7000)));
+
+    *fake.elevated.lock().unwrap() = true;
+    let mut admin = connect(&svc.pipe).await;
+    assert_eq!(sizes(&same_size_all(&mut admin, &[id], 1, 2).await), [8000, 7777, 7000]);
+
+    let _ = svc.stop.send(true);
+    svc.task.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn same_size_counts_across_two_drives() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = Arc::new(Fake::default());
+    let mut second = volume();
+    second.mount_point = "U:\\".into();
+    second.label = "OTHERSTICK".into();
+    second.identity = DeviceIdentity::Volume { serial: 0xBEEF, filesystem: "exFAT".into() };
+    fake.vols.lock().unwrap().extend([volume(), second]);
+    let svc = start(dir.path(), fake.clone()).await;
+    let mut c = connect(&svc.pipe).await;
+    wait_for(&mut c, "both scanned", |ds| {
+        ds.len() == 2 && ds.iter().all(|d| d.state == DeviceState::Online && d.entry_count == ENTRIES)
+    })
+    .await;
+    let Response::Devices { devices } = c.request(Request::ListDevices).await.unwrap() else { panic!() };
+    let mut ids: Vec<_> = devices.iter().map(|d| d.id).collect();
+    ids.sort();
+
+    // every size is unique inside a drive, so only the two drives together make groups
+    assert_eq!(same_size(&mut c, &ids[..1], 1, None, 100).await, (vec![], None));
+    assert_eq!(same_size(&mut c, &ids[1..], 1, None, 100).await, (vec![], None));
+    let all = same_size_all(&mut c, &ids, 1, 100).await;
+    assert_eq!(all.len(), 990);
+    assert_eq!(all[0].size, 1000);
+    assert_eq!(all.last().unwrap().size, 11);
+    for g in &all {
+        assert_eq!(g.files.len(), 2);
+        assert_eq!((g.files[0].device_id, g.files[1].device_id), (ids[0], ids[1]), "ordered by device");
+        assert!(g.files.iter().all(|f| f.size == g.size));
+    }
+
+    // no drives chosen means no groups; unknown ids are skipped
+    assert_eq!(same_size(&mut c, &[], 1, None, 100).await, (vec![], None));
+    assert_eq!(same_size(&mut c, &[uuid::Uuid::new_v4()], 1, None, 100).await, (vec![], None));
+    let with_unknown = [ids[0], uuid::Uuid::new_v4(), ids[1]];
+    let (page, next) = same_size(&mut c, &with_unknown, 996, None, 100).await;
+    assert_eq!((page.len(), next), (5, None));
+    let (page, next) = same_size(&mut c, &ids, 1, None, 10).await;
+    assert_eq!((page.len(), next), (5, Some(995)));
+
+    let _ = svc.stop.send(true);
+    svc.task.await.unwrap().unwrap();
+}
+
+async fn folder_facts(c: &mut Client, paths: &[&str]) -> Vec<Option<seek_core::FolderFact>> {
+    let paths = paths.iter().map(|p| p.to_string()).collect();
+    match c.request(Request::FolderFacts { paths }).await.unwrap() {
+        Response::FolderFacts { facts } => facts,
+        other => panic!("expected FolderFacts, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn folder_facts_reports_totals_and_hides_other_users_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = Arc::new(Fake::default());
+    fake.vols.lock().unwrap().push(volume());
+    *fake.profiles.lock().unwrap() = vec![(ME.into(), r"T:\folder1".into()), ("S-1-5-21-bob".into(), r"T:\FOLDER2\".into())];
+    let svc = start(dir.path(), fake.clone()).await;
+    let mut c = connect(&svc.pipe).await;
+    wait_for(&mut c, "device scanned", scanned_online).await;
+
+    // folder1 holds files 20, 30, ... 1000 (ids ending in 0); folder2 holds the ids ending in 1.
+    let paths = [r"T:\folder1", r"t:\FOLDER1\", r"T:\folder2", r"T:\nothing", r"D:\folder1"];
+    let f = folder_facts(&mut c, &paths).await;
+    assert_eq!(f.len(), paths.len(), "one answer per path, in order");
+    let one = f[0].as_ref().expect("folder1");
+    assert_eq!((one.files, one.size), (99, (20..=1000).step_by(10).sum::<u64>()));
+    assert!(one.has_files && !one.has_subfolders && !one.has_programs && !one.has_link && !one.has_cloud);
+    assert_eq!(one.newest_modified, 1_700_000_000_000);
+    assert_eq!(one.top_names.len(), 6);
+    assert!(one.top_names.windows(2).all(|w| w[0].to_lowercase() <= w[1].to_lowercase()), "{:?}", one.top_names);
+    assert_eq!(f[1], f[0], "case and a trailing backslash do not matter");
+    assert_eq!(f[2], None, "another user's folder is not found");
+    assert_eq!(f[3], None, "not in the index");
+    assert_eq!(f[4], None, "not on a drive of this PC");
+
+    *fake.elevated.lock().unwrap() = true;
+    let mut admin = connect(&svc.pipe).await;
+    let f = folder_facts(&mut admin, &[r"T:\folder2"]).await;
+    let two = f[0].as_ref().expect("folder2 for an admin");
+    assert_eq!((two.files, two.size), (99, (11..=991).step_by(10).sum::<u64>()));
+
+    let _ = svc.stop.send(true);
+    svc.task.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stale_data_knows_a_live_id_spelled_in_upper_case_or_braces() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = Arc::new(Fake::default());
+    fake.vols.lock().unwrap().push(volume());
+    let svc = start(dir.path(), fake.clone()).await;
+    let mut c = connect(&svc.pipe).await;
+    wait_for(&mut c, "device scanned", scanned_online).await;
+    let live = device_id(&mut c).await;
+    let (indexes, journal) = (dir.path().join("indexes"), dir.path().join("journal"));
+    std::fs::write(indexes.join(format!("{}.seekidx", live.to_string().to_uppercase())), b"live").unwrap();
+    std::fs::write(journal.join(format!("{{{live}}}.log")), b"live").unwrap();
+    let unknown = uuid::Uuid::new_v4();
+    std::fs::write(indexes.join(format!("{{{}}}.seekidx", unknown.to_string().to_uppercase())), b"stale").unwrap();
+    let files = stale_files(&mut c).await;
+    assert_eq!(files.len(), 1, "{files:?}");
+    assert!(files[0].path.to_uppercase().contains(&unknown.to_string().to_uppercase()));
 
     let _ = svc.stop.send(true);
     svc.task.await.unwrap().unwrap();

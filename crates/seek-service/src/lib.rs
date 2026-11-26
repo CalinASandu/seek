@@ -2,8 +2,11 @@
 //! over a named pipe.
 
 pub mod access;
+mod hub;
 mod journal_ops;
+pub mod memory;
 pub mod monitor;
+pub mod parking;
 pub mod peers;
 pub mod server;
 pub mod state;
@@ -17,11 +20,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub use monitor::{RealVolumes, VolumeSource};
+
+#[global_allocator]
+static ALLOCATOR: memory::CountingAlloc = memory::CountingAlloc;
 pub use state::{Config, State, SyncConfig};
 
 const VOLUME_POLL: Duration = Duration::from_secs(2);
 const JOURNAL_POLL: Duration = Duration::from_millis(500);
 const SAVE_EVERY: Duration = Duration::from_secs(5 * 60);
+const IDLE_CHECK: Duration = Duration::from_secs(5);
 
 /// TCP port linked PCs connect to (the firewall rule opens it to the local subnet).
 pub const SYNC_PORT: u16 = 47321;
@@ -34,6 +41,7 @@ pub fn default_sync_config() -> SyncConfig {
         mdns: true,
         name: std::env::var("COMPUTERNAME").unwrap_or_else(|_| "This PC".into()),
         interval: Duration::from_secs(60),
+        hub_tls: None,
     }
 }
 
@@ -73,6 +81,7 @@ pub async fn run_with(
     background.push(every(VOLUME_POLL, state.clone(), monitor::poll_volumes));
     background.push(every(JOURNAL_POLL, state.clone(), monitor::poll_journals));
     background.push(every(SAVE_EVERY, state.clone(), |s| s.save_dirty()));
+    background.push(every(IDLE_CHECK, state.clone(), |s| s.idle_tick()));
     background.push(every(Duration::from_secs(1), state.clone(), |s| {
         if s.invalidated.swap(false, Ordering::Relaxed) {
             s.emit(seek_ipc::Event::ResultsInvalidated);

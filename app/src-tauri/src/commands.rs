@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use seek_core::{Device, DeviceId, ResultRow, SortKey};
-use seek_ipc::{PcInfo, Request, Response, StatusInfo};
+use seek_ipc::{HubStatus, PcInfo, Request, Response, StatusInfo};
 use serde_json::{json, Value};
 use tauri::{AppHandle, State};
 use tauri_plugin_autostart::ManagerExt;
@@ -129,12 +129,20 @@ pub fn get_settings() -> Settings {
 
 #[tauri::command]
 pub fn set_settings(app: AppHandle, settings: Settings) -> Result<(), String> {
+    // Saved first: a file that can't be overwritten safely stops everything, autostart included.
+    settings::save(&settings)?;
     let autolaunch = app.autolaunch();
     let result = if settings.start_with_windows { autolaunch.enable() } else { autolaunch.disable() };
     if let Err(e) = result {
         tracing::warn!("updating start-with-Windows failed: {e}");
     }
-    settings::save(&settings)
+    Ok(())
+}
+
+/// Why the saved settings (and so the protected list) can't be used, if they can't.
+#[tauri::command]
+pub fn settings_problem() -> Option<String> {
+    settings::problem()
 }
 
 // ---- linked PCs ----
@@ -158,6 +166,27 @@ pub async fn discovered_pcs(link: Link<'_>) -> Result<Vec<PcInfo>, String> {
 #[tauri::command]
 pub async fn join_pairing(link: Link<'_>, addr: String, code: String) -> Result<(), String> {
     expect_ok(&link, Request::JoinPairing { addr, code }).await
+}
+
+#[tauri::command]
+pub async fn link_hub(link: Link<'_>, addr: String, code: String) -> Result<String, String> {
+    match link.request(Request::LinkHub { addr, code }).await? {
+        Response::HubLinked { name } => Ok(name),
+        other => Err(unexpected(other)),
+    }
+}
+
+#[tauri::command]
+pub async fn unlink_hub(link: Link<'_>) -> Result<(), String> {
+    expect_ok(&link, Request::UnlinkHub).await
+}
+
+#[tauri::command]
+pub async fn hub_status(link: Link<'_>) -> Result<Option<HubStatus>, String> {
+    match link.request(Request::HubStatus).await? {
+        Response::Hub { hub } => Ok(hub),
+        other => Err(unexpected(other)),
+    }
 }
 
 #[tauri::command]

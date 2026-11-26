@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { formatCount, formatModified, formatRelative, formatSize, splitPath } from "../lib/format";
-import { hasToken, highlightTerms, segmentName, toggleToken } from "../lib/query";
+import { composeQuery, folderFilter, hasToken, highlightTerms, segmentName, toggleFilter, type Filter } from "../lib/query";
 
 describe("formatSize", () => {
   it("formats bytes with binary units", () => {
@@ -31,11 +31,36 @@ describe("formatCount / dates / paths", () => {
 });
 
 describe("query helpers", () => {
-  it("toggles filter tokens", () => {
-    expect(toggleToken("report", "file:")).toBe("report file: ");
-    expect(toggleToken("report file: ", "file:")).toBe("report");
-    expect(toggleToken("folder: x", "file:", ["folder:"])).toBe("x file: ");
+  const flag = (token: string): Filter => ({ token, kind: "flag", label: token });
+  const drive = (name: string): Filter => ({ token: `drive:"${name}"`, kind: "drive", label: name });
+
+  it("toggles filters without touching the typed text", () => {
+    const on = toggleFilter({ text: "report", filters: [] }, flag("file:"));
+    expect(on).toEqual({ text: "report", filters: [flag("file:")] });
+    expect(toggleFilter(on, flag("file:"))).toEqual({ text: "report", filters: [] });
+    expect(toggleFilter(on, flag("folder:"), ["file:"]).filters).toEqual([flag("folder:")]);
     expect(hasToken('a device:"Data (D:)" b', 'device:"Data (D:)"')).toBe(true);
+  });
+  it("takes a filter typed by hand out of the text", () => {
+    expect(toggleFilter({ text: "report file:", filters: [] }, flag("file:"))).toEqual({ text: "report", filters: [] });
+    expect(toggleFilter({ text: "folder: x", filters: [] }, flag("file:"), ["folder:"])).toEqual({
+      text: "x",
+      filters: [flag("file:")],
+    });
+  });
+  it("composes filters before the text, with several drives as alternatives", () => {
+    expect(composeQuery({ text: "report", filters: [] })).toBe("report");
+    expect(composeQuery({ text: "", filters: [flag("file:")] })).toBe("file:");
+    expect(composeQuery({ text: 'ab"', filters: [flag("file:"), drive("A"), drive("B")] })).toBe('drive:"A"|drive:"B" file: ab"');
+  });
+  it("names a folder filter after the folder", () => {
+    expect(folderFilter("D:\\Games\\Steam")).toEqual({
+      token: 'path:"D:\\Games\\Steam"',
+      kind: "folder",
+      label: "in Steam",
+      title: "D:\\Games\\Steam",
+    });
+    expect(folderFilter("D:\\").label).toBe("in D:");
   });
   it("derives highlight terms and segments", () => {
     expect(highlightTerms('report ext:pdf device:"Data (D:)" "annual budget"')).toEqual(["report", "annual budget"]);

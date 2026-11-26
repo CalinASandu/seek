@@ -9,3 +9,8 @@ app/src-tauri/gen/
 .superpowers/
 perf-results/
 app/src-tauri/binaries/
+docker/data
+docker/keys
+docker/tailscale
+docker/.env
+docker/dist

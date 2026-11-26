@@ -10,25 +10,30 @@ import { ResultsTable } from "./components/ResultsTable";
 import { SearchBar } from "./components/SearchBar";
 import { ServiceSetup } from "./components/ServiceSetup";
 import { SettingsPanel } from "./components/SettingsPanel";
-import { SpaceView } from "./components/space/SpaceView";
+import { CleanView } from "./components/clean/CleanView";
+import { SpaceView, type Tab } from "./components/space/SpaceView";
 import { Sidebar } from "./components/Sidebar";
 import { StatusBar } from "./components/StatusBar";
 import { TitleBar } from "./components/TitleBar";
 import { ViewSwitch, type View } from "./components/ViewSwitch";
 import { useDevices } from "./hooks/useDevices";
 import { useHotkeys } from "./hooks/useHotkeys";
+import { useMouseNav } from "./hooks/useMouseNav";
 import { useSearch } from "./hooks/useSearch";
 import { useSettings } from "./hooks/useSettings";
+import { useSpaceNav } from "./hooks/useSpaceNav";
 import { errText, remotePcNames } from "./lib/pcs";
-import { toggleToken } from "./lib/query";
+import { composeQuery, filterOn, folderFilter, toggleFilter, type Filter, type SearchInput } from "./lib/query";
 
 const SORT_KEYS: SortKey[] = ["name", "path", "size", "modified", "device"];
 const COLLAPSE_KEY = "seek.sidebarCollapsed";
 const VIEW_KEY = "seek.view";
+const NO_SEGS: string[] = [];
 
 function readView(): View {
   try {
-    return localStorage.getItem(VIEW_KEY) === "space" ? "space" : "search";
+    const v = localStorage.getItem(VIEW_KEY);
+    return v === "space" || v === "clean" ? v : "search";
   } catch {
     return "search";
   }
@@ -54,12 +59,15 @@ export function App({ api }: { api?: SeekApi }) {
 function Shell() {
   const api = useApi();
   const [service, setService] = useState<ServiceState>("connecting");
-  const [query, setQuery] = useState("");
+  const [input, setInput] = useState<SearchInput>({ text: "", filters: [] });
   const [sort, setSort] = useState<SortKey>("name");
   const [descending, setDescending] = useState(false);
   const [collapsed, setCollapsed] = useState(readCollapsed);
   const [view, setViewState] = useState<View>(readView);
-  const [spaceDevice, setSpaceDevice] = useState<string | null>(null);
+  const [spaceTab, setSpaceTab] = useState<Tab>("contents");
+  const nav = useSpaceNav();
+  // Decimator: the drive picked in the sidebar narrows Duplicates to it
+  const [cleanDevice, setCleanDevice] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState(false);
   const [showShare, setShowShare] = useState(false);
   const [showLink, setShowLink] = useState(false);
@@ -67,10 +75,35 @@ function Shell() {
   const inputRef = useRef<HTMLInputElement>(null);
   const scrollerRef = useRef<HTMLDivElement>(null);
   const toastTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  // Set by "Search in this folder": the back button returns to Space.
+  const backToSpace = useRef(false);
 
-  const { devices, status, progress, peers, refresh } = useDevices();
+  const { devices, status, progress, peers, hub, refresh } = useDevices();
   const remotePc = useMemo(() => remotePcNames(devices, peers), [devices, peers]);
-  const { settings, update } = useSettings();
+  const { settings, problem: settingsProblem, update } = useSettings();
+  // Both save first and only then change the list the rows are judged by, so a failed save never shows as protected.
+  // Each adds or removes relative to the list when its turn in the save queue comes, so quick choices all survive.
+  const protectPath = useCallback(
+    (path: string): Promise<void> =>
+      update(
+        (s) => (s.protectedPaths.some((p) => p.toLowerCase() === path.toLowerCase()) ? {} : { protectedPaths: [...s.protectedPaths, path] }),
+        { saveFirst: true },
+      ),
+    [update],
+  );
+  const unprotectPath = useCallback(
+    (entry: string): Promise<void> => update((s) => ({ protectedPaths: s.protectedPaths.filter((p) => p !== entry) }), { saveFirst: true }),
+    [update],
+  );
+  const scanDeviceIds = useMemo(
+    () => devices.filter((d) => !remotePc.has(d.id) && d.state !== "offline").map((d) => d.id),
+    [devices, remotePc],
+  );
+  const [cleanOpened, setCleanOpened] = useState(view === "clean");
+  useEffect(() => {
+    if (view === "clean") setCleanOpened(true);
+  }, [view]);
+  const query = useMemo(() => composeQuery(input), [input]);
   const search = useSearch(query, sort, descending);
 
   useEffect(() => {
@@ -83,10 +116,10 @@ function Shell() {
     };
   }, [api]);
 
-  const notify = useCallback((message: string) => {
+  const notify = useCallback((message: string, ms = 1800) => {
     setToast(message);
     clearTimeout(toastTimer.current);
-    toastTimer.current = setTimeout(() => setToast(null), 1800);
+    toastTimer.current = setTimeout(() => setToast(null), ms);
   }, []);
 
   const onSort = useCallback(
@@ -106,6 +139,7 @@ function Shell() {
   };
 
   const setView = useCallback((v: View) => {
+    backToSpace.current = false;
     setViewState(v);
     try {
       localStorage.setItem(VIEW_KEY, v);
@@ -114,6 +148,16 @@ function Shell() {
     }
   }, []);
 
+  const goBack = useCallback(() => {
+    if (document.querySelector('[role="dialog"]')) return;
+    if (view === "space") nav.step(-1);
+    else if (backToSpace.current) setView("space");
+  }, [nav.step, setView, view]);
+  const goForward = useCallback(() => {
+    if (view === "space" && !document.querySelector('[role="dialog"]')) nav.step(1);
+  }, [nav.step, view]);
+  useMouseNav(goBack, goForward);
+
   const hotkeys = useMemo(() => {
     const map: Record<string, () => void> = {
       "ctrl+f": () => {
@@ -121,11 +165,14 @@ function Shell() {
         setTimeout(focusSearch);
       },
       f5: search.refresh,
-      "ctrl+shift+s": () => setView(view === "space" ? "search" : "space"),
+      "ctrl+shift+s": () => (document.querySelector('[role="dialog"]') ? false : setView(view === "space" ? "search" : "space")),
+      "ctrl+shift+d": () => (document.querySelector('[role="dialog"]') ? false : setView(view === "clean" ? "search" : "clean")),
+      "alt+arrowleft": goBack,
+      "alt+arrowright": goForward,
     };
     if (view === "search") SORT_KEYS.forEach((k, i) => (map[`ctrl+${i + 1}`] = () => onSort(k)));
     return map;
-  }, [onSort, search.refresh, setView, view]);
+  }, [goBack, goForward, onSort, search.refresh, setView, view]);
   useHotkeys(hotkeys);
 
   const toggleCollapsed = () => {
@@ -139,8 +186,10 @@ function Shell() {
     });
   };
 
-  const applyToken = (token: string, exclusive?: string[]) => {
-    setQuery((q) => toggleToken(q, token, exclusive));
+  const setText = (text: string) => setInput((s) => ({ ...s, text }));
+
+  const applyFilter = (filter: Filter, exclusive?: string[]) => {
+    setInput((s) => toggleFilter(s, filter, exclusive));
     inputRef.current?.focus();
   };
 
@@ -160,14 +209,22 @@ function Shell() {
   const hasQuery = query.trim() !== "";
   // Space view: the chosen drive, else the first one of this PC that is online.
   const spaceDrive =
-    devices.find((d) => d.id === spaceDevice) ??
+    devices.find((d) => d.id === nav.spot.device) ??
     devices.find((d) => !remotePc.has(d.id) && d.state !== "offline") ??
     devices[0];
 
   const searchIn = (folder: string) => {
-    setQuery(`path:"${folder}" `);
+    setInput({ text: "", filters: [folderFilter(folder)] });
     setView("search");
+    backToSpace.current = true;
     setTimeout(() => inputRef.current?.focus());
+  };
+
+  const isFilterOn = (token: string) => filterOn(input, token);
+  // Errors are positioned in the composed query; the box shows only the typed end of it.
+  const typedError = search.error && {
+    ...search.error,
+    position: Math.max(0, search.error.position - (query.length - input.text.length)),
   };
 
   return (
@@ -177,23 +234,43 @@ function Shell() {
         devices={devices}
         progress={progress}
         peers={peers}
-        query={query}
+        hub={hub}
+        isFilterOn={isFilterOn}
         collapsed={collapsed}
         onCollapse={toggleCollapsed}
-        selectedDevice={view === "space" ? (spaceDrive?.id ?? null) : undefined}
-        onSelectDevice={(d) => setSpaceDevice(d.id)}
-        onToggleDevice={(t) => applyToken(t)}
+        selectedDevice={view === "space" ? (spaceDrive?.id ?? null) : view === "clean" ? cleanDevice : undefined}
+        onSelectDevice={(d) =>
+          view === "clean" ? setCleanDevice((cur) => (cur === d.id ? null : d.id)) : d.id !== spaceDrive?.id && nav.openDrive(d.id)
+        }
+        onToggleDevice={(f) => applyFilter(f)}
         onAddShare={() => setShowShare(true)}
         onLinkPc={() => setShowLink(true)}
         onOpenSettings={() => setShowSettings(true)}
         onChanged={() => void refresh()}
         notify={notify}
       />
-      {view === "space" ? (
+      {cleanOpened && (
+        <CleanView
+          active={view === "clean"}
+          deviceId={cleanDevice}
+          deviceName={devices.find((d) => d.id === cleanDevice)?.displayName ?? null}
+          scanDeviceIds={scanDeviceIds}
+          protectedPaths={settings.protectedPaths}
+          onProtect={protectPath}
+          onUnprotect={unprotectPath}
+          notify={notify}
+        />
+      )}
+      {view === "clean" ? null : view === "space" ? (
         <main className="main">
           {spaceDrive ? (
             <SpaceView
               device={spaceDrive}
+              segs={nav.spot.device === spaceDrive.id ? nav.spot.segs : NO_SEGS}
+              tab={spaceTab}
+              onTab={setSpaceTab}
+              onGo={nav.go}
+              onReplace={nav.replace}
               remotePc={remotePc.get(spaceDrive.id)}
               scanned={progress[spaceDrive.id]}
               notify={notify}
@@ -208,8 +285,8 @@ function Shell() {
       ) : (
       <main className="main">
         <div className="main-head">
-          <SearchBar value={query} onChange={setQuery} error={search.error} inputRef={inputRef} onArrowDown={focusGrid} />
-          <FilterChips query={query} onToggle={applyToken} />
+          <SearchBar value={input.text} onChange={setText} error={typedError} inputRef={inputRef} onArrowDown={focusGrid} />
+          <FilterChips filters={input.filters} isOn={isFilterOn} onToggle={applyFilter} />
         </div>
         <div className="main-body">
           {!hasQuery ? (
@@ -217,12 +294,12 @@ function Shell() {
               totalEntries={status?.totalEntries ?? 0}
               devices={devices.length}
               onPick={(q) => {
-                setQuery(q);
+                setText(q);
                 inputRef.current?.focus();
               }}
             />
           ) : search.active && search.total === 0 && !search.error ? (
-            <EmptyNone query={query} />
+            <EmptyNone query={input.text.trim() || input.filters.map((f) => f.label).join(", ")} />
           ) : search.active ? (
             <ResultsTable
               searchId={search.searchId}
@@ -250,6 +327,7 @@ function Shell() {
         devices={devices}
         progress={progress}
         peers={peers}
+        hub={hub}
       />
 
       {toast && (
@@ -263,9 +341,17 @@ function Shell() {
           settings={settings}
           version={status?.serviceVersion}
           peers={peers}
-          onChange={update}
+          hub={hub}
+          problem={settingsProblem}
+          onChange={(patch) => void update(patch).catch((e: unknown) => notify(errText(e)))}
           onSharing={(on) => void api.setSharing(on).catch((e: unknown) => notify(errText(e)))}
           onLinkPc={() => setShowLink(true)}
+          onUnlinkHub={(done) =>
+            void api.unlinkHub().then(
+              () => done && notify(done),
+              (e: unknown) => notify(errText(e)),
+            )
+          }
           onClose={() => setShowSettings(false)}
         />
       )}

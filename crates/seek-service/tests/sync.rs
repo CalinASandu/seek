@@ -1,222 +1,15 @@
 //! Linked PCs end to end: real services (pipe server, sync listener, sessions) over loopback, fake volumes.
 
-use std::net::{IpAddr, Ipv4Addr};
-use std::path::Path;
-use std::sync::{Arc, Mutex};
+mod common;
+
 use std::time::Duration;
 
-use seek_core::{
-    Change, Checkpoint, DeviceIdentity, DeviceIndex, DeviceKind, DeviceState, RawEntry, SortKey, ATTR_DIRECTORY,
-};
-use seek_ipc::{Client, Request, Response};
-use seek_scan::{Changed, DirWatcher, FollowError, ScanError, ScanResult, UsnFollower, VolumeInfo};
-use seek_service::access::Caller;
-use seek_service::peers::PeersRuntime;
-use seek_service::{Config, State, SyncConfig, VolumeSource};
+use common::*;
+use seek_core::{Change, DeviceState, RawEntry};
+use seek_scan::Changed;
+use seek_ipc::{Request, Response};
 use seek_sync::peers::PeerState;
-use tokio::net::windows::named_pipe::NamedPipeServer;
 
-const ENTRIES: u64 = 1000;
-const ME: &str = "S-1-5-21-me";
-
-/// `ENTRIES` entries: folders `folder1..10`, files `<prefix><id>.txt` spread over them.
-fn entries(prefix: &str) -> Vec<RawEntry> {
-    (1..=ENTRIES)
-        .map(|id| {
-            let dir = id <= 10;
-            RawEntry {
-                id,
-                parent_id: if dir { 0 } else { id % 10 + 1 },
-                name: if dir { format!("folder{id}") } else { format!("{prefix}{id}.txt") },
-                size: if dir { 0 } else { id },
-                modified: 1_700_000_000_000,
-                created: 1_700_000_000_000,
-                attrs: if dir { ATTR_DIRECTORY } else { 0 },
-            }
-        })
-        .collect()
-}
-
-fn volume(serial: u64) -> VolumeInfo {
-    VolumeInfo {
-        mount_point: "T:\\".into(),
-        identity: DeviceIdentity::Volume { serial, filesystem: "exFAT".into() },
-        label: "TESTSTICK".into(),
-        filesystem: "exFAT".into(),
-        kind: DeviceKind::Removable,
-        total_bytes: 1 << 30,
-        free_bytes: 1 << 29,
-    }
-}
-
-type OnChange = Box<dyn Fn(Changed) + Send>;
-
-struct Fake {
-    vols: Mutex<Vec<VolumeInfo>>,
-    prefix: String,
-    on_change: Mutex<Option<OnChange>>,
-    folder_changes: Mutex<Vec<Change>>,
-    /// The pipe client is this user (SID), elevated or not; `profiles` = (SID, folder).
-    sid: Mutex<String>,
-    elevated: Mutex<bool>,
-    profiles: Mutex<Vec<(String, String)>>,
-}
-
-impl Fake {
-    fn new(prefix: &str, vols: Vec<VolumeInfo>) -> Arc<Fake> {
-        Arc::new(Fake {
-            vols: Mutex::new(vols),
-            prefix: prefix.into(),
-            on_change: Mutex::new(None),
-            folder_changes: Mutex::new(Vec::new()),
-            sid: Mutex::new(ME.into()),
-            elevated: Mutex::new(false),
-            profiles: Mutex::new(Vec::new()),
-        })
-    }
-}
-
-impl VolumeSource for Fake {
-    fn list(&self) -> Vec<VolumeInfo> {
-        self.vols.lock().unwrap().clone()
-    }
-    fn scan(&self, _v: &VolumeInfo, progress: &(dyn Fn(u64) + Sync)) -> Result<ScanResult, ScanError> {
-        progress(ENTRIES);
-        Ok(ScanResult { index: DeviceIndex::from_raw(0, entries(&self.prefix)), checkpoint: None, skipped: 0 })
-    }
-    fn follow(&self, _v: &VolumeInfo, _cp: Checkpoint) -> Result<UsnFollower, FollowError> {
-        Err(FollowError::AccessDenied)
-    }
-    fn watch(&self, _v: &VolumeInfo, f: Box<dyn Fn(Changed) + Send>) -> Option<DirWatcher> {
-        *self.on_change.lock().unwrap() = Some(f);
-        None
-    }
-    fn rescan_dirs(
-        &self,
-        _v: &VolumeInfo,
-        _ix: &DeviceIndex,
-        _dirs: &[std::path::PathBuf],
-    ) -> Result<Vec<Change>, ScanError> {
-        Ok(std::mem::take(&mut *self.folder_changes.lock().unwrap()))
-    }
-    fn caller(&self, _pipe: &NamedPipeServer) -> Caller {
-        Caller { elevated: *self.elevated.lock().unwrap(), sid: self.sid.lock().unwrap().clone() }
-    }
-    fn profiles(&self) -> Vec<(String, String)> {
-        self.profiles.lock().unwrap().clone()
-    }
-}
-
-struct Pc {
-    pipe: String,
-    state: Arc<State>,
-    stop: tokio::sync::watch::Sender<bool>,
-    task: tokio::task::JoinHandle<anyhow::Result<()>>,
-}
-
-impl Pc {
-    fn rt(&self) -> &Arc<PeersRuntime> {
-        self.state.peers_rt.get().expect("sync is enabled")
-    }
-    fn id(&self) -> uuid::Uuid {
-        self.state.host_id()
-    }
-    fn addr(&self) -> String {
-        self.rt().local_addr().to_string()
-    }
-    fn peer_state(&self, other: &Pc) -> Option<PeerState> {
-        self.state.peers.lock().unwrap().get(other.id()).map(|p| p.state)
-    }
-    fn connected_to(&self, other: &Pc) -> bool {
-        self.state.connected.lock().unwrap().contains(&other.id())
-    }
-    async fn stop(self) {
-        let _ = self.stop.send(true);
-        let _ = self.task.await;
-    }
-    /// A pipe client (the caller's SID/elevation are read from the fake when it connects).
-    async fn client(&self) -> Client {
-        for _ in 0..100 {
-            if let Ok(c) = Client::connect_to(&self.pipe).await {
-                return c;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        panic!("service did not start");
-    }
-}
-
-async fn devices(c: &mut Client) -> Vec<seek_core::Device> {
-    match c.request(Request::ListDevices).await.unwrap() {
-        Response::Devices { devices } => devices,
-        other => panic!("{other:?}"),
-    }
-}
-
-async fn wait_devices(c: &mut Client, what: &str, pred: impl Fn(&[seek_core::Device]) -> bool) {
-    for _ in 0..300 {
-        if pred(&devices(c).await) {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!("timed out waiting for {what}");
-}
-
-/// `(search id, total)` of a search.
-async fn search(c: &mut Client, q: &str) -> (u64, u64) {
-    let r = c.request(Request::Search { query: q.into(), sort: SortKey::Name, descending: false }).await.unwrap();
-    match r {
-        Response::SearchStarted { search_id, total, .. } => (search_id, total),
-        other => panic!("search {q:?}: {other:?}"),
-    }
-}
-
-/// `guest` joins `host`'s group through the pipe API (as the app does).
-async fn link_via_pipe(host: &Pc, guest: &Pc) {
-    let code = match host.client().await.request(Request::StartPairing).await.unwrap() {
-        Response::PairingCode { code, .. } => code,
-        other => panic!("{other:?}"),
-    };
-    let r = guest.client().await.request(Request::JoinPairing { addr: host.addr(), code }).await.unwrap();
-    assert_eq!(r, Response::Ok);
-}
-
-async fn start(dir: &Path, name: &str, fake: Arc<Fake>) -> Pc {
-    let pipe = format!(r"\\.\pipe\seek-sync-test-{}", uuid::Uuid::new_v4());
-    let (stop, rx) = tokio::sync::watch::channel(false);
-    let cfg = Config {
-        data_dir: dir.to_path_buf(),
-        pipe_name: pipe.clone(),
-        sync: Some(SyncConfig {
-            bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
-            port: 0,
-            mdns: false,
-            name: name.into(),
-            interval: Duration::from_secs(1),
-        }),
-    };
-    let (tx, ready) = tokio::sync::oneshot::channel();
-    let task = tokio::spawn(seek_service::run_with(cfg, fake, rx, Some(tx)));
-    let state = ready.await.expect("service started");
-    Pc { pipe, state, stop, task }
-}
-
-async fn wait(what: &str, pred: impl Fn() -> bool) {
-    for _ in 0..1500 {
-        if pred() {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    panic!("timed out waiting for {what}");
-}
-
-/// `guest` joins `host`'s group.
-async fn link(host: &Pc, guest: &Pc) {
-    let code = host.rt().start_pairing(ME);
-    guest.rt().join(&host.addr(), &code.code, ME).await.expect("pairing succeeds");
-}
 
 #[tokio::test(flavor = "multi_thread")]
 async fn pairing_with_the_right_code_links_both_pcs() {
@@ -243,6 +36,62 @@ async fn pairing_with_the_right_code_links_both_pcs() {
     wait("a session", || a.connected_to(&b) && b.connected_to(&a)).await;
     // the code was used up
     assert!(b.rt().join(&a.addr(), &code.code, ME).await.is_err());
+    a.stop().await;
+    b.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_host_has_saved_the_link_before_the_guest_hears_back() {
+    use seek_sync::noise::Keys;
+    use seek_sync::pairing::{pair_guest, PairInfo};
+    use seek_sync::peers::key_to_b64;
+    use seek_sync::Role;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let da = tempfile::tempdir().unwrap();
+    let a = start(da.path(), "A", Fake::new("a", vec![])).await;
+    let code = a.rt().start_pairing(ME);
+    let guest = PairInfo {
+        host_id: uuid::Uuid::new_v4(),
+        name: "Guest".into(),
+        public_key: key_to_b64(&Keys::generate().public),
+        user_sid: ME.into(),
+        members: vec![],
+        port: 1,
+        role: Role::Pc,
+        addrs: vec![],
+        user_name: String::new(),
+    };
+    let mut io = tokio::net::TcpStream::connect(a.addr()).await.unwrap();
+    io.write_all(b"P").await.unwrap();
+    assert_eq!(io.read_u8().await.unwrap(), 1, "the host is showing a code");
+    pair_guest(&mut io, &code.code, &guest).await.unwrap();
+    assert!(
+        a.state.peers.lock().unwrap().get(guest.host_id).is_some(),
+        "a guest that dials the moment it hears back must find itself linked"
+    );
+    a.stop().await;
+}
+
+/// A PC can dial one that does not know it yet: the other side of a pairing still saving it, or a group member not
+/// yet told about a PC that joined through another. Being told "unlinked" then would break a link nobody removed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pc_nobody_unlinked_is_not_told_it_was() {
+    let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let a = start(da.path(), "A", Fake::new("a", vec![])).await;
+    let b = start(db.path(), "B", Fake::new("b", vec![])).await;
+    link(&a, &b).await;
+    wait("a session", || a.connected_to(&b)).await;
+    let b_id = b.id();
+    b.stop().await;
+    wait("session gone", || !a.state.connected.lock().unwrap().contains(&b_id)).await;
+
+    // A does not know B, and never removed it
+    a.state.peers.lock().unwrap().remove(b_id);
+    let b = start(db.path(), "B", Fake::new("b", vec![])).await;
+    // long enough for B to dial as either the lower or the higher host id (2 × the 1 s interval)
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert_eq!(b.peer_state(&a), Some(PeerState::Linked), "B keeps the link and tries again later");
     a.stop().await;
     b.stop().await;
 }

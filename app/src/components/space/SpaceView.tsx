@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState, type KeyboardEvent } from "react";
+import { useEffect, useMemo, useState, type KeyboardEvent } from "react";
 import { ClipboardCopy, FolderOpen, Search } from "lucide-react";
 import { useApi } from "../../api/context";
 import type { Device, SpaceNode } from "../../api/types";
@@ -6,6 +6,7 @@ import { useSpaceQuery } from "../../hooks/useSpaceQuery";
 import { formatInt, formatRelative, formatSize } from "../../lib/format";
 import { kindOf, layoutSunburst, type Arc } from "../../lib/sunburst";
 import { ContextMenu, type MenuItem } from "../ContextMenu";
+import { Segmented } from "../Segmented";
 import { CapacityBar } from "./CapacityBar";
 import { LargestList } from "./LargestList";
 import { PathBar } from "./PathBar";
@@ -15,7 +16,7 @@ import { TypeList } from "./TypeList";
 
 const RINGS = 3;
 const GONE = "That folder no longer exists";
-type Tab = "contents" | "largest" | "types";
+export type Tab = "contents" | "largest" | "types";
 const TABS: { id: Tab; label: string }[] = [
   { id: "contents", label: "Contents" },
   { id: "largest", label: "Largest" },
@@ -24,6 +25,14 @@ const TABS: { id: Tab; label: string }[] = [
 
 interface Props {
   device: Device;
+  /** Folders below the drive root; kept by the shell so history survives leaving the view. */
+  segs: string[];
+  tab: Tab;
+  onTab: (tab: Tab) => void;
+  /** Move to a folder (a new history step). */
+  onGo: (device: string, segs: string[]) => void;
+  /** Correct the current place without adding a step. */
+  onReplace: (device: string, segs: string[]) => void;
   /** Name of the linked PC the drive belongs to; undefined for this PC's drives. */
   remotePc: string | undefined;
   scanned: number | undefined;
@@ -39,12 +48,9 @@ export function folderPath(mount: string, segs: string[]): string {
 
 type Menu = { x: number; y: number; path: string; folder: boolean };
 
-export function SpaceView({ device, remotePc, scanned, notify, onSearchIn }: Props) {
+export function SpaceView({ device, segs, tab, onTab, onGo, onReplace, remotePc, scanned, notify, onSearchIn }: Props) {
   const api = useApi();
-  const [where, setWhere] = useState<Record<string, string[]>>({});
-  const segs = useMemo(() => where[device.id] ?? [], [where, device.id]);
-  const setSegs = useCallback((s: string[]) => setWhere((w) => ({ ...w, [device.id]: s })), [device.id]);
-  const [tab, setTab] = useState<Tab>("contents");
+  const setSegs = (s: string[]) => onGo(device.id, s);
   const [hover, setHover] = useState<string | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
   const [menu, setMenu] = useState<Menu | null>(null);
@@ -63,9 +69,9 @@ export function SpaceView({ device, remotePc, scanned, notify, onSearchIn }: Pro
   useEffect(() => {
     if (tree.error === GONE && tree.errorKey === key && segs.length > 0) {
       notify(GONE);
-      setSegs(segs.slice(0, -1));
+      onReplace(device.id, segs.slice(0, -1));
     }
-  }, [tree.error, tree.errorKey, key, segs, setSegs, notify]);
+  }, [tree.error, tree.errorKey, key, segs, device.id, onReplace, notify]);
 
   useEffect(() => {
     setHover(null);
@@ -119,7 +125,7 @@ export function SpaceView({ device, remotePc, scanned, notify, onSearchIn }: Pro
     setMenu({ x, y, path: folderPath(path, [n.name]), folder: kindOf(n) === "folder" });
 
   const onKey = (e: KeyboardEvent) => {
-    if (e.key === "Backspace" || e.key === "ArrowLeft" || (e.altKey && e.key === "ArrowUp")) {
+    if (e.key === "Backspace" || (e.key === "ArrowLeft" && !e.altKey) || (e.altKey && e.key === "ArrowUp")) {
       if (shownSegs.length === 0) return;
       e.preventDefault();
       up();
@@ -194,14 +200,7 @@ export function SpaceView({ device, remotePc, scanned, notify, onSearchIn }: Pro
 
         <aside className="space-side" aria-label="Details">
           <div className="space-tabs">
-            <div className="segctl is-small" role="tablist" aria-label="Show" data-index={TABS.findIndex((t) => t.id === tab)}>
-              <span className="segctl-thumb" aria-hidden="true" />
-              {TABS.map((t) => (
-                <button key={t.id} role="tab" aria-selected={tab === t.id} className="segment" onClick={() => setTab(t.id)}>
-                  {t.label}
-                </button>
-              ))}
-            </div>
+            <Segmented items={TABS} value={tab} onChange={onTab} label="Show" kind="tab" className="is-small" />
           </div>
           <div className="space-panel">
             {tab === "contents" &&

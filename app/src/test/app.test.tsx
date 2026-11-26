@@ -3,7 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import { App } from "../App";
 import { createMockApi } from "../api/mock";
-import type { SeekApi } from "../api/types";
+import type { HubStatus, SeekApi } from "../api/types";
 
 function makeApi(over: Partial<SeekApi> = {}): SeekApi {
   return { ...createMockApi({ rowCount: 4000, latency: [0, 0], state: "connected" }), ...over };
@@ -136,20 +136,91 @@ describe("Seek app", () => {
     expect(await screen.findByText(/2 devices/)).toBeInTheDocument();
   });
 
+  it("keeps drives of an unlinked former LAN PC out of this device's group", async () => {
+    const base = makeApi();
+    const ghost = { ...(await base.listDevices())[0]!, id: "dev-ghost", displayName: "Ghost disk", indexedByHost: "host-ghost" };
+    render(<App api={{ ...base, listDevices: async () => [...(await base.listDevices()), ghost] }} />);
+    const other = await screen.findByRole("group", { name: "Other devices" });
+    expect(within(other).getByRole("button", { name: /Ghost disk/ })).toBeInTheDocument();
+    expect(within(other).getByText("Not linked · offline")).toBeInTheDocument();
+    expect(within(screen.getByRole("group", { name: "DESKTOP" })).queryByRole("button", { name: /Ghost disk/ })).toBeNull();
+    // no PC menu for it, and "Forget drive" stays the way to clean up
+    fireEvent.contextMenu(within(other).getByRole("button", { name: /Other devices/ }));
+    expect(screen.queryByRole("menuitem", { name: /Sync now/ })).toBeNull();
+  });
+
+  it("offers neither Rename nor Unlink for the hub's PCs", async () => {
+    const api = createMockApi({ rowCount: 4000, latency: [0, 0], state: "connected", hub: true });
+    render(<App api={api} />);
+    const laptop = await screen.findByRole("group", { name: "Laptop" });
+    fireEvent.contextMenu(within(laptop).getByRole("button", { name: /Laptop/ }));
+    expect(await screen.findByRole("menuitem", { name: /Sync now/ })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: /Rename/ })).toBeNull();
+    expect(screen.queryByRole("menuitem", { name: /Unlink/ })).toBeNull();
+  });
+
   it("selects one of two same-named drives on different devices, not both", async () => {
     const user = userEvent.setup();
     render(<App api={makeApi()} />);
     const laptop = await screen.findByRole("group", { name: "Laptop" });
     const desktop = screen.getByRole("group", { name: "DESKTOP" });
     await user.click(within(laptop).getByRole("button", { name: /System \(C:\), online/ }));
-    expect(screen.getByRole("searchbox")).toHaveValue('drive:"Laptop/System (C:)" ');
+    expect(screen.getByRole("searchbox")).toHaveValue("");
+    expect(screen.getByRole("button", { name: "Remove filter Laptop › System (C:)" })).toBeInTheDocument();
     await waitFor(() =>
       expect(within(laptop).getByRole("button", { name: /System \(C:\), online/ })).toHaveAttribute("aria-pressed", "true"),
     );
     expect(within(desktop).getByRole("button", { name: /System \(C:\), online/ })).toHaveAttribute("aria-pressed", "false");
     // a name only one drive has stays short
     await user.click(within(desktop).getByRole("button", { name: /^Data \(D:\)/ }));
-    expect(screen.getByRole("searchbox")).toHaveValue('drive:"Laptop/System (C:)" drive:"Data (D:)" ');
+    await waitFor(() => expect(screen.getByRole("button", { name: "Remove filter Data (D:)" })).toBeInTheDocument());
+  });
+
+  it("keeps filters out of the search box and adds them to what is searched", async () => {
+    const base = makeApi();
+    const search = vi.fn(base.search);
+    const user = userEvent.setup();
+    render(<App api={{ ...base, search }} />);
+    const box = await screen.findByRole("searchbox");
+    await user.type(box, "report");
+    await user.click(screen.getByRole("button", { name: "Files" }));
+    await user.click(screen.getByRole("button", { name: /^Data \(D:\)/ }));
+    await user.click(screen.getByRole("button", { name: /^NAS media/ }));
+    expect(box).toHaveValue("report");
+    expect(screen.getByRole("button", { name: "Files" })).toHaveAttribute("aria-pressed", "true");
+    await waitFor(() =>
+      expect(search).toHaveBeenLastCalledWith('drive:"Data (D:)"|drive:"NAS media" file: report', "name", false),
+    );
+
+    await user.click(screen.getByRole("button", { name: "Remove filter NAS media" }));
+    await waitFor(() => expect(search).toHaveBeenLastCalledWith('drive:"Data (D:)" file: report', "name", false));
+
+    // clearing the box leaves the filters on
+    await user.click(screen.getByRole("button", { name: "Clear search" }));
+    await waitFor(() => expect(search).toHaveBeenLastCalledWith('drive:"Data (D:)" file:', "name", false));
+    expect(screen.getByRole("button", { name: "Remove filter Data (D:)" })).toBeInTheDocument();
+  });
+
+  it("turns off a filter that was typed by hand", async () => {
+    const user = userEvent.setup();
+    render(<App api={makeApi()} />);
+    const box = await screen.findByRole("searchbox");
+    await user.type(box, "report file:");
+    await user.click(screen.getByRole("button", { name: "Folders" }));
+    expect(box).toHaveValue("report");
+    expect(screen.getByRole("button", { name: "Folders" })).toHaveAttribute("aria-pressed", "true");
+  });
+
+  it("points a parse error at the typed text, past the filters", async () => {
+    const q = 'file: ab"';
+    const api = makeApi({ search: async () => ({ ok: false, message: "unclosed quote", position: q.indexOf('"') }) });
+    const user = userEvent.setup();
+    render(<App api={api} />);
+    await user.click(await screen.findByRole("button", { name: "Files" }));
+    await user.type(screen.getByRole("searchbox"), 'ab"');
+    expect(await screen.findByRole("alert")).toHaveTextContent("unclosed quote");
+    // the caret sits under the quote: 2 typed characters in, not 8
+    expect(document.querySelector<HTMLElement>(".search-caret")?.style.left).toBe("57px");
   });
 
   it("shows a pairing code in the Link a device dialog (sidebar button)", async () => {
@@ -159,6 +230,25 @@ describe("Seek app", () => {
     const dialog = await screen.findByRole("dialog", { name: "Link a device" });
     expect(await within(dialog).findByText("482 913")).toBeInTheDocument();
     expect(within(dialog).getByText(/Valid for [12]:\d\d · works once/)).toBeInTheDocument();
+  });
+
+  it("uses the shared selector for Settings' theme and the Link dialog's tabs", async () => {
+    const user = userEvent.setup();
+    render(<App api={makeApi()} />);
+    await user.click(await screen.findByRole("button", { name: "Settings" }));
+    const settings = await screen.findByRole("dialog", { name: "Settings" });
+    const theme = within(settings).getByRole("radiogroup", { name: "Theme" });
+    expect(theme).toHaveClass("seg");
+    const radios = within(theme).getAllByRole("radio");
+    expect(radios.map((r) => r.textContent)).toEqual(["System", "Light", "Dark"]);
+    for (const r of radios) expect(r.querySelector("svg")).not.toBeNull();
+
+    await user.click(within(settings).getByRole("button", { name: /Link a device/ }));
+    const dialog = await screen.findByRole("dialog", { name: "Link a device" });
+    const tabs = within(dialog).getByRole("tablist", { name: "How to link" });
+    expect(tabs).toHaveClass("seg", "is-block");
+    expect(within(tabs).getAllByRole("tab").map((t) => t.textContent)).toEqual(["Show a code", "Enter a code", "Hub"]);
+    expect(document.querySelector(".segmented, .link-tabs")).toBeNull();
   });
 
   it("links with a discovered PC by entering its code", async () => {
@@ -212,5 +302,115 @@ describe("Seek app", () => {
     });
     expect(within(menu).getByRole("menuitem", { name: /^Open(?! containing)/ })).toBeDisabled();
     expect(within(menu).getByRole("menuitem", { name: /Copy path/ })).toBeEnabled();
+  });
+
+  const HUB: HubStatus = {
+    name: "Home Hub",
+    addr: "tls://seek-hub.example.ts.net",
+    online: true,
+    lastSyncMs: Date.now() - 20_000,
+    lastError: null,
+    pcs: [
+      { hostId: "host-laptop", name: "Laptop", online: true, lastSyncMs: Date.now() - 60_000, needsRelink: false },
+      { hostId: "host-office", name: "Office-PC", online: false, lastSyncMs: Date.now() - 3 * 3_600_000, needsRelink: false },
+    ],
+  };
+
+  it("link hub tab validates 8-digit code", async () => {
+    const base = makeApi();
+    const linkHub = vi.fn(base.linkHub);
+    const user = userEvent.setup();
+    render(<App api={{ ...base, linkHub }} />);
+    await user.click(await screen.findByRole("button", { name: "Link a device" }));
+    const dialog = await screen.findByRole("dialog", { name: "Link a device" });
+    await user.click(within(dialog).getByRole("tab", { name: "Hub" }));
+    expect(within(dialog).getByText(/Run `seek-hub link` on the hub to get a code\./)).toBeInTheDocument();
+    const addr = within(dialog).getByLabelText("Hub address");
+    expect(addr).toHaveAttribute("placeholder", "tls://seek-hub.your-tailnet.ts.net");
+    const code = within(dialog).getByLabelText("Code");
+    const link = within(dialog).getByRole("button", { name: "Link hub" });
+    await user.type(addr, "tls://seek-hub.example.ts.net");
+    await user.type(code, "8765432");
+    expect(link).toBeDisabled();
+    await user.type(code, "1");
+    expect(code).toHaveValue("8765 4321");
+    expect(link).toBeEnabled();
+
+    // direct links exist (the Laptop): the user confirms first
+    await user.click(link);
+    expect(within(dialog).getByText(/Linking to a hub replaces your direct links with 1 PC\./)).toBeInTheDocument();
+    expect(linkHub).not.toHaveBeenCalled();
+    await user.click(within(dialog).getByRole("button", { name: "Link hub" }));
+    expect(await within(dialog).findByRole("alert")).toHaveTextContent(
+      "That code didn't match. Run `seek-hub link` again for a new code.",
+    );
+
+    await user.clear(within(dialog).getByLabelText("Code"));
+    await user.type(within(dialog).getByLabelText("Code"), "12345678");
+    await user.click(within(dialog).getByRole("button", { name: "Link hub" }));
+    await user.click(within(dialog).getByRole("button", { name: "Link hub" }));
+    await waitFor(() => expect(linkHub).toHaveBeenLastCalledWith("tls://seek-hub.example.ts.net", "12345678"));
+    expect(await within(dialog).findByText("Linked with Home Hub")).toBeInTheDocument();
+  });
+
+  it("explains a hub that is closed or untrusted", async () => {
+    const user = userEvent.setup();
+    const fail = (msg: string) => makeApi({ listPeers: async () => ({ ...(await makeApi().listPeers()), peers: [] }), linkHub: async () => Promise.reject(msg) });
+    for (const [msg, shown] of [
+      ["[hub:no-window] the hub is not showing a code", "The hub isn't accepting links right now. Run `seek-hub link` on the hub."],
+      ["[hub:untrusted] Hub address not trusted (x)", "The hub's certificate isn't valid for that address."],
+      ["could not reach tls://x: timed out", "could not reach tls://x: timed out"],
+    ] as const) {
+      const { unmount } = render(<App api={fail(msg)} />);
+      await user.click(await screen.findByRole("button", { name: "Link a device" }));
+      const dialog = await screen.findByRole("dialog", { name: "Link a device" });
+      await user.click(within(dialog).getByRole("tab", { name: "Hub" }));
+      await user.type(within(dialog).getByLabelText("Hub address"), "tls://h.example");
+      await user.type(within(dialog).getByLabelText("Code"), "12345678");
+      await user.click(within(dialog).getByRole("button", { name: "Link hub" }));
+      expect(await within(dialog).findByRole("alert")).toHaveTextContent(shown);
+      unmount();
+    }
+  });
+
+  it("settings shows hub card and hides LAN link", async () => {
+    const unlinkHub = vi.fn(async () => {});
+    const user = userEvent.setup();
+    render(<App api={makeApi({ hubStatus: async () => HUB, unlinkHub })} />);
+    await user.click(await screen.findByRole("button", { name: "Settings" }));
+    const settings = await screen.findByRole("dialog", { name: "Settings" });
+    expect(await within(settings).findByText("Hub · Home Hub")).toBeInTheDocument();
+    expect(within(settings).getByText("synced just now")).toBeInTheDocument();
+    expect(within(settings).getByText("Office-PC")).toBeInTheDocument();
+    expect(within(settings).queryByRole("button", { name: /Link a device/ })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Link a device" })).toBeNull();
+    await user.click(within(settings).getByRole("button", { name: "Unlink hub" }));
+    expect(unlinkHub).not.toHaveBeenCalled();
+    const confirm = await screen.findByRole("dialog", { name: /Unlink Home Hub\?/ });
+    await user.click(within(confirm).getByRole("button", { name: "Unlink hub" }));
+    await waitFor(() => expect(unlinkHub).toHaveBeenCalledOnce());
+  });
+
+  it("shows the hub's unlink notice in Settings and dismisses it", async () => {
+    const unlinkHub = vi.fn(async () => {});
+    const gone: HubStatus = { ...HUB, online: false, lastSyncMs: 0, lastError: "The hub unlinked this PC", pcs: [], unlinked: true };
+    const user = userEvent.setup();
+    render(<App api={makeApi({ hubStatus: async () => gone, unlinkHub })} />);
+    await user.click(await screen.findByRole("button", { name: "Settings" }));
+    const settings = await screen.findByRole("dialog", { name: "Settings" });
+    expect(await within(settings).findByText("The hub unlinked this PC")).toBeInTheDocument();
+    await user.click(within(settings).getByRole("button", { name: "Dismiss" }));
+    await waitFor(() => expect(unlinkHub).toHaveBeenCalledOnce());
+  });
+
+  it("status bar shows hub sync", async () => {
+    const seg = (text: string) => (_: string, el: Element | null) =>
+      !!el?.classList.contains("status-seg") && el.textContent?.trim() === text;
+    const { unmount } = render(<App api={makeApi({ hubStatus: async () => HUB })} />);
+    expect(await screen.findByText(seg("Hub · synced just now"))).toBeInTheDocument();
+    unmount();
+    const off: HubStatus = { ...HUB, online: false, lastSyncMs: Date.now() - 3 * 3_600_000 };
+    render(<App api={makeApi({ hubStatus: async () => off })} />);
+    expect(await screen.findByText(seg("Hub offline · synced 3 h ago"))).toBeInTheDocument();
   });
 });

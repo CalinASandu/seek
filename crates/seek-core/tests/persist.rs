@@ -193,3 +193,13 @@ fn level_one_encoding_roundtrips_and_changes_serialize() {
     let json = serde_json::to_string(&change).unwrap();
     assert_eq!(serde_json::from_str::<Change>(&json).unwrap(), change);
 }
+
+#[test]
+fn body_larger_than_the_limit_is_refused() {
+    let bytes = encode_index(&hdr(), &mut sample()).unwrap();
+    assert!(decode_index_limited(&bytes, 1 << 20).is_ok());
+    match decode_index_limited(&bytes, 16) {
+        Err(Error::Format(m)) => assert!(m.contains("larger than 16"), "{m}"),
+        other => panic!("unexpected: {other:?}"),
+    }
+}

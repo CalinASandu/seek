@@ -16,10 +16,10 @@ import {
   TriangleAlert,
 } from "lucide-react";
 import { useApi } from "../api/context";
-import type { Device, PcSummary, Peers } from "../api/types";
+import type { Device, HubStatus, PcSummary, Peers } from "../api/types";
 import { formatRelative } from "../lib/format";
-import { errText, hasPeers } from "../lib/pcs";
-import { driveToken, hasToken } from "../lib/query";
+import { errText, hasPeers, inHubMode, OTHER_DEVICES } from "../lib/pcs";
+import { driveToken, type Filter } from "../lib/query";
 import { ContextMenu, type MenuItem } from "./ContextMenu";
 import { Dialog } from "./Dialog";
 import { DeviceItem } from "./DeviceItem";
@@ -28,13 +28,15 @@ interface Props {
   devices: Device[];
   progress: Record<string, number>;
   peers: Peers | null;
-  query: string;
+  /** While a hub is set, PCs come from the hub: no direct links. */
+  hub: HubStatus | null;
+  isFilterOn: (token: string) => boolean;
   collapsed: boolean;
   onCollapse: () => void;
   /** Space view: the drive shown (clicking a drive selects it instead of filtering the search). */
   selectedDevice?: string | null;
   onSelectDevice: (d: Device) => void;
-  onToggleDevice: (token: string) => void;
+  onToggleDevice: (filter: Filter) => void;
   onAddShare: () => void;
   onLinkPc: () => void;
   onOpenSettings: () => void;
@@ -45,10 +47,14 @@ interface Props {
 interface Group {
   pc: PcSummary;
   self: boolean;
+  /** Drives of a PC that is no longer (or never was) linked, e.g. a former LAN PC that did not join the hub. */
+  other?: boolean;
   devices: Device[];
 }
 
 type Menu = { x: number; y: number } & ({ device: Device } | { pc: PcSummary });
+
+const OTHER_SUB = "Not linked · offline";
 
 export function syncedText(pc: PcSummary): string {
   if (pc.needsRelink) return "Needs re-linking";
@@ -59,10 +65,21 @@ export function syncedText(pc: PcSummary): string {
 /** Drives by device (PC): this device first, then each linked one (null when none is linked: a flat list). */
 function groupDevices(devices: Device[], peers: Peers | null): Group[] | null {
   if (!hasPeers(peers)) return null;
-  const linked = new Set(peers.peers.map((p) => p.hostId));
+  const known = new Set([peers.thisPc.hostId, ...peers.peers.map((p) => p.hostId)]);
+  const others = new Map<string, Device[]>();
+  for (const d of devices) {
+    if (!known.has(d.indexedByHost)) others.set(d.indexedByHost, [...(others.get(d.indexedByHost) ?? []), d]);
+  }
   return [
-    { pc: peers.thisPc, self: true, devices: devices.filter((d) => !linked.has(d.indexedByHost)) },
+    { pc: peers.thisPc, self: true, devices: devices.filter((d) => d.indexedByHost === peers.thisPc.hostId) },
     ...peers.peers.map((pc) => ({ pc, self: false, devices: devices.filter((d) => d.indexedByHost === pc.hostId) })),
+    // copies of a PC that is not linked: offline, kept until the user forgets the drives
+    ...[...others].map(([hostId, devs]) => ({
+      pc: { hostId, name: OTHER_DEVICES, online: false, lastSyncMs: 0, needsRelink: false },
+      self: false,
+      other: true,
+      devices: devs,
+    })),
   ];
 }
 
@@ -88,11 +105,10 @@ export function Sidebar(p: Props) {
     const k = d.displayName.toLowerCase();
     nameCount.set(k, (nameCount.get(k) ?? 0) + 1);
   }
-  const tokenFor = (d: Device) =>
-    driveToken(
-      d.displayName,
-      (nameCount.get(d.displayName.toLowerCase()) ?? 0) > 1 ? pcNames.get(d.indexedByHost) : undefined,
-    );
+  const filterFor = (d: Device): Filter => {
+    const pc = (nameCount.get(d.displayName.toLowerCase()) ?? 0) > 1 ? pcNames.get(d.indexedByHost) : undefined;
+    return { token: driveToken(d.displayName, pc), kind: "drive", label: pc ? `${pc} › ${d.displayName}` : d.displayName };
+  };
 
   const commitRename = async (d: Device, name: string) => {
     setRenaming(null);
@@ -128,10 +144,10 @@ export function Sidebar(p: Props) {
       device={d}
       scanned={p.progress[d.id]}
       collapsed={p.collapsed}
-      active={p.selectedDevice !== undefined ? p.selectedDevice === d.id : hasToken(p.query, tokenFor(d))}
+      active={p.selectedDevice !== undefined ? p.selectedDevice === d.id : p.isFilterOn(filterFor(d).token)}
       renaming={renaming === d.id}
       note={deviceNote(d)}
-      onToggle={() => (p.selectedDevice !== undefined ? p.onSelectDevice(d) : p.onToggleDevice(tokenFor(d)))}
+      onToggle={() => (p.selectedDevice !== undefined ? p.onSelectDevice(d) : p.onToggleDevice(filterFor(d)))}
       onContextMenu={(pt) => setMenu({ ...pt, device: d })}
       onRename={() => !isRemote(d) && setRenaming(d.id)}
       onRenameCommit={(n) => void commitRename(d, n)}
@@ -180,15 +196,21 @@ export function Sidebar(p: Props) {
 
   const pcMenu = (pc: PcSummary): MenuItem[] => [
     { id: "sync", label: "Sync now", icon: <RefreshCw size={14} />, disabled: !pc.online, onSelect: syncNow },
-    { id: "rename", label: "Rename…", icon: <Pencil size={14} />, onSelect: () => setRenamingPc(pc) },
-    {
-      id: "unlink",
-      label: "Unlink…",
-      icon: <Link2Off size={14} />,
-      danger: true,
-      separatorBefore: true,
-      onSelect: () => setUnlinking(pc),
-    },
+    // In hub mode every PC in the list came from the hub's catalog (enter_hub_mode keeps only those, and the
+    // service refuses to rename or unlink them): the hub owns their names and links.
+    ...(inHubMode(p.hub)
+      ? []
+      : [
+          { id: "rename", label: "Rename…", icon: <Pencil size={14} />, onSelect: () => setRenamingPc(pc) },
+          {
+            id: "unlink",
+            label: "Unlink…",
+            icon: <Link2Off size={14} />,
+            danger: true,
+            separatorBefore: true,
+            onSelect: () => setUnlinking(pc),
+          },
+        ]),
   ];
 
   const renderGroup = (g: Group) => {
@@ -196,18 +218,18 @@ export function Sidebar(p: Props) {
     if (p.collapsed) {
       return (
         <div key={g.pc.hostId} className="pc-group" role="group" aria-label={g.pc.name}>
-          {!g.self && <div className="pc-sep" title={`${g.pc.name} · ${syncedText(g.pc)}`} />}
+          {!g.self && <div className="pc-sep" title={`${g.pc.name} · ${g.other ? OTHER_SUB : syncedText(g.pc)}`} />}
           {g.devices.map(renderDevice)}
         </div>
       );
     }
     const onContext = (e: MouseEvent) => {
-      if (g.self) return;
+      if (g.self || g.other) return;
       e.preventDefault();
       setMenu({ x: e.clientX, y: e.clientY, pc: g.pc });
     };
     const onKey = (e: KeyboardEvent) => {
-      if (g.self) return;
+      if (g.self || g.other) return;
       if (e.key === "ContextMenu" || (e.shiftKey && e.key === "F10")) {
         e.preventDefault();
         const r = e.currentTarget.getBoundingClientRect();
@@ -235,7 +257,7 @@ export function Sidebar(p: Props) {
             <span className={`dot dot-${g.pc.online ? "online" : "offline"}`} aria-label={g.pc.online ? "online" : "offline"} />
           )}
         </button>
-        {!g.self && !g.pc.needsRelink && <div className="pc-sub">{syncedText(g.pc)}</div>}
+        {!g.self && !g.pc.needsRelink && <div className="pc-sub">{g.other ? OTHER_SUB : syncedText(g.pc)}</div>}
         {open &&
           (g.devices.length > 0 ? (
             g.devices.map(renderDevice)
@@ -274,7 +296,7 @@ export function Sidebar(p: Props) {
           <Plus size={18} strokeWidth={1.75} aria-hidden="true" />
           {!p.collapsed && <span>Add network share</span>}
         </button>
-        {p.peers && (
+        {p.peers && !inHubMode(p.hub) && (
           <button
             className="side-btn"
             aria-label="Link a device"

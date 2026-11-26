@@ -17,6 +17,8 @@ pub const NOISE_PARAMS: &str = "Noise_IK_25519_ChaChaPoly_BLAKE2s";
 const MAX_MSG: usize = 65535;
 const TAG: usize = 16;
 const MAX_PLAIN: usize = MAX_MSG - TAG;
+/// Most a frame's buffer reserves up front.
+const FIRST_RESERVE: usize = 1 << 20;
 
 /// This PC's static key pair.
 #[derive(Clone)]
@@ -72,6 +74,8 @@ pub struct SecureReader<R> {
     state: Arc<StatelessTransportState>,
     nonce: u64,
     buf: Vec<u8>,
+    max_frame: usize,
+    max_json: usize,
 }
 
 pub struct SecureWriter<W> {
@@ -97,11 +101,23 @@ async fn write_msg<W: AsyncWrite + Unpin>(io: &mut W, msg: &[u8]) -> Result<(), 
 }
 
 impl<R: AsyncRead + Unpin> SecureReader<R> {
+    /// Lowers the largest frame (default [`MAX_FRAME`]) this reader accepts; a bigger announcement fails the
+    /// read before any buffer grows. For listeners whose peers are bounded by a quota.
+    pub fn set_max_frame(&mut self, max: usize) {
+        self.max_frame = max.min(MAX_FRAME);
+    }
+
+    /// Lowers the largest JSON header (default: any that fits the frame) a frame may carry.
+    pub fn set_max_json(&mut self, max: usize) {
+        self.max_json = max;
+    }
+
     /// Next frame from the peer.
     pub async fn recv(&mut self) -> Result<Frame, Error> {
         let mut plain = vec![0u8; MAX_MSG];
         let mut data: Vec<u8> = Vec::new();
         let mut total: Option<usize> = None;
+        let mut json_checked = false;
         loop {
             let n = read_msg(&mut self.io, &mut self.buf).await?;
             let m = self.state.read_message(self.nonce, &self.buf[..n], &mut plain).map_err(crypto)?;
@@ -112,15 +128,23 @@ impl<R: AsyncRead + Unpin> SecureReader<R> {
                     return Err(Error::Protocol("short frame start".into()));
                 }
                 let t = u32::from_le_bytes(chunk[..4].try_into().unwrap()) as usize;
-                if t > MAX_FRAME {
+                if t > self.max_frame {
                     return Err(Error::Protocol(format!("frame of {t} bytes is too large")));
                 }
-                data.reserve_exact(t);
+                // the announced size is the peer's word: reserve a little and grow as the data arrives
+                data.reserve(t.min(FIRST_RESERVE));
                 total = Some(t);
                 chunk = &chunk[4..];
             }
             data.extend_from_slice(chunk);
             let t = total.unwrap();
+            if !json_checked && data.len() >= 4 {
+                json_checked = true;
+                let j = u32::from_le_bytes(data[..4].try_into().unwrap()) as usize;
+                if j > self.max_json {
+                    return Err(Error::Protocol(format!("message header of {j} bytes is too large")));
+                }
+            }
             if data.len() == t {
                 return Frame::from_bytes(data);
             }
@@ -156,7 +180,7 @@ fn halves<S: AsyncRead + AsyncWrite>(io: S, state: StatelessTransportState) -> H
     let state = Arc::new(state);
     let (r, w) = tokio::io::split(io);
     (
-        SecureReader { io: r, state: state.clone(), nonce: 0, buf: Vec::new() },
+        SecureReader { io: r, state: state.clone(), nonce: 0, buf: Vec::new(), max_frame: MAX_FRAME, max_json: usize::MAX },
         SecureWriter { io: w, state, nonce: 0, buf: Vec::new() },
     )
 }
@@ -184,14 +208,33 @@ pub async fn connect<S: AsyncRead + AsyncWrite + Unpin>(
 
 /// Listener side: returns the dialer's public key once `accept_key` approved it.
 pub async fn accept<S: AsyncRead + AsyncWrite + Unpin>(
+    io: S,
+    me: &Keys,
+    accept_key: impl Fn(&[u8; 32]) -> bool,
+) -> Result<([u8; 32], SecureReader<ReadHalf<S>>, SecureWriter<WriteHalf<S>>), Error> {
+    accept_limited(io, me, MAX_MSG, accept_key).await
+}
+
+/// Like [`accept`], for listeners reachable by strangers: the first message may be at most `max_first`
+/// bytes, checked from its length prefix before anything is allocated or read. Nothing is ever written
+/// back unless the dialer's key is accepted.
+pub async fn accept_limited<S: AsyncRead + AsyncWrite + Unpin>(
     mut io: S,
     me: &Keys,
+    max_first: usize,
     accept_key: impl Fn(&[u8; 32]) -> bool,
 ) -> Result<([u8; 32], SecureReader<ReadHalf<S>>, SecureWriter<WriteHalf<S>>), Error> {
     let mut hs = builder().local_private_key(&me.private).build_responder().map_err(crypto)?;
     let mut msg = Vec::new();
+    let mut len = [0u8; 2];
+    io.read_exact(&mut len).await?;
+    let n = u16::from_le_bytes(len) as usize;
+    if n > max_first {
+        return Err(Error::Protocol("handshake too large".into()));
+    }
     let mut buf = vec![0u8; MAX_MSG];
-    let n = read_msg(&mut io, &mut msg).await?;
+    msg.resize(n, 0);
+    io.read_exact(&mut msg[..n]).await?;
     hs.read_message(&msg[..n], &mut buf).map_err(crypto)?;
     let theirs = to32(hs.get_remote_static().ok_or_else(|| Error::Crypto("no static key".into()))?);
     if !accept_key(&theirs) {
@@ -239,6 +282,38 @@ mod tests {
         assert_eq!(ra.recv().await.unwrap().msg::<u8>().unwrap(), 1);
     }
 
+    async fn pair_of_peers() -> (SecureWriter<WriteHalf<tokio::io::DuplexStream>>, SecureReader<ReadHalf<tokio::io::DuplexStream>>) {
+        let (a, b) = (Keys::generate(), Keys::generate());
+        let (ia, ib) = tokio::io::duplex(1 << 16);
+        let a_pub = a.public;
+        let b2 = b.clone();
+        let server = tokio::spawn(async move { accept(ib, &b2, |k| *k == a_pub).await.unwrap() });
+        let (_ra, wa) = connect(ia, &a, &b.public).await.unwrap();
+        let (_, rb, _wb) = server.await.unwrap();
+        (wa, rb)
+    }
+
+    #[tokio::test]
+    async fn reader_caps_the_frame_before_reserving() {
+        let (mut wa, mut rb) = pair_of_peers().await;
+        rb.set_max_frame(100_000);
+        wa.send(&Frame::new(&1u8, vec![0; 50_000])).await.unwrap();
+        assert_eq!(rb.recv().await.unwrap().payload.len(), 50_000);
+        // the reader gives up after the first chunk, so the sender may stay blocked: don't await it
+        tokio::spawn(async move { wa.send(&Frame::new(&1u8, vec![0; 200_000])).await });
+        assert!(matches!(rb.recv().await, Err(Error::Protocol(m)) if m.contains("too large")));
+    }
+
+    #[tokio::test]
+    async fn reader_caps_the_json_header() {
+        let (mut wa, mut rb) = pair_of_peers().await;
+        rb.set_max_json(1024);
+        wa.send(&Frame::new(&"x".repeat(100), vec![])).await.unwrap();
+        assert!(rb.recv().await.is_ok());
+        wa.send(&Frame::new(&"x".repeat(5000), vec![])).await.unwrap();
+        assert!(matches!(rb.recv().await, Err(Error::Protocol(m)) if m.contains("header")));
+    }
+
     #[tokio::test]
     async fn unknown_dialer_is_refused() {
         let (a, b) = (Keys::generate(), Keys::generate());
@@ -248,6 +323,35 @@ mod tests {
         let client = connect(ia, &a, &b.public).await;
         assert!(matches!(server.await.unwrap(), Err(Error::NotLinked)));
         assert!(client.is_err(), "dialer must not get a session");
+    }
+
+    #[tokio::test]
+    async fn unknown_key_gets_no_reply() {
+        use tokio::io::AsyncReadExt;
+        let (a, b) = (Keys::generate(), Keys::generate());
+        let (mut ia, ib) = tokio::io::duplex(1 << 16);
+        let b2 = b.clone();
+        let server = tokio::spawn(async move { accept(ib, &b2, |_| false).await.map(|_| ()) });
+        let mut hs = builder().local_private_key(&a.private).remote_public_key(&b.public).build_initiator().unwrap();
+        let mut buf = vec![0u8; MAX_MSG];
+        let n = hs.write_message(&[], &mut buf).unwrap();
+        write_msg(&mut ia, &buf[..n]).await.unwrap();
+        assert!(matches!(server.await.unwrap(), Err(Error::NotLinked)));
+        let mut got = Vec::new();
+        assert_eq!(ia.read_to_end(&mut got).await.unwrap(), 0, "nothing may be written back");
+    }
+
+    #[tokio::test]
+    async fn oversized_first_message_rejected_silently() {
+        use tokio::io::AsyncReadExt;
+        let b = Keys::generate();
+        let (mut ia, ib) = tokio::io::duplex(1 << 16);
+        let server = tokio::spawn(async move { accept_limited(ib, &b, 256, |_| true).await.map(|_| ()) });
+        // only the length prefix: the listener must decide without waiting for (or reading) a body
+        ia.write_all(&300u16.to_le_bytes()).await.unwrap();
+        assert!(matches!(server.await.unwrap(), Err(Error::Protocol(m)) if m == "handshake too large"));
+        let mut got = Vec::new();
+        assert_eq!(ia.read_to_end(&mut got).await.unwrap(), 0, "nothing may be written back");
     }
 
     #[tokio::test]

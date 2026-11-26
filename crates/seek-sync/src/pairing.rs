@@ -11,12 +11,17 @@ use serde::{Deserialize, Serialize};
 use spake2::{Ed25519Group, Identity, Password, Spake2};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+use crate::wire::Role;
 use crate::Error;
 
 pub const CODE_VALID_MS: i64 = 120_000;
 pub const CODE_ATTEMPTS: u8 = 3;
+/// A hub is reachable from further away than the LAN, so its codes are longer.
+pub const HUB_CODE_DIGITS: usize = 8;
 const IDENTITY: &[u8] = b"seek-pair-v1";
 const MAX_PAIR_MSG: usize = 1 << 20;
+/// Largest message a host reads from a guest (a guest's info is a few hundred bytes plus its group).
+const MAX_GUEST_MSG: usize = 64 << 10;
 
 /// What each PC tells the other when linking.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -33,6 +38,15 @@ pub struct PairInfo {
     /// TCP port this PC listens on for sync (the other side knows the IP from the connection).
     #[serde(default)]
     pub port: u16,
+    /// What the sender is; a PC can tell it paired with a hub.
+    #[serde(default)]
+    pub role: Role,
+    /// Hub only: addresses to reach it (LAN addresses when enabled, then `SEEK_HUB_PUBLIC`).
+    #[serde(default)]
+    pub addrs: Vec<String>,
+    /// PC only: display name of the user who linked (empty from a hub).
+    #[serde(default)]
+    pub user_name: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -54,8 +68,14 @@ pub struct PairingCode {
 
 impl PairingCode {
     pub fn new(now_ms: i64) -> PairingCode {
-        let n: u32 = rand::thread_rng().gen_range(0..1_000_000);
-        PairingCode { code: format!("{n:06}"), expires_ms: now_ms + CODE_VALID_MS, attempts_left: CODE_ATTEMPTS }
+        Self::with_digits(now_ms, 6)
+    }
+
+    /// A code of `digits` decimal digits (hubs use [`HUB_CODE_DIGITS`]); same lifetime and attempts.
+    pub fn with_digits(now_ms: i64, digits: usize) -> PairingCode {
+        let mut rng = rand::thread_rng();
+        let code: String = (0..digits).map(|_| char::from(b'0' + rng.gen_range(0..10u8))).collect();
+        PairingCode { code, expires_ms: now_ms + CODE_VALID_MS, attempts_left: CODE_ATTEMPTS }
     }
 
     pub fn usable(&self, now_ms: i64) -> bool {
@@ -79,11 +99,11 @@ async fn send<S: AsyncWrite + Unpin>(io: &mut S, b: &[u8]) -> Result<(), Error> 
     Ok(())
 }
 
-async fn recv<S: AsyncRead + Unpin>(io: &mut S) -> Result<Vec<u8>, Error> {
+async fn recv<S: AsyncRead + Unpin>(io: &mut S, max: usize) -> Result<Vec<u8>, Error> {
     let mut len = [0u8; 4];
     io.read_exact(&mut len).await?;
     let n = u32::from_le_bytes(len) as usize;
-    if n > MAX_PAIR_MSG {
+    if n > max {
         return Err(Error::Protocol("pairing message too large".into()));
     }
     let mut b = vec![0u8; n];
@@ -96,7 +116,7 @@ async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(io: &mut S, code: &str) -> 
     let (spake, outbound) =
         Spake2::<Ed25519Group>::start_symmetric(&Password::new(code.as_bytes()), &Identity::new(IDENTITY));
     send(io, &outbound).await?;
-    let inbound = recv(io).await?;
+    let inbound = recv(io, MAX_GUEST_MSG).await?;
     let key = spake.finish(&inbound).map_err(|e| Error::Crypto(format!("{e:?}")))?;
     Ok(ChaCha20Poly1305::new(Key::from_slice(&key[..32])))
 }
@@ -120,14 +140,30 @@ pub async fn pair_host<S: AsyncRead + AsyncWrite + Unpin>(
     code: &str,
     mine: &PairInfo,
 ) -> Result<PairInfo, Error> {
+    pair_host_then(io, code, mine, |_| async { Ok(()) }).await
+}
+
+/// Like [`pair_host`], but `accept` sees the guest's info (and may take its time to save it) BEFORE the
+/// reply is sent, so the guest cannot act on being linked before the host knows it. When `accept` fails the
+/// guest gets the "rejected" message and the error comes back.
+pub async fn pair_host_then<S, F, Fut>(io: &mut S, code: &str, mine: &PairInfo, accept: F) -> Result<PairInfo, Error>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    F: FnOnce(PairInfo) -> Fut,
+    Fut: std::future::Future<Output = Result<(), Error>>,
+{
     let cipher = exchange(io, code).await?;
-    let theirs = match open(&cipher, GUEST, &recv(io).await?) {
+    let theirs = match open(&cipher, GUEST, &recv(io, MAX_GUEST_MSG).await?) {
         Ok(t) => t,
         Err(e) => {
             let _ = send(io, &[]).await;
             return Err(e);
         }
     };
+    if let Err(e) = accept(theirs.clone()).await {
+        let _ = send(io, &[]).await;
+        return Err(e);
+    }
     send(io, &seal(&cipher, HOST, mine)?).await?;
     Ok(theirs)
 }
@@ -140,7 +176,7 @@ pub async fn pair_guest<S: AsyncRead + AsyncWrite + Unpin>(
 ) -> Result<PairInfo, Error> {
     let cipher = exchange(io, code).await?;
     send(io, &seal(&cipher, GUEST, mine)?).await?;
-    let reply = recv(io).await?;
+    let reply = recv(io, MAX_PAIR_MSG).await?;
     if reply.is_empty() {
         return Err(Error::WrongCode);
     }
@@ -159,7 +195,28 @@ mod tests {
             user_sid: "S-1".into(),
             members: vec![],
             port: 47321,
+            role: Role::Pc,
+            addrs: vec![],
+            user_name: "me".into(),
         }
+    }
+
+    #[test]
+    fn code_rules_hub() {
+        let mut c = PairingCode::with_digits(1_000, HUB_CODE_DIGITS);
+        assert_eq!(c.code.len(), 8);
+        assert!(c.code.chars().all(|ch| ch.is_ascii_digit()));
+        assert!(c.usable(1_000 + 119_000) && !c.usable(1_000 + 121_000));
+        assert!(c.consume_attempt() && c.consume_attempt() && c.consume_attempt());
+        assert!(!c.consume_attempt() && !c.usable(1_001));
+    }
+
+    #[test]
+    fn role_defaults_to_pc() {
+        let s = r#"{"hostId":"00000000-0000-0000-0000-000000000000","name":"A","publicKey":"k","userSid":"S-1","members":[]}"#;
+        let p: PairInfo = serde_json::from_str(s).unwrap();
+        assert_eq!(p.role, Role::Pc);
+        assert!(p.addrs.is_empty() && p.user_name.is_empty() && p.port == 0);
     }
 
     #[tokio::test]
@@ -179,6 +236,44 @@ mod tests {
         let h = tokio::spawn(async move { pair_host(&mut a, "123456", &info("A")).await });
         assert!(matches!(pair_guest(&mut b, "654321", &info("B")).await, Err(Error::WrongCode)));
         assert!(matches!(h.await.unwrap(), Err(Error::WrongCode)));
+    }
+
+    #[tokio::test]
+    async fn host_accepts_before_replying_and_can_reject() {
+        let (mut a, mut b) = tokio::io::duplex(4096);
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen2 = seen.clone();
+        let h = tokio::spawn(async move {
+            pair_host_then(&mut a, "123456", &info("A"), |g| async move {
+                assert_eq!(g.name, "B");
+                seen2.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            })
+            .await
+        });
+        pair_guest(&mut b, "123456", &info("B")).await.unwrap();
+        assert!(seen.load(std::sync::atomic::Ordering::SeqCst), "accept ran before the guest saw the reply");
+        h.await.unwrap().unwrap();
+
+        let (mut a, mut b) = tokio::io::duplex(4096);
+        let h = tokio::spawn(async move {
+            pair_host_then(&mut a, "123456", &info("A"), |_| async { Err(Error::Protocol("no".into())) }).await
+        });
+        assert!(matches!(pair_guest(&mut b, "123456", &info("B")).await, Err(Error::WrongCode)));
+        assert!(matches!(h.await.unwrap(), Err(Error::Protocol(_))));
+    }
+
+    #[tokio::test]
+    async fn host_refuses_a_big_guest_message() {
+        use tokio::io::AsyncWriteExt;
+        let (mut a, mut b) = tokio::io::duplex(1 << 20);
+        let h = tokio::spawn(async move { pair_host(&mut a, "123456", &info("A")).await });
+        // our SPAKE2 message, then a guest message announcing 100 KiB
+        let (_s, out) = Spake2::<Ed25519Group>::start_symmetric(&Password::new(b"123456"), &Identity::new(IDENTITY));
+        send(&mut b, &out).await.unwrap();
+        b.write_all(&(100u32 << 10).to_le_bytes()).await.unwrap();
+        let _ = recv(&mut b, 1 << 20).await; // host's spake message
+        assert!(matches!(h.await.unwrap(), Err(Error::Protocol(m)) if m.contains("too large")));
     }
 
     #[test]

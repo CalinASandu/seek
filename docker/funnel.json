@@ -1,0 +1,11 @@
+{
+  "TCP": {
+    "443": {
+      "TCPForward": "127.0.0.1:47321",
+      "TerminateTLS": "${TS_CERT_DOMAIN}"
+    }
+  },
+  "AllowFunnel": {
+    "${TS_CERT_DOMAIN}:443": true
+  }
+}

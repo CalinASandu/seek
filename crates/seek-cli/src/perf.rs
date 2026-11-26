@@ -4,7 +4,10 @@
 //! Sections: synthetic index (build time, memory), search latency for every query × sort key,
 //! fetching a page of results, saving/loading an index, applying a batch of live changes, real
 //! drive scans (each in a child process so its peak memory is its own), sync between linked PCs
-//! (full copy over loopback, applying a delta), and round trips to the running service.
+//! (full copy over loopback, applying a delta), a Seek Hub (upload, pull, delta, idle poll, compaction),
+//! and round trips to the running service.
+
+mod hub;
 
 use std::collections::HashMap;
 use std::os::windows::io::AsRawHandle;
@@ -20,6 +23,9 @@ use seek_core::{
 };
 use seek_ipc::{Client, Request, Response, PROTOCOL_VERSION};
 use serde_json::{json, Value};
+
+/// Child of the hub section: compacts one device of a hub store and prints how long it took.
+pub use hub::compact_child as hub_compact;
 
 pub struct Opts {
     pub entries: usize,
@@ -150,6 +156,7 @@ pub fn run(o: Opts) -> anyhow::Result<()> {
 
     synthetic(&mut r, &o)?;
     sync(&mut r, o.runs)?;
+    hub::run(&mut r, o.runs)?;
     for target in &o.scans {
         real_scan(&mut r, target)?;
     }

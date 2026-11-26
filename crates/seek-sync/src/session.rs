@@ -4,7 +4,7 @@
 //! journaled changes, or a full copy when the history does not reach back far enough. The service plugs in
 //! through [`SyncHost`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,7 +16,7 @@ use crate::frame::Frame;
 use crate::journal::Cursor;
 use crate::noise::{SecureReader, SecureWriter};
 use crate::pairing::MemberInfo;
-use crate::wire::{Msg, SYNC_PROTOCOL};
+use crate::wire::{CatalogPc, Msg, Refusal, Role, SYNC_PROTOCOL};
 use crate::Error;
 
 /// What an owner sends so a copy catches up.
@@ -37,8 +37,13 @@ pub trait SyncHost: Send + Sync + 'static {
     fn outgoing(&self, device: uuid::Uuid, have: Option<Cursor>) -> Option<Outgoing>;
     /// Cursors of `owner`'s devices held here.
     fn held(&self, owner: uuid::Uuid) -> Vec<(uuid::Uuid, Cursor)>;
+    /// Cursors of every copy of another PC's device held here (what a hub `Pull` reports).
+    fn held_remote(&self) -> Vec<(uuid::Uuid, Cursor)>;
     /// `owner`'s current shared devices: add/update records, drop copies of devices no longer listed.
     fn remote_devices(&self, owner: uuid::Uuid, devices: Vec<Device>, profiles: Vec<(String, String)>);
+    /// A hub's catalog: for every PC in `pcs`, the same as `remote_devices(that PC, its devices, its profiles)`;
+    /// copies of owners received through the hub that are no longer in `pcs` are dropped.
+    fn catalog(&self, hub: uuid::Uuid, pcs: Vec<CatalogPc>, devices: Vec<Device>);
     fn apply_delta(
         &self,
         owner: uuid::Uuid,
@@ -53,12 +58,18 @@ pub trait SyncHost: Send + Sync + 'static {
     fn member_joined(&self, member: MemberInfo);
     /// `peer` removed the link.
     fn unlinked_by(&self, peer: uuid::Uuid);
+    /// The hub did not take or serve something.
+    fn hub_refused(&self, reason: Refusal) {
+        tracing::warn!("the hub refused a request: {reason:?}");
+    }
 }
 
 /// Handle to steer a running session.
 pub struct SessionCtl {
     /// Push own changes now and ask the peer to do the same.
     pub sync_now: Notify,
+    /// An own index changed (fired debounced by the service); a hub session uploads and pulls. LAN sessions ignore it.
+    pub changed: Notify,
     /// End the session.
     pub stop: Notify,
     outbox: mpsc::UnboundedSender<Msg>,
@@ -67,7 +78,8 @@ pub struct SessionCtl {
 impl SessionCtl {
     pub fn new() -> (Arc<SessionCtl>, mpsc::UnboundedReceiver<Msg>) {
         let (tx, rx) = mpsc::unbounded_channel();
-        (Arc::new(SessionCtl { sync_now: Notify::new(), stop: Notify::new(), outbox: tx }), rx)
+        let ctl = SessionCtl { sync_now: Notify::new(), changed: Notify::new(), stop: Notify::new(), outbox: tx };
+        (Arc::new(ctl), rx)
     }
 
     /// Queues a message for the peer (e.g. `Unlinked`, `MemberJoined`). Ends the session after `Unlinked`.
@@ -81,30 +93,130 @@ pub fn encode_delta(changes: &[Change]) -> Vec<u8> {
     zstd::encode_all(raw.as_slice(), 1).expect("zstd in memory")
 }
 
+/// Most a delta may decompress to (a compressed one can claim far more than it weighs).
+pub const MAX_DELTA_PLAIN: u64 = 512 << 20;
+
 pub fn decode_delta(b: &[u8]) -> Result<Vec<Change>, Error> {
-    let raw = zstd::decode_all(b).map_err(|e| Error::Protocol(format!("bad delta: {e}")))?;
-    postcard::from_bytes(&raw).map_err(|e| Error::Protocol(format!("bad delta: {e}")))
+    decode_delta_limited(b, MAX_DELTA_PLAIN)
 }
 
-struct Owner {
+/// [`decode_delta`] refusing a delta that decompresses to more than `limit` bytes.
+pub fn decode_delta_limited(b: &[u8], limit: u64) -> Result<Vec<Change>, Error> {
+    use std::io::Read;
+    let bad = |e: String| Error::Protocol(format!("bad delta: {e}"));
+    let dec = zstd::Decoder::new(b).map_err(|e| bad(e.to_string()))?;
+    let mut raw = Vec::new();
+    dec.take(limit + 1).read_to_end(&mut raw).map_err(|e| bad(e.to_string()))?;
+    if raw.len() as u64 > limit {
+        return Err(bad(format!("larger than {limit} bytes unpacked")));
+    }
+    postcard::from_bytes(&raw).map_err(|e| bad(e.to_string()))
+}
+
+/// The owner side of a session: what the peer holds of our own devices.
+pub(crate) struct Owner {
     /// What the peer's copy of each own device is at (as far as we know).
-    sent: HashMap<uuid::Uuid, Cursor>,
+    pub(crate) sent: HashMap<uuid::Uuid, Cursor>,
     /// The peer told us what it has, so pushing makes sense.
-    ready: bool,
+    pub(crate) ready: bool,
     /// JSON of the device list last sent.
     last_devices: Vec<u8>,
+    /// Ids of the own devices last listed.
+    pub(crate) shared: HashSet<uuid::Uuid>,
+    /// `Devices` messages sent that the peer has not answered yet (a hub answers each with `Have` or `Refused`).
+    pub(crate) devices_pending: u32,
 }
 
-async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Result<T, Error> {
+impl Owner {
+    pub(crate) fn new() -> Owner {
+        Owner { sent: HashMap::new(), ready: false, last_devices: Vec::new(), shared: HashSet::new(), devices_pending: 0 }
+    }
+
+    /// Notes what the peer holds of `device`. An answer from before the last update was sent (a `Have` for an
+    /// earlier `Devices`, an `Ack` of an earlier delta) is behind `sent`: the answer to the update follows, and
+    /// acting on the older one would send that update twice, which the peer takes for a gap and answers with a
+    /// request for a full copy. A cursor of another generation, or none, always wins.
+    pub(crate) fn peer_has(&mut self, device: uuid::Uuid, cursor: Cursor) {
+        match self.sent.get(&device) {
+            Some(known) if known.generation == cursor.generation && cursor.seq < known.seq => {}
+            _ => {
+                self.sent.insert(device, cursor);
+            }
+        }
+    }
+}
+
+pub(crate) async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Result<T, Error> {
     tokio::task::spawn_blocking(f).await.map_err(|e| Error::Protocol(format!("worker failed: {e}")))
+}
+
+/// The frame channels of a session: a writer task drains `tx`, a reader task fills `rx`.
+pub(crate) struct Pipes {
+    pub(crate) tx: mpsc::Sender<Frame>,
+    pub(crate) rx: mpsc::Receiver<Result<Frame, Error>>,
+    writer: AbortOnDrop<Result<(), Error>>,
+    _reader: AbortOnDrop<()>,
+}
+
+/// A task that ends with its owner, so a session that is aborted mid-way leaks nothing.
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+impl Pipes {
+    pub(crate) fn spawn<R, W>(mut rd: SecureReader<R>, mut wr: SecureWriter<W>) -> Pipes
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
+        let (tx, mut out_rx) = mpsc::channel::<Frame>(8);
+        let writer = tokio::spawn(async move {
+            while let Some(f) = out_rx.recv().await {
+                wr.send(&f).await?;
+            }
+            Ok::<_, Error>(())
+        });
+        let (in_tx, rx) = mpsc::channel::<Result<Frame, Error>>(8);
+        let reader = tokio::spawn(async move {
+            loop {
+                let r = rd.recv().await;
+                let end = r.is_err();
+                if in_tx.send(r).await.is_err() || end {
+                    break;
+                }
+            }
+        });
+        Pipes { tx, rx, writer: AbortOnDrop(writer), _reader: AbortOnDrop(reader) }
+    }
+
+    /// Lets queued frames go out (for up to 5 s), then stops reading.
+    pub(crate) async fn close(mut self) {
+        drop(self.tx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), &mut self.writer.0).await;
+        // both tasks are aborted when `self` drops
+    }
+}
+
+/// A received frame; `None` when the peer closed the connection.
+pub(crate) fn incoming(r: Option<Result<Frame, Error>>) -> Result<Option<Frame>, Error> {
+    match r {
+        None => Ok(None),
+        Some(Err(Error::Io(e))) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
+        Some(Err(e)) => Err(e),
+        Some(Ok(f)) => Ok(Some(f)),
+    }
 }
 
 /// Runs a session until the connection ends, `ctl.stop` fires, or either side unlinks.
 pub async fn run_session<R, W>(
     host: Arc<dyn SyncHost>,
     peer: uuid::Uuid,
-    mut rd: SecureReader<R>,
-    mut wr: SecureWriter<W>,
+    rd: SecureReader<R>,
+    wr: SecureWriter<W>,
     ctl: Arc<SessionCtl>,
     mut outbox: mpsc::UnboundedReceiver<Msg>,
     interval: Duration,
@@ -113,32 +225,13 @@ where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let (out_tx, mut out_rx) = mpsc::channel::<Frame>(8);
-    let writer = tokio::spawn(async move {
-        while let Some(f) = out_rx.recv().await {
-            wr.send(&f).await?;
-        }
-        Ok::<_, Error>(())
-    });
-    let (in_tx, mut in_rx) = mpsc::channel::<Result<Frame, Error>>(8);
-    let reader = tokio::spawn(async move {
-        loop {
-            let r = rd.recv().await;
-            let end = r.is_err();
-            if in_tx.send(r).await.is_err() || end {
-                break;
-            }
-        }
-    });
-
-    let result = drive(host, peer, &ctl, &mut outbox, &out_tx, &mut in_rx, interval).await;
-    drop(out_tx);
-    let _ = tokio::time::timeout(Duration::from_secs(5), writer).await;
-    reader.abort();
+    let mut pipes = Pipes::spawn(rd, wr);
+    let result = drive(host, peer, &ctl, &mut outbox, &pipes.tx, &mut pipes.rx, interval).await;
+    pipes.close().await;
     result
 }
 
-async fn send(tx: &mpsc::Sender<Frame>, m: &Msg, payload: Vec<u8>) -> Result<(), Error> {
+pub(crate) async fn send(tx: &mpsc::Sender<Frame>, m: &Msg, payload: Vec<u8>) -> Result<(), Error> {
     tx.send(Frame::new(m, payload)).await.map_err(|_| Error::Protocol("connection closed".into()))
 }
 
@@ -151,8 +244,9 @@ async fn drive(
     rx: &mut mpsc::Receiver<Result<Frame, Error>>,
     interval: Duration,
 ) -> Result<(), Error> {
-    send(tx, &Msg::Hello { protocol: SYNC_PROTOCOL, host_id: host.host_id(), name: host.name() }, vec![]).await?;
-    let mut owner = Owner { sent: HashMap::new(), ready: false, last_devices: Vec::new() };
+    let hello = Msg::Hello { protocol: SYNC_PROTOCOL, host_id: host.host_id(), name: host.name(), role: Role::Pc };
+    send(tx, &hello, vec![]).await?;
+    let mut owner = Owner::new();
     send_devices(&host, &mut owner, tx).await?;
     let h = host.clone();
     let held = blocking(move || h.held(peer)).await?;
@@ -163,19 +257,17 @@ async fn drive(
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
-            incoming = rx.recv() => {
-                let frame = match incoming {
-                    None => return Ok(()),
-                    Some(Err(Error::Io(e))) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
-                    Some(Err(e)) => return Err(e),
-                    Some(Ok(f)) => f,
-                };
+            r = rx.recv() => {
+                let Some(frame) = incoming(r)? else { return Ok(()) };
                 let msg: Msg = frame.msg()?;
                 if !hello {
                     match msg {
-                        Msg::Hello { protocol, host_id, .. } => {
+                        Msg::Hello { protocol, host_id, role, .. } => {
                             if protocol != SYNC_PROTOCOL {
                                 return Err(Error::Protocol(format!("peer speaks sync protocol v{protocol}, we speak v{SYNC_PROTOCOL}")));
+                            }
+                            if role == Role::Hub {
+                                return Err(Error::Protocol("that address is a hub - use Link a hub".into()));
                             }
                             if host_id != peer {
                                 return Err(Error::Protocol("peer identified as another PC".into()));
@@ -227,7 +319,9 @@ async fn handle(
             .await?;
         }
         Msg::Have { cursors } => {
-            owner.sent.extend(cursors);
+            for (device, cursor) in cursors {
+                owner.peer_has(device, cursor);
+            }
             owner.ready = true;
             push(host, owner, tx).await?;
         }
@@ -253,9 +347,7 @@ async fn handle(
             .await?;
             answer(device, cursor, applied, tx).await?;
         }
-        Msg::Ack { device, cursor } => {
-            owner.sent.insert(device, cursor);
-        }
+        Msg::Ack { device, cursor } => owner.peer_has(device, cursor),
         Msg::SyncNow => push(host, owner, tx).await?,
         Msg::Unlinked => {
             let h = host.clone();
@@ -266,6 +358,9 @@ async fn handle(
             let h = host.clone();
             blocking(move || h.member_joined(member)).await?;
         }
+        // Hub-only messages mean nothing between two PCs.
+        Msg::Pull { .. } | Msg::Catalog { .. } | Msg::PullDone | Msg::Refused { .. } | Msg::Data { .. } | Msg::Close { .. } => {}
+        Msg::Open { .. } => send(tx, &Msg::Refused { reason: Refusal::NotSupported }, vec![]).await?,
     }
     Ok(false)
 }
@@ -281,19 +376,21 @@ async fn answer(device: uuid::Uuid, cursor: Cursor, applied: Result<(), String>,
     }
 }
 
-async fn send_devices(host: &Arc<dyn SyncHost>, owner: &mut Owner, tx: &mpsc::Sender<Frame>) -> Result<Vec<Device>, Error> {
+pub(crate) async fn send_devices(host: &Arc<dyn SyncHost>, owner: &mut Owner, tx: &mpsc::Sender<Frame>) -> Result<Vec<Device>, Error> {
     let h = host.clone();
     let (devices, profiles) = blocking(move || (h.shared_devices(), h.profiles())).await?;
+    owner.shared = devices.iter().map(|d| d.id).collect();
     let json = serde_json::to_vec(&devices).unwrap_or_default();
     if json != owner.last_devices {
         send(tx, &Msg::Devices { devices: devices.clone(), profiles }, vec![]).await?;
         owner.last_devices = json;
+        owner.devices_pending += 1;
     }
     Ok(devices)
 }
 
 /// Sends the device list if it changed, then whatever each copy on the peer misses.
-async fn push(host: &Arc<dyn SyncHost>, owner: &mut Owner, tx: &mpsc::Sender<Frame>) -> Result<(), Error> {
+pub(crate) async fn push(host: &Arc<dyn SyncHost>, owner: &mut Owner, tx: &mpsc::Sender<Frame>) -> Result<(), Error> {
     let devices = send_devices(host, owner, tx).await?;
     if !owner.ready {
         return Ok(());

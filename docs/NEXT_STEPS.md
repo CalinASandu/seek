@@ -1,6 +1,6 @@
 # Seek — Status & Next Steps
 
-_Last updated: 2026-10-16 (Space view implemented, plan tasks 1–8). Read this first when starting a new session in this repo._
+_Last updated: 2026-11-20 (Decimator tried by the user in the real window: works well; slimming it next). Read this first when starting a new session in this repo._
 
 ## Where we are
 
@@ -127,7 +127,7 @@ devices, a results page, save/load, a live-change batch, real scans (`--scan D:\
 peak memory is its own) and service round trips (`--remote`). `--json` saves, `--compare` prints deltas.
 `perf.ps1` saves to `perf-results\` (git-ignored) and compares with the previous run automatically.
 
-**Installer**: `.\scripts\build-installer.ps1` → `target\release\bundle\nsis\Seek_0.1.0_x64-setup.exe` (3.6 MB).
+**Installer**: `.\scripts\build-installer.ps1` → `target\installer\release\bundle\nsis\Seek_0.1.0_x64-setup.exe` (3.6 MB).
 Per-machine (Program Files — the SYSTEM service must not live in a user-writable folder). Hooks
 (`app/src-tauri/windows/hooks.nsh`): stop the service before files are replaced, `seek-service install`
 after (now idempotent: updates an existing registration), `seek-service uninstall` on uninstall; the index in
@@ -243,7 +243,180 @@ Spec `docs/superpowers/specs/2026-10-16-seek-space-view-design.md`, plan `docs/s
 - **Perf** (2M entries): totals 113 ms, tree 0.8 ms, largest 4.2 ms, types 29 ms (`seek perf`, `== space ==`).
 - Screenshots: `app/docs/screenshots/11-space-*.png`, `12-space-folder-dark.png`, `13-space-types-light.png`.
 
+## Done in wave 7: Seek Hub (2026-10-24 .. 2026-10-25)
+
+A self-hosted hub (`crates/seek-hub`, binary `seek-hub`) that PCs on different networks sync through, reachable
+only via Tailscale Funnel. Spec `docs/superpowers/specs/2026-10-24-seek-hub-design.md`, plan
+`docs/superpowers/plans/2026-10-24-seek-hub.md`. Packaging: `docker/` (Dockerfile, compose, Funnel serve config,
+tailnet policy example, README with the setup flow and the Pi checklist), `scripts/build-hub-image.ps1`.
+
+- How to run (no Docker on the Windows PC): `.\scripts\build-hub-image.ps1` builds `docker\dist\{arm64,amd64}\seek-hub`;
+  `scp -r docker pi@<pi>:seek-hub`; on the Pi `docker build --build-arg TARGETARCH=arm64 -t
+  ghcr.io/calinasandu/seek-hub:0.1.0 .`, then follow `docker/README.md`. One-shot commands are `docker compose run
+  --rm --no-deps seek-hub <cmd>`; `init` runs only while the hub is stopped (`docker compose stop seek-hub; docker
+  compose run --rm --no-deps seek-hub init; docker compose start seek-hub`); `init --keys` and `rotate-key` run with
+  the hub stopped via `docker run --rm -v "$PWD/data:/data" -v "$PWD/keys:/keys" <image> <cmd>`; `link`, `status`,
+  `pcs`, `unlink`, `doctor` use `docker exec seek-hub seek-hub <cmd>`. `data/` and `keys/` need `chown 10001:10001`.
+  A value in `docker/.env` (`SEEK_HUB_PUBLIC`, `SEEK_HUB_LAN`) overrides what `init` saved.
+- Linux tests (done 2026-10-27, 79 unit + 11 CLI pass on Alpine under WSL): `wsl -d seek-alpine --cd
+  /mnt/d/Programming/seek -- sh -c ". /root/.cargo/env && CARGO_TARGET_DIR=/root/seek-target cargo test -p seek-hub"`.
+  The release binaries cross-build here (zig + cargo-zigbuild, both musl targets; arm64 about 4.4 MB).
+- Not run yet: the image build (`docker build` on the Pi), everything on the Pi, and the Funnel serve config against a
+  live tailscaled.
+
+**Pi checkpoint (user)** - the commands are in `docker/README.md`, last section, in this order: copy `docker/` to the
+Pi, `docker build`, `mkdir -p data keys tailscale && sudo chown 10001:10001 data keys && sudo chown root:root tailscale`, fill `.env`, `init --keys`,
+optional `init`, `compose up -d`, `compose logs`, `openssl s_client` (the certificate can take a few minutes: retry),
+`doctor --public`, link two PCs (one on a phone hotspot without Tailscale), search across them, `seek-hub status`.
+
+## Quality of life pass (2026-11-02)
+
+- **Mouse side buttons + Alt+←/→**: Space keeps a browser-style history (`hooks/useSpaceNav.ts`): every folder and drive
+  change is a step, a new move drops the steps ahead, a vanished folder replaces its entry instead of adding one. It lives
+  in `Shell`, so the folder, history and tab survive switching to Search. In Search, back only returns to Space after
+  "Search in this folder". Buttons do nothing behind a dialog. `hooks/useMouseNav.ts` listens on the window.
+  **Not yet pressed with a real mouse in the Tauri window**: tests dispatch events for buttons 3 and 4.
+- **Search box holds only typed text**: `SearchInput { text, filters }` in `lib/query.ts`. `composeQuery` puts filters first,
+  so an unfinished quote can't swallow them; parse errors are shifted back to the typed text. Files/Folders/Online/Offline
+  light up; drive and folder filters also get a removable pill. X and Esc clear only the text.
+- **Several drives now mean "any of these"** (`drive:"A"|drive:"B"`): spaces AND terms, so two selected drives used to
+  return nothing.
+- **Beam switch** (the user's pick from a five-way test page, since deleted): `components/Segmented.tsx` is the Search/Space
+  switch and the Space tabs. A capsule on two spring edges, with the labels repeated in its ink colour and clipped to it.
+  **Not yet seen in the real window or at the app's 32 px title bar** (the dev server was stopped for low memory). Settings
+  and the Link dialog keep the older `.segmented` control.
+- Maybe later (user): a shortcuts page in Settings.
+
+## Decimator (Cleanup): built 2026-11-05 … 11-06, tried by the user 2026-11-20 (works well; full checklist below not run yet)
+
+Spec `docs/superpowers/specs/2026-11-04-seek-cleanup-design.md`, plan `docs/superpowers/plans/2026-11-05-seek-decimator.md`, all 18
+tasks plus a final whole-branch review and fix pass, committed on `feat/v1` (not pushed). Every ruling made along the way, with what
+it costs if wrong, is in the ledger `.superpowers/sdd/2026-11-05-seek-decimator/progress.md` (git-ignored).
+
+- **What it is:** a Decimator area beside Search and Space (`Ctrl+Shift+D`) with Duplicates, Leftovers and Apps (run an app's own
+  uninstaller, then offer what it left), plus Recently removed with Put back. `crates/seek-clean` is the only code that removes
+  anything, and it only moves to the Recycle Bin; every rule is in its engine (`prepare` → token → `commit`), not the UI.
+- **Admin:** Program Files leftovers and Seek's stale index files go through one UAC prompt per removal, run by `seek-app.exe
+  --clean-elevated` over a user-only named pipe; the elevated copy re-judges every item. Put back of an admin-removed item says to
+  restore it from the Recycle Bin.
+- **Protect:** row menu *Always protect* (saved before the row changes) and Settings → Protected from Cleanup.
+- **Seek's own uninstaller** asks "Also delete Seek's index and settings? This is permanent." (No by default; skipped when silent,
+  passive or updating).
+- **One Seek at a time** now (`tauri-plugin-single-instance`): a second launch focuses the running window.
+- **Faster scans (2026-11-07):** *Scan faster* (progress line) reads at normal priority, up to 4 files at once on an SSD;
+  scans remember what they read in `%TEMP%\Seek\dupe-prints.txt` (the Scan button's tooltip says so; Settings → Duplicate
+  scans: size and *Clear*). A same-name quick scan was tried and dropped: on the user's PC it still read 405 of 604 GB.
+  Plan: `docs/superpowers/plans/2026-11-07-faster-duplicate-scans.md`.
+- **Slow scan fix (2026-11-09):** files on a drive that can't be cleaned (Google Drive's G:, network shares, USB sticks)
+  are left out before any per-file check; G: alone cost 4–8 s per file and held 370 of 410 GB. Real scan on the user's
+  PC: 43 s with remembered results, 2 min without. Measure with `seek dupes [--fast] [--fresh]`.
+- The app and service must be rebuilt together (protocol v5).
+- Tests: `cargo test --workspace` 823 passed; `pnpm test` 168; clippy clean. Real-Recycle-Bin flows:
+  `cargo test -p seek-clean --test flows -- --ignored` (temp files only).
+
+**Limits the user should know (rulings):**
+- Only NTFS and ReFS drives can be cleaned; others show why (Google Drive's G: can't be told apart from a FAT32 drive with a bin).
+- A removal is refused when the Recycle Bin would be over 90% full afterwards: "empty the Recycle Bin first".
+- Very long paths are refused with a reason (Windows may delete them for good instead of recycling).
+- Two separate removals can leave the last copy of a file only in the Recycle Bin (a duplicate removed, later its twin as a leftover).
+- Running an older Seek build and saving settings drops the Always protect list.
+
+**Real-window checks (user), after `Stop Seek.bat` then `Rebuild Seek.bat`:**
+1. Look and feel, light and dark: each tab, the review sheet, Recently removed, the beam colour (back to `#f5f5f7`, user 2026-11-07), the motion. Not yet seen
+   in a real window (the session's browser pane couldn't draw).
+2. A USB stick or other non-NTFS drive shows its items locked, with the reason.
+3. A Program Files leftover: exactly one admin prompt, no false "system folders don't match" refusal, and it lands in the
+   Recycle Bin (the admin copy now loads DLLs from System32 and its own folder only).
+4. Uninstall a small real app: UAC if it asks, its uninstaller runs, then its leftovers are listed.
+5. *Put back* restores a file to its folder; with a new file of the same name at the original path it refuses with the reason; an
+   admin-removed item says to restore it from the Recycle Bin.
+6. Scan Duplicates, hide the window for 5 minutes, then `seek memory` / Task Manager: the window's memory goes back down.
+7. A OneDrive folder: online-only files are never downloaded by a scan.
+8. A second double-click on `Seek.bat` brings up the running window.
+9. Installer: `.\scripts\build-installer.ps1` (Seek stopped), install, uninstall: the data question defaults to No.
+10. Index timing for Leftovers: `cargo test -p seek-app real_leftovers_list_with_index -- --ignored --nocapture`.
+11. Faster scans: *Scan faster* raises disk reads in Task Manager; a second scan is much quicker; edit a file and it is read again; Settings
+    → Duplicate scans → *Clear* shows "Nothing remembered yet".
+
+## Pairing race (fixed 2026-11-04)
+
+The sync tests failed in 4 of 22 runs before this fix. After linking, a PC could dial before the other had saved the link. The other side
+then took it for a PC that had missed an unlink and told it so, and each forgot the other. Forcing a 100 ms delay on the last commit failed
+every run in either direction. Whether the uncommitted RAM work made it more likely was not established (0 of 12 failures on the
+commit before it is a small sample).
+
+- The host now saves the guest before replying (`pair_host_then`), and takes it back out if the reply fails.
+- `PeerFile.unlinked` records the PCs this PC actually removed, cleared when they link again. Only those are told "unlinked"; any other
+  unknown PC is closed on quietly and dials again. A link removed before this version is not told later: that PC stays offline until
+  it is unlinked there too.
+- A PC that links while its Hello is on the way no longer gets marked as reinstalled.
+- Verified: the forced delays (guest slow to save, group told late) now pass 6 of 6, and the sync tests 30 of 30 runs.
+
+## RAM investigation (2026-11-02 to 11-04, idle RAM fixed; see "Not explained" below)
+
+The user wants `seek-service` near zero while idle in the tray, using more only while loading. Task Manager showed
+593 MB; the process had 611 MB working set, 1,181 MB private, 1,259 MB peak. Measured by loading a copy of the real data:
+
+- 5 indexes, 4.84M rows: **600 MB** (130 B/row), held in RAM permanently. This is what Task Manager's number mostly is.
+- 2 journals, 112 MB on disk: **269 MB** as heap objects. **Fixed, uncommitted, not yet running on this PC**:
+  `seek_sync::DeviceJournal` keeps only file offsets, 13 MB on the same data. Needs the elevated rebuild + service restart.
+- About 310 MB of the 1,181 MB is **still unattributed**, and so is the 1,259 MB peak. Not measured yet; don't assume a cause.
+- Stored searches are small (8 B per hit, about 39 MB for an all-files search, 2 kept per connection).
+- Dropping everything returned the process to **3 MB**; reloading all 5 indexes takes **449 ms** in parallel, 864 ms in series.
+
+**Idle unloading is built (uncommitted, not yet running on this PC)**, `crates/seek-service/src/parking.rs`. A device is in
+`State::indexes` or `State::parked` (its saved file plus newer journal entries). The service starts with everything
+parked; `snapshot()` (searches, Space, fetching rows) and `Request::Wake` load what is visible, in parallel; `idle_tick`
+(every 5 s) parks anything unused for 60 s (`IDLE_UNLOAD`). Own devices park without saving: USN changes keep going to
+the journal and the next load replays them. Other PCs' copies have no journal here: they are saved before parking, and a
+delta for one loads it. `fold_parked` writes a backlog over 25 MB to its file so the journal never trims what a parked
+device needs. The app's `keep_service_awake` (`app/src-tauri/src/lib.rs`) sends `Wake` when the window shows and every
+20 s while it does. Parking clears stored searches, so a late `FetchRows` answers "results changed; search again" and the UI
+re-searches. `PROTOCOL_VERSION` is now 2: the app and service must be rebuilt together.
+
+Measured with the real service code on a copy of the real data (no volumes attached, so no live USN following):
+
+| Moment | Working set | Private |
+|---|---|---|
+| Started, nothing searched | 29 MB | 24 MB |
+| After a search (window open) | 634 MB | 949 MB |
+| 75 s idle | 31 MB | 27 MB |
+
+First search from idle 517–543 ms, later ones 18.5 ms. The ~310 MB gap between private and working set reappears on load
+and goes away on unload; what holds it is still not attributed.
+
+Limits: a linked PC that keeps sending changes keeps its drive loaded; a parked drive's entry count updates at its next
+load.
+
+**Measuring it: `seek memory`** asks the running service. It prints working set, committed memory, the heap (a counting
+`#[global_allocator]` in `seek-service/src/memory.rs`), every drive (in memory or on disk, rows, RAM, idle time, loads, unloads,
+last user, why it was refused unloading), the heap by owner and by column, and which code asked for indexes how often. Loads,
+unloads and refusals are in `service.log` at INFO with their reason. `seek hub` shows the hub link and each drive's dates.
+
+**Found with it (2026-11-04, live service, 4.96M rows):**
+
+- Idle in the tray or minimized: **21 MB working set, 12 MB committed**, 8 MB heap, of which 7.5 MB is journal offsets. Opening the
+  window loads everything in about 0.6 s; 60 s after it is hidden it is back at 21 MB.
+- **Every column held exactly twice what it needed** (`ids` 16 B/row for an 8 B value): a loaded column has no spare room, so the
+  first change after loading made each `Vec` double. That was the ~310 MB "unattributed" gap: committed, mostly never touched, so
+  it did not show in Task Manager. `DeviceIndex::apply` now reserves what a batch needs and grows by 1/32; building and compacting
+  end with `trim()`.
+- **Not explained:** the run before this diagnostic stayed at 700 MB for 20+ minutes with the window hidden, on the same unloading
+  logic. It did not recur on the next build. If it does, `seek memory` names the cause (last user, or `stays in memory: ...`).
+
+In-use RAM by column, if it ever needs to go lower (window open, after the doubling fix): names and lowercase names about 110 MB
+each, `id_to_row` 136 MB (a `hashbrown::HashTable<u32>` would need about 45 MB), sizes/ids/modified/created 38 MB each. The load
+peak (950 MB) is the decompressed file plus the columns; decoding columns as a stream would about halve it.
+
+**"Seen 2 days ago" on another PC's drives (fixed 2026-11-04):** the owner stamps `last_seen` only when a drive comes or goes, so a
+drive that stays plugged in showed the time its service started, while the data was up to date. A drive reported online by its PC
+now counts as seen when that PC last synced (`apply_remote_devices`), and when a direct session ends. The date moving alone is not
+saved or announced.
+
 ## Next step
+
+**Now (2026-11-20): Decimator slimming**, `docs/superpowers/plans/2026-11-07-decimator-slimming.md`. The faster-scans work it
+waited for has landed.
 
 0. **Space view in the real window (user)** — the release binaries were locked while the session ran:
    elevated: `Stop-Service SeekService`; close the Seek window; `cargo build --release -p seek-service -p seek-cli`;
@@ -274,6 +447,28 @@ Spec `docs/superpowers/specs/2026-10-16-seek-space-view-design.md`, plan `docs/s
 
 ## Open findings / backlog (ranked)
 
+H. ~~Linux check (hub)~~ **DONE 2026-10-27**: native `cargo test -p seek-hub` passes on Alpine under WSL (79 unit + 11 CLI) after
+   a test-only fix in `tests/cli.rs`. Rerun command is in the wave-7 section above.
+
+Hub (from the final review of wave 7; the first-link race, pre-auth lock, OOM caps, metadata caps and compaction
+   memory were fixed in the final fix pass):
+   - I6 append-only journal: `put_delta` rewrites and re-encrypts the whole journal per batch under the store lock (SD wear, latency).
+   - Noise msg-1 replay kills the live session before a frame proves the key.
+   - `pc_by_key` / `sessions.insert` race with unlink (a just-unlinked PC can briefly hold a session).
+   - Admin socket: bind-then-chmod gap (set a umask before binding).
+   - Global 60/min handshake limiter: behind Funnel everything comes from localhost, so a stranger can lock PCs out; check PROXY protocol.
+   - Idle trickle (a peer sending 1 byte per 3 min keeps a session alive).
+   - Minor: `PairingCode` digits 0, `HubAddr` trailing dot, `SEEK_HUB_LAN` only accepts "1", `commit_devices` after a `commit_pcs` failure,
+     split `store.rs` per R11 (copy-file helpers), serve the stored copy decrypted outside the store lock, count PC metadata toward its bytes.
+
+Hub, PC side (final review; I1-I4, M1, M2, M5, M6 were fixed in the final fix pass):
+   - M4 the upload debounce is a throttle: a busy drive sends hub traffic about every 2 s (consider a 10-15 s minimum gap).
+   - M8 `PairInfo.user_name` is never filled (needs `LookupAccountSid`), so the hub's PC list shows no user names.
+   - `start_lan` failing after a hub-initiated unlink is only logged; `link_hub` has no re-entry guard (two links at once).
+   - Catalog upsert merges `linked_users` forever (a user the hub dropped stays linked here).
+   - The hub's `last_seen_ms` is compared with the local clock (skew makes a PC look offline/online wrongly).
+   - `seek-cli` links `seek-hub`, which makes `seek.exe` bigger.
+
 0. Space (from the wave-6 self-review): computing totals holds the device's read lock (~0.1 s per 2M rows,
    once per index change); the live refresh refetches the shown folder ~1 s after every index change, even when
    the change was elsewhere on the drive; Space has no delete yet (Cleanup feature, reversible only).
@@ -286,7 +481,7 @@ Spec `docs/superpowers/specs/2026-10-16-seek-space-view-design.md`, plan `docs/s
 4. Empty query sorted by name over 10M ≈ 0.5 s (consider a pre-sorted name order per index).
 5. UI: no inline query syntax highlighting (spec §8.2).
 6. Google Drive (`G:`, virtual FAT32) is treated as a removable drive; classify cloud-sync drives separately.
-7. Uninstall keeps `%ProgramData%\Seek` (indexes); add an opt-in "delete my index" step. MSI target.
+7. MSI target for the installer.
 8. Shares: rescan only changed folders too (needs incremental pushes instead of whole indexes).
 9. Later specs: self-hosted server sync (and relaying between PCs that can't reach each other) → macOS/Linux →
    content search / duplicates.

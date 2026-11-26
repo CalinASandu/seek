@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { useApi } from "../api/context";
-import type { Device, Peers, Status } from "../api/types";
+import type { Device, HubStatus, Peers, Status } from "../api/types";
 
 export function useDevices() {
   const api = useApi();
@@ -10,11 +10,19 @@ export function useDevices() {
   /** `null` while unknown or when the service has sync turned off. */
   const [peers, setPeers] = useState<Peers | null>(null);
 
+  /** The link to a hub; `null` when there is none. */
+  const [hub, setHub] = useState<HubStatus | null>(null);
+
   const refreshPeers = useCallback(async () => {
     try {
       setPeers(await api.listPeers());
     } catch {
       setPeers(null);
+    }
+    try {
+      setHub(await api.hubStatus());
+    } catch {
+      setHub(null);
     }
   }, [api]);
 
@@ -49,5 +57,5 @@ export function useDevices() {
     });
   }, [api, refresh, refreshPeers]);
 
-  return { devices, status, progress, peers, refresh, refreshPeers };
+  return { devices, status, progress, peers, hub, refresh, refreshPeers };
 }

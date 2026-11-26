@@ -1,5 +1,6 @@
 import type {
   Device,
+  HubStatus,
   PairingCode,
   PcInfo,
   PcSummary,
@@ -13,7 +14,9 @@ import type {
   SortKey,
   Status,
 } from "./types";
+import { HUB_ERR_WRONG_CODE } from "../lib/pcs";
 import { createMockSpace } from "./mockSpace";
+import { createMockClean, type CleanScenario } from "./mockClean";
 
 export interface MockOptions {
   /** Number of synthetic rows (default 300k). */
@@ -24,6 +27,10 @@ export interface MockOptions {
   state?: ServiceState;
   /** Emit fake indexing progress for the scanning device. */
   simulate?: boolean;
+  /** Start linked to a hub (default: the `?hub` URL param). */
+  hub?: boolean;
+  /** What the Decimator tab finds: `default`, `empty` or `big` (default: the `?clean=` URL param). */
+  clean?: CleanScenario;
 }
 
 const DAY = 86_400_000; // timestamps are unix epoch milliseconds, like the service
@@ -31,6 +38,8 @@ export const MOCK_THIS_PC = "host-desktop";
 export const MOCK_LAPTOP = "host-laptop";
 /** The code the mock's other PCs "show"; any other code is wrong. */
 export const MOCK_PAIRING_CODE = "482913";
+/** The code the mock's hub shows. */
+export const MOCK_HUB_CODE = "12345678";
 const GB = 1024 ** 3;
 
 function mulberry32(seed: number): () => number {
@@ -243,7 +252,7 @@ function parseQuery(query: string): Parsed {
     const val = m?.[2] ?? "";
     if (key === "ext") q.exts = new Set(val.toLowerCase().split(";").filter(Boolean));
     else if (key === "device") q.devices.push(val.toLowerCase());
-    else if (key === "drive") q.drives.push(val.toLowerCase());
+    else if (key === "drive") q.drives.push(...val.toLowerCase().split("|drive:"));
     else if (key === "pc") {
       if (!val) return { ok: false, message: "pc: needs a name", position: start };
       q.pcs.push(val.toLowerCase());
@@ -281,6 +290,7 @@ export function createMockApi(opts: MockOptions = {}): SeekApi {
     startWithWindows: true,
     theme: "system",
     excludeFolders: ["C:\\Windows\\WinSxS", "C:\\$Recycle.Bin"],
+    protectedPaths: [],
   };
   const listeners = new Set<(e: SeekEvent) => void>();
   const emit = (e: SeekEvent) => listeners.forEach((l) => l(e));
@@ -297,6 +307,24 @@ export function createMockApi(opts: MockOptions = {}): SeekApi {
   let peers: PcSummary[] = [
     { hostId: MOCK_LAPTOP, name: "Laptop", online: true, lastSyncMs: now - 20_000, needsRelink: false },
   ];
+  /** The hub's PCs (the mock hub knows two), and the link to it. */
+  const hubPcs = (): PcSummary[] => [
+    { hostId: MOCK_LAPTOP, name: "Laptop", online: true, lastSyncMs: now - 60_000, needsRelink: false },
+    { hostId: "host-office", name: "Office-PC", online: false, lastSyncMs: now - 3 * 3_600_000, needsRelink: false },
+  ];
+  const startHub = (name: string, addr: string): HubStatus => ({
+    name,
+    addr,
+    online: true,
+    lastSyncMs: now - 20_000,
+    lastError: null,
+    pcs: hubPcs(),
+    unlinked: false,
+  });
+  let hub: HubStatus | null = (opts.hub ?? (typeof location !== "undefined" && new URLSearchParams(location.search).has("hub")))
+    ? startHub("Home Hub", "tls://seek-hub.your-tailnet.ts.net")
+    : null;
+  if (hub) peers = hub.pcs.map((p) => ({ ...p }));
   let sharing = true;
   let unshared: string[] = [];
   const discovered: PcInfo[] = [{ hostId: "host-office", name: "Office-PC", addr: "192.168.1.23:47321" }];
@@ -353,7 +381,17 @@ export function createMockApi(opts: MockOptions = {}): SeekApi {
     }
   };
 
+  const urlClean = typeof location !== "undefined" ? new URLSearchParams(location.search).get("clean") : null;
+  const cleanApi = createMockClean({
+    scenario: opts.clean ?? (urlClean === "empty" || urlClean === "big" ? urlClean : "default"),
+    simulate: !!opts.simulate,
+    delay,
+    protectedPaths: () => settings.protectedPaths,
+    now,
+  });
+
   return {
+    ...cleanApi,
     async search(query, sort, descending): Promise<SearchOutcome> {
       await delay();
       const t0 = performance.now();
@@ -475,11 +513,14 @@ export function createMockApi(opts: MockOptions = {}): SeekApi {
     },
     async getSettings() {
       await delay();
-      return { ...settings, excludeFolders: [...settings.excludeFolders] };
+      return { ...settings, excludeFolders: [...settings.excludeFolders], protectedPaths: [...settings.protectedPaths] };
+    },
+    async settingsProblem() {
+      return null;
     },
     async setSettings(s) {
       await delay();
-      settings = s;
+      settings = { ...s, protectedPaths: s.protectedPaths ?? [] };
     },
     async startPairing(): Promise<PairingCode> {
       await delay();
@@ -497,6 +538,27 @@ export function createMockApi(opts: MockOptions = {}): SeekApi {
       const hostId = found?.hostId ?? `host-${Date.now()}`;
       peers = [...peers, { hostId, name: found?.name ?? addr.split(":")[0]!, online: true, lastSyncMs: Date.now(), needsRelink: false }];
       emit({ type: "peersChanged" });
+    },
+    async linkHub(addr, code) {
+      await delay();
+      if (hub) throw new Error("this PC is already linked to a hub; unlink it first");
+      if (code.replace(/\D/g, "").length !== 8) throw new Error("the code has 8 digits");
+      if (code.replace(/\D/g, "") !== MOCK_HUB_CODE) throw new Error(`${HUB_ERR_WRONG_CODE}wrong code`);
+      hub = startHub("Home Hub", addr.trim());
+      peers = hub.pcs.map((p) => ({ ...p }));
+      emit({ type: "peersChanged" });
+      return hub.name;
+    },
+    async unlinkHub() {
+      await delay();
+      if (!hub) throw new Error("this PC is not linked to a hub");
+      hub = null;
+      peers = [];
+      emit({ type: "peersChanged" });
+    },
+    async hubStatus() {
+      await delay();
+      return hub && { ...hub, pcs: hub.pcs.map((p) => ({ ...p })) };
     },
     async listPeers(): Promise<Peers> {
       await delay();

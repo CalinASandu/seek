@@ -6,10 +6,13 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 
 use crate::noise::Keys;
+use crate::wire::Role;
 use crate::Error;
 
 /// A group holds at most this many PCs, this one included.
 pub const MAX_PCS: usize = 5;
+/// How many removed links are remembered.
+const MAX_UNLINKED: usize = 32;
 const PEERS_FILE: &str = "peers.json";
 const KEY_FILE: &str = "host.key";
 
@@ -39,6 +42,16 @@ pub struct Peer {
     #[serde(default)]
     pub last_sync_ms: i64,
     pub state: PeerState,
+    /// A PC (LAN peer, or a PC known through the hub) or the hub itself.
+    #[serde(default)]
+    pub role: Role,
+    /// The hub's addresses, tried in order (empty for a PC). For the hub peer, `linked_users` holds one pair:
+    /// the local user who linked it (and the same SID again: one person on every PC of the hub).
+    #[serde(default)]
+    pub addrs: Vec<String>,
+    /// A PC only known from the hub's catalog: never dialed, not part of the LAN group.
+    #[serde(default)]
+    pub via_hub: bool,
 }
 
 fn yes() -> bool {
@@ -56,17 +69,27 @@ pub struct PeerFile {
     pub unshared: Vec<uuid::Uuid>,
     #[serde(default)]
     pub peers: Vec<Peer>,
+    /// PCs this PC removed the link to, newest last: a PC that was off at the time learns it when it comes back.
+    #[serde(default)]
+    pub unlinked: Vec<uuid::Uuid>,
 }
 
 impl Default for PeerFile {
     fn default() -> Self {
-        Self { sharing: true, unshared: Vec::new(), peers: Vec::new() }
+        Self { sharing: true, unshared: Vec::new(), peers: Vec::new(), unlinked: Vec::new() }
     }
 }
 
 pub struct PeerStore {
     dir: PathBuf,
     pub file: PeerFile,
+}
+
+impl PeerFile {
+    /// The hub this PC is linked to, if any.
+    pub fn hub(&self) -> Option<&Peer> {
+        self.peers.iter().find(|p| p.role == Role::Hub)
+    }
 }
 
 impl PeerStore {
@@ -104,6 +127,7 @@ impl PeerStore {
 
     /// Adds or replaces a peer; user links are merged.
     pub fn upsert(&mut self, mut p: Peer) {
+        self.file.unlinked.retain(|h| *h != p.host_id);
         if let Some(old) = self.get_mut(p.host_id) {
             for l in std::mem::take(&mut old.linked_users) {
                 if !p.linked_users.contains(&l) {
@@ -119,6 +143,20 @@ impl PeerStore {
     pub fn remove(&mut self, host: uuid::Uuid) -> Option<Peer> {
         let pos = self.file.peers.iter().position(|p| p.host_id == host)?;
         Some(self.file.peers.remove(pos))
+    }
+
+    /// Notes that this PC removed the link to `host`.
+    pub fn remember_unlinked(&mut self, host: uuid::Uuid) {
+        self.file.unlinked.retain(|h| *h != host);
+        self.file.unlinked.push(host);
+        if self.file.unlinked.len() > MAX_UNLINKED {
+            self.file.unlinked.remove(0);
+        }
+    }
+
+    /// Whether this PC removed the link to `host` and has not linked with it since.
+    pub fn was_unlinked(&self, host: uuid::Uuid) -> bool {
+        self.file.unlinked.contains(&host)
     }
 
     pub fn by_key(&self, key: &[u8; 32]) -> Option<&Peer> {
@@ -165,6 +203,9 @@ mod tests {
             profiles: vec![],
             last_sync_ms: 0,
             state: PeerState::Linked,
+            role: Role::Pc,
+            addrs: Vec::new(),
+            via_hub: false,
         }
     }
 
@@ -199,8 +240,52 @@ mod tests {
     }
 
     #[test]
+    fn peer_file_without_role_loads_as_pc() {
+        let f: PeerFile = serde_json::from_str(
+            r#"{"peers":[{"hostId":"00000000-0000-0000-0000-000000000007","name":"Laptop","publicKey":"AA==",
+                "addr":"10.0.0.2:47321","state":"linked"}]}"#,
+        )
+        .unwrap();
+        let p = &f.peers[0];
+        assert!(p.role == Role::Pc && p.addrs.is_empty() && !p.via_hub);
+        assert!(f.hub().is_none());
+    }
+
+    #[test]
     fn older_files_default_to_sharing() {
         let f: PeerFile = serde_json::from_str("{}").unwrap();
         assert!(f.sharing);
+    }
+
+    #[test]
+    fn an_unlink_is_remembered_until_the_pc_is_linked_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = Keys::generate().public;
+        let host = uuid::Uuid::from_u128(7);
+        let mut s = PeerStore::load(dir.path());
+        assert!(!s.was_unlinked(host));
+        s.upsert(peer(&key, vec![]));
+        s.remember_unlinked(host);
+        s.remember_unlinked(host);
+        s.remove(host);
+        s.save().unwrap();
+
+        let mut s = PeerStore::load(dir.path());
+        assert!(s.was_unlinked(host));
+        assert_eq!(s.file.unlinked.len(), 1);
+        s.upsert(peer(&key, vec![]));
+        assert!(!s.was_unlinked(host), "linked again");
+    }
+
+    #[test]
+    fn only_the_latest_unlinks_are_remembered() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = PeerStore::load(dir.path());
+        for i in 0..(MAX_UNLINKED as u128 + 1) {
+            s.remember_unlinked(uuid::Uuid::from_u128(i));
+        }
+        assert_eq!(s.file.unlinked.len(), MAX_UNLINKED);
+        assert!(!s.was_unlinked(uuid::Uuid::from_u128(0)));
+        assert!(s.was_unlinked(uuid::Uuid::from_u128(MAX_UNLINKED as u128)));
     }
 }

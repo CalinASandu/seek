@@ -7,8 +7,8 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use seek_core::{
-    load_index, save_index, Device, DeviceId, DeviceIndex, DeviceKind, DeviceRegistry, DeviceState,
-    FolderTotals, HostId, IndexHeader, INDEX_FORMAT_VERSION,
+    load_index, read_index_head, save_index, Device, DeviceId, DeviceIndex, DeviceKind, DeviceRegistry,
+    DeviceState, FolderTotals, HostId, IndexHeader, INDEX_FORMAT_VERSION,
 };
 use seek_ipc::Event;
 use seek_scan::watch::MAX_CHANGED_DIRS;
@@ -16,12 +16,15 @@ use seek_scan::{Changed, DirWatcher, UsnFollower, VolumeInfo};
 use tokio::sync::broadcast;
 
 use crate::monitor::VolumeSource;
+use crate::parking::Parked;
 
 pub struct Config {
     pub data_dir: PathBuf,
     pub pipe_name: String,
     /// Sync with linked PCs; `None` disables it.
     pub sync: Option<SyncConfig>,
+    /// Unload an index this long after its last use; `None` keeps loaded indexes in memory.
+    pub idle_unload: Option<Duration>,
 }
 
 /// Network settings for sync between linked PCs.
@@ -35,8 +38,10 @@ pub struct SyncConfig {
     pub mdns: bool,
     /// This PC's name as shown on linked PCs.
     pub name: String,
-    /// How often changes are pushed to linked PCs.
+    /// How often changes are pushed to linked PCs, and the hub is polled and redialed.
     pub interval: Duration,
+    /// TLS trust for a `tls://` hub address; `None` = the public web roots (tests trust their own root).
+    pub hub_tls: Option<seek_sync::transport::TlsConfig>,
 }
 
 pub type SharedIndex = Arc<RwLock<DeviceIndex>>;
@@ -47,7 +52,18 @@ pub struct State {
     pub cfg: Config,
     pub source: Arc<dyn VolumeSource>,
     pub registry: RwLock<DeviceRegistry>,
+    /// Indexes in memory. A device with an index is either here or in `parked`.
     pub indexes: RwLock<HashMap<DeviceId, SharedIndex>>,
+    /// Indexes that are only on disk (see `parking`).
+    pub parked: Mutex<HashMap<DeviceId, Parked>>,
+    /// Only one thread loads parked indexes at a time; the others wait for what it brings in.
+    pub load_lock: Mutex<()>,
+    /// When each index was last needed.
+    pub last_used: Mutex<HashMap<DeviceId, Instant>>,
+    /// Who needed it, for `seek memory`.
+    pub usage: Mutex<crate::memory::UsageLog>,
+    /// Bumped when indexes leave memory: connections drop the results they stored.
+    pub parked_gen: tokio::sync::watch::Sender<u64>,
     pub dirty: Mutex<HashSet<DeviceId>>,
     /// Local volumes currently present, by device.
     pub mounted: Mutex<HashMap<DeviceId, VolumeInfo>>,
@@ -132,8 +148,9 @@ pub fn now_ms() -> i64 {
 }
 
 impl State {
-    /// Loads the registry and every stored index. Unreadable indexes are dropped and their
-    /// devices queued for a rescan; an unreadable registry is moved aside and recreated.
+    /// Loads the registry and notes every stored index, which stay on disk until they are needed. Unreadable
+    /// indexes are dropped and their devices queued for a rescan; an unreadable registry is moved aside and
+    /// recreated.
     pub fn load(cfg: Config, source: Arc<dyn VolumeSource>) -> anyhow::Result<Arc<State>> {
         std::fs::create_dir_all(cfg.data_dir.join("indexes"))?;
         std::fs::create_dir_all(cfg.data_dir.join("journal"))?;
@@ -147,6 +164,8 @@ impl State {
             }
         };
         let mut indexes = HashMap::new();
+        let mut parked = HashMap::new();
+        let mut dirty = HashSet::new();
         let mut needs_rescan = HashSet::new();
         let mut journals = HashMap::new();
         let mut remote_cursors = HashMap::new();
@@ -154,23 +173,41 @@ impl State {
         for d in &mut registry.devices {
             d.state = DeviceState::Offline;
             let path = index_path(&cfg.data_dir, d.id);
-            match load_index(&path) {
-                Ok((hdr, ix)) if hdr.device_id == d.id => {
+            match read_index_head(&path) {
+                Ok(head) if head.device_id == d.id => {
+                    let mut stale = false;
                     if d.indexed_by_host == host_id {
-                        // The journal must describe exactly the saved index; otherwise (crash between
-                        // saves, older index file) linked PCs need a full copy.
+                        // The journal must reach back to the saved index, whose missing changes it holds;
+                        // otherwise (older index file, damaged journal) linked PCs need a full copy.
                         let jpath = cfg.data_dir.join("journal").join(format!("{}.log", d.id));
                         let mut j =
                             seek_sync::DeviceJournal::open(jpath, seek_sync::JOURNAL_MAX_BYTES);
-                        let c = j.cursor();
-                        if hdr.sync_cursor != Some((c.generation, c.seq)) {
+                        stale = !head
+                            .sync_cursor
+                            .is_some_and(|(generation, seq)| j.covers(&seek_sync::Cursor { generation, seq }));
+                        if stale {
                             j.reset();
                         }
                         journals.insert(d.id, j);
-                    } else if let Some((generation, seq)) = hdr.sync_cursor {
+                    } else if let Some((generation, seq)) = head.sync_cursor {
                         remote_cursors.insert(d.id, seek_sync::Cursor { generation, seq });
                     }
-                    indexes.insert(d.id, Arc::new(RwLock::new(ix)));
+                    if !stale {
+                        parked.insert(d.id, Parked::from_head(&head));
+                        continue;
+                    }
+                    // Its file no longer matches the new journal: kept in memory until it is saved.
+                    match load_index(&path) {
+                        Ok((_, ix)) => {
+                            indexes.insert(d.id, Arc::new(RwLock::new(ix)));
+                            dirty.insert(d.id);
+                        }
+                        Err(e) => {
+                            tracing::warn!("index for {} unreadable ({e}); will rescan", d.display_name);
+                            let _ = std::fs::remove_file(&path);
+                            needs_rescan.insert(d.id);
+                        }
+                    }
                 }
                 Ok(_) => {
                     tracing::warn!(
@@ -194,7 +231,12 @@ impl State {
             source,
             registry: RwLock::new(registry),
             indexes: RwLock::new(indexes),
-            dirty: Mutex::new(HashSet::new()),
+            parked: Mutex::new(parked),
+            load_lock: Mutex::new(()),
+            last_used: Mutex::new(HashMap::new()),
+            usage: Mutex::new(crate::memory::UsageLog::default()),
+            parked_gen: tokio::sync::watch::channel(0).0,
+            dirty: Mutex::new(dirty),
             mounted: Mutex::new(HashMap::new()),
             followers: Mutex::new(HashMap::new()),
             watchers: Mutex::new(HashMap::new()),
@@ -449,9 +491,11 @@ impl State {
         t
     }
 
-    /// Every device that has an index, in registry order.
-    pub fn snapshot(&self) -> Vec<Snapshot> {
+    /// Every device that has an index, in registry order, loaded.
+    pub fn snapshot(&self, why: &'static str) -> Vec<Snapshot> {
         let devices = self.visible_devices();
+        let ids: Vec<DeviceId> = devices.iter().map(|d| d.id).collect();
+        self.ensure_loaded(&ids, why);
         let names: HashMap<HostId, String> = {
             let peers = self.peers.lock().unwrap();
             peers.file.peers.iter().map(|p| (p.host_id, p.name.clone())).collect()
@@ -474,6 +518,39 @@ impl State {
                 })
             })
             .collect()
+    }
+}
+
+impl State {
+    /// `indexes/*.seekidx` and `journal/*.log` whose name is not the id of any device in the
+    /// registry. Only reads. The folder is listed before the registry, so a drive added while this
+    /// runs is never mistaken for a stranger.
+    pub fn stale_data(&self) -> Vec<seek_ipc::StaleFile> {
+        let mut found = Vec::new();
+        for (sub, ext) in [("indexes", "seekidx"), ("journal", "log")] {
+            let Ok(rd) = std::fs::read_dir(self.cfg.data_dir.join(sub)) else { continue };
+            for entry in rd.flatten() {
+                let path = entry.path();
+                let is_ours = path.extension().is_some_and(|e| e.eq_ignore_ascii_case(ext));
+                let id = path.file_stem().and_then(|s| s.to_str()).and_then(|s| s.parse::<DeviceId>().ok());
+                let (true, Some(id)) = (is_ours, id) else { continue };
+                let Ok(md) = entry.metadata() else { continue };
+                if !md.is_file() {
+                    continue;
+                }
+                let modified = md
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map_or(0, |d| d.as_millis() as i64);
+                found.push((id, seek_ipc::StaleFile { path: path.to_string_lossy().into_owned(), size: md.len(), modified }));
+            }
+        }
+        let reg = self.registry.read().unwrap();
+        let mut out: Vec<seek_ipc::StaleFile> =
+            found.into_iter().filter(|(id, _)| reg.get(*id).is_none()).map(|(_, f)| f).collect();
+        out.sort_by(|a, b| a.path.cmp(&b.path));
+        out
     }
 }
 

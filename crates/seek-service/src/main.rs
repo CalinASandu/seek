@@ -78,6 +78,7 @@ fn run_console(data_dir: PathBuf, pipe_name: String, sync: bool) -> anyhow::Resu
                 data_dir,
                 pipe_name,
                 sync: sync.then(default_sync_config),
+                idle_unload: Some(seek_service::parking::IDLE_UNLOAD),
             },
             Arc::new(RealVolumes),
             rx,

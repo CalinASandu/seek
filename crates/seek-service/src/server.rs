@@ -1,6 +1,6 @@
 //! Named-pipe server: one task per connection, requests handled concurrently.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -8,11 +8,11 @@ use std::time::Instant;
 use base64::Engine;
 use seek_core::{
     decode_index, materialize, normalize_unc, query, search, Device, DeviceId, DeviceIdentity,
-    DeviceKind, DeviceIndex, DeviceState, FolderTotals, Hit, SearchDevice, SortKey,
+    DeviceKind, DeviceIndex, DeviceState, FolderTotals, Hit, ResultRow, SearchDevice, SortKey,
 };
 use seek_ipc::{
     create_server, read_frame, write_frame, Envelope, IndexProgress, PcInfo, PcSummary, Request,
-    Response, StatusInfo, UserVolume, PROTOCOL_VERSION,
+    Response, SizeGroup, StatusInfo, UserVolume, PROTOCOL_VERSION,
 };
 use seek_sync::peers::PeerState;
 use tokio::net::windows::named_pipe::NamedPipeServer;
@@ -26,6 +26,8 @@ const MAX_ROWS_PER_FETCH: u32 = 500;
 const KEPT_SEARCHES: usize = 2;
 const MAX_SPACE_DEPTH: u8 = 8;
 const MAX_SPACE_FILES: u32 = 1000;
+/// Most files in one same-size page (every page scans the whole index, so pages must be big).
+const MAX_SAME_SIZE_FILES_PER_PAGE: u32 = 20_000;
 const FOLDER_GONE: &str = "That folder no longer exists";
 
 struct StoredSearch {
@@ -33,6 +35,19 @@ struct StoredSearch {
     /// Device id and index epoch of every device searched, in hit `dev` order.
     devices: Vec<(DeviceId, u64)>,
     hits: Arc<Vec<Hit>>,
+}
+
+/// Hits kept for clients, on all connections.
+static STORED_HITS: AtomicU64 = AtomicU64::new(0);
+
+impl Drop for StoredSearch {
+    fn drop(&mut self) {
+        STORED_HITS.fetch_sub(self.hits.len() as u64, Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn stored_result_bytes() -> u64 {
+    STORED_HITS.load(Ordering::Relaxed) * std::mem::size_of::<Hit>() as u64
 }
 
 #[derive(Default)]
@@ -97,6 +112,14 @@ async fn handle_connection(pipe: NamedPipeServer, state: Arc<State>) {
         }
     });
     let mut tasks = Vec::new();
+    // stored results are row numbers: they mean nothing once their indexes have left memory
+    let mut parked = state.parked_gen.subscribe();
+    let stored = conn.clone();
+    tasks.push(tokio::spawn(async move {
+        while parked.changed().await.is_ok() {
+            stored.searches.lock().unwrap().clear();
+        }
+    }));
     while let Ok(Some(env)) = read_frame::<_, Envelope<Request>>(&mut rd).await {
         if env.body == Request::Subscribe {
             let mut events = state.events.subscribe();
@@ -166,6 +189,13 @@ async fn handle(state: Arc<State>, conn: Arc<Conn>, req: Request) -> Response {
             offset,
             limit,
         } => fetch_rows(state, conn, search_id, offset, limit).await,
+        Request::Wake => {
+            tokio::task::spawn_blocking(move || state.wake());
+            Response::Ok
+        }
+        Request::Memory => tokio::task::spawn_blocking(move || Response::Memory { report: state.memory_report() })
+            .await
+            .unwrap_or_else(|e| err(format!("memory report failed: {e}"))),
         Request::ListDevices => Response::Devices {
             devices: state.visible_devices(),
         },
@@ -251,11 +281,21 @@ async fn handle(state: Arc<State>, conn: Arc<Conn>, req: Request) -> Response {
             })
             .await
         }
+        Request::SameSizeFiles { min_size, device_ids, cursor, limit } => {
+            same_size_files(state, conn, min_size, device_ids, cursor, limit).await
+        }
+        Request::StaleData => tokio::task::spawn_blocking(move || Response::StaleData { files: state.stale_data() })
+            .await
+            .unwrap_or_else(|e| err(format!("listing stale data failed: {e}"))),
+        Request::FolderFacts { paths } => folder_facts(state, conn, paths).await,
         Request::Status => Response::Status(status(&state)),
         Request::Subscribe => Response::Ok,
         Request::StartPairing
         | Request::DiscoveredPcs
         | Request::JoinPairing { .. }
+        | Request::LinkHub { .. }
+        | Request::UnlinkHub
+        | Request::HubStatus
         | Request::ListPeers
         | Request::Unlink { .. }
         | Request::RenamePeer { .. }
@@ -298,6 +338,15 @@ async fn sync_request(state: &Arc<State>, rt: &Arc<PeersRuntime>, conn: &Conn, r
                 Err(e) => err(e),
             }
         }
+        Request::LinkHub { addr, code } => match rt.link_hub(addr.trim(), &code, &conn.sid).await {
+            Ok(name) => Response::HubLinked { name },
+            Err(e) => err(e),
+        },
+        Request::UnlinkHub => match rt.unlink_hub().await {
+            Ok(()) => Response::Ok,
+            Err(e) => err(e),
+        },
+        Request::HubStatus => Response::Hub { hub: rt.hub_status() },
         Request::ListPeers => peers_info(state, rt),
         Request::Unlink { host_id } => match rt.unlink(host_id).await {
             Ok(()) => Response::Ok,
@@ -308,10 +357,9 @@ async fn sync_request(state: &Arc<State>, rt: &Arc<PeersRuntime>, conn: &Conn, r
             if name.is_empty() {
                 return err("name cannot be empty");
             }
-            if state.peers.lock().unwrap().get(host_id).is_none() {
-                return err("that device is not linked");
+            if let Err(e) = rt.rename_peer(host_id, name) {
+                return err(&e);
             }
-            rt.rename_peer(host_id, name);
             state.invalidate();
             Response::Ok
         }
@@ -350,10 +398,11 @@ fn peers_info(state: &Arc<State>, rt: &Arc<PeersRuntime>) -> Response {
             .file
             .peers
             .iter()
+            .filter(|p| p.role == seek_sync::Role::Pc)
             .map(|p| PcSummary {
                 host_id: p.host_id,
                 name: p.name.clone(),
-                online: rt.is_connected(p.host_id),
+                online: rt.peer_online(p),
                 last_sync_ms: p.last_sync_ms,
                 needs_relink: p.state == PeerState::NeedsRelink,
             })
@@ -383,7 +432,7 @@ async fn run_search(
     let c2 = conn.clone();
     let result = tokio::task::spawn_blocking(move || {
         let started = Instant::now();
-        let snap = state.snapshot();
+        let snap = state.snapshot("search");
         let guards: Vec<_> = snap.iter().map(|s| s.index.read().unwrap()).collect();
         let devs: Vec<SearchDevice> = snap
             .iter()
@@ -425,6 +474,7 @@ async fn run_search(
         Ok(Some((hits, devices, elapsed_ms))) => {
             let id = next_search_id();
             let total = hits.len() as u64;
+            STORED_HITS.fetch_add(total, Ordering::Relaxed);
             let mut searches = conn.searches.lock().unwrap();
             searches.push_back(StoredSearch {
                 id,
@@ -455,7 +505,7 @@ async fn space(
     f: impl FnOnce(&SearchDevice, &FolderTotals, Option<u32>) -> Response + Send + 'static,
 ) -> Response {
     tokio::task::spawn_blocking(move || {
-        let snap = state.snapshot();
+        let snap = state.snapshot("space view");
         let Some(s) = snap.iter().find(|s| s.device.id == device_id) else {
             return err("Unknown drive");
         };
@@ -485,7 +535,152 @@ async fn space(
     .unwrap_or_else(|e| err(format!("space view failed: {e}")))
 }
 
+/// The first requested drive that exists (is in `visible`) but has no loaded index.
+fn first_unloaded(requested: &[DeviceId], visible: &[DeviceId], loaded: &[DeviceId]) -> Option<DeviceId> {
+    requested.iter().copied().find(|id| visible.contains(id) && !loaded.contains(id))
+}
+
+/// How many of the leading `(size, files)` groups make one page: whole groups only, up to
+/// `MAX_SAME_SIZE_FILES_PER_PAGE` or `limit` files (the smaller), and always at least one group.
+fn groups_in_page(sizes: &[(u64, u64)], limit: u32) -> usize {
+    let max_files = u64::from(limit.min(MAX_SAME_SIZE_FILES_PER_PAGE));
+    let (mut taken, mut files) = (0, 0u64);
+    for &(_, n) in sizes {
+        if taken > 0 && files + n > max_files {
+            break;
+        }
+        taken += 1;
+        files += n;
+    }
+    taken
+}
+
+/// One page of files that share a size across `device_ids` (first stage of the duplicate finder). Reads the
+/// index only and keeps nothing between pages: each call recomputes from the cursor, so an index change
+/// between pages can shift results, but every page's sizes are strictly below the previous page's.
+async fn same_size_files(
+    state: Arc<State>,
+    conn: Arc<Conn>,
+    min_size: u64,
+    device_ids: Vec<DeviceId>,
+    cursor: Option<u64>,
+    limit: u32,
+) -> Response {
+    if device_ids.is_empty() {
+        return Response::SameSizeFiles { groups: Vec::new(), next: None };
+    }
+    tokio::task::spawn_blocking(move || {
+        let mut snap = state.snapshot("same size");
+        // ids that are no drive at all are skipped, but a drive whose index did not load is an error:
+        // an empty answer would read as "no duplicates"
+        let visible: Vec<DeviceId> = state.visible_devices().iter().map(|d| d.id).collect();
+        let loaded: Vec<DeviceId> = snap.iter().map(|s| s.device.id).collect();
+        if let Some(id) = first_unloaded(&device_ids, &visible, &loaded) {
+            let name = state.device(id).map_or_else(|| "A drive".to_string(), |d| d.display_name);
+            return err(format!("{name} could not be read right now, so its files can't be compared"));
+        }
+        // the order is stable whatever the snapshot's order
+        snap.retain(|s| device_ids.contains(&s.device.id));
+        snap.sort_by_key(|s| s.device.id);
+        let guards: Vec<_> = snap.iter().map(|s| s.index.read().unwrap()).collect();
+        let masks: Vec<_> = snap
+            .iter()
+            .zip(&guards)
+            .map(|(s, g)| {
+                let hidden = state.hidden_for(&s.device, &conn.sid, conn.elevated, &conn.hidden);
+                state.hidden_mask(&s.device, g, &conn.sid, &hidden)
+            })
+            .collect();
+        let mask_of = |d: usize| masks[d].as_deref().map(Vec::as_slice);
+
+        // files per size over all chosen drives; only sizes held by two or more files are candidates
+        let mut counts: HashMap<u64, u64> = HashMap::new();
+        for (d, g) in guards.iter().enumerate() {
+            for (size, n) in seek_core::sizes_with_files(g, mask_of(d), min_size) {
+                *counts.entry(size).or_default() += u64::from(n);
+            }
+        }
+        let mut sizes: Vec<(u64, u64)> = counts
+            .into_iter()
+            .filter(|&(size, n)| n >= 2 && cursor.is_none_or(|c| size <= c))
+            .collect();
+        sizes.sort_unstable_by_key(|&(size, _)| std::cmp::Reverse(size));
+
+        let taken = groups_in_page(&sizes, limit);
+        let next = sizes.get(taken).map(|&(size, _)| size);
+        let page: Vec<u64> = sizes[..taken].iter().map(|&(size, _)| size).collect();
+        let wanted: HashSet<u64> = page.iter().copied().collect();
+
+        let devs: Vec<SearchDevice> = snap
+            .iter()
+            .zip(&guards)
+            .map(|(s, g)| SearchDevice {
+                device: &s.device,
+                index: g,
+                mount: &s.device.last_mount_point,
+                online: s.online,
+                pc: &s.pc,
+            })
+            .collect();
+        let mut by_size: HashMap<u64, Vec<ResultRow>> = HashMap::new();
+        for (d, g) in guards.iter().enumerate() {
+            for (size, rows) in seek_core::files_of_size(g, mask_of(d), &wanted) {
+                by_size
+                    .entry(size)
+                    .or_default()
+                    .extend(rows.into_iter().map(|row| materialize(&devs, Hit { dev: d as u16, row })));
+            }
+        }
+        let groups = page
+            .into_iter()
+            .map(|size| SizeGroup { size, files: by_size.remove(&size).unwrap_or_default() })
+            .collect();
+        Response::SameSizeFiles { groups, next }
+    })
+    .await
+    .unwrap_or_else(|e| err(format!("same-size search failed: {e}")))
+}
+
 /// `Some(None)` for the drive root, `Some(Some(row))` for a live folder, `None` when there is no such folder.
+/// What the index knows about each folder in `paths`, for the folders on this PC's online drives.
+/// Hidden rows are handled as the space view does; a hidden folder is not found.
+async fn folder_facts(state: Arc<State>, conn: Arc<Conn>, paths: Vec<String>) -> Response {
+    tokio::task::spawn_blocking(move || {
+        let me = state.host_id();
+        let mut facts: Vec<Option<seek_core::FolderFact>> = vec![None; paths.len()];
+        for s in state.snapshot("folder facts") {
+            if s.device.indexed_by_host != me || s.device.state != DeviceState::Online {
+                continue;
+            }
+            let mount = s.device.last_mount_point.as_str();
+            let prefix = format!("{}\\", mount.trim_end_matches('\\').to_lowercase());
+            let mine: Vec<usize> = (0..paths.len()).filter(|&i| paths[i].to_lowercase().starts_with(&prefix)).collect();
+            if mine.is_empty() {
+                continue;
+            }
+            let ix = s.index.read().unwrap();
+            let hidden = state.hidden_for(&s.device, &conn.sid, conn.elevated, &conn.hidden);
+            let mask = state.hidden_mask(&s.device, &ix, &conn.sid, &hidden);
+            let wanted: Vec<&str> = mine.iter().map(|&i| paths[i].as_str()).collect();
+            let found = ix.find_folders(mount, &wanted);
+            let visible: Vec<(usize, u32)> = mine
+                .iter()
+                .zip(found)
+                .filter_map(|(&i, row)| row.map(|r| (i, r)))
+                .filter(|&(_, r)| !mask.as_ref().is_some_and(|m| m[r as usize]))
+                .collect();
+            let rows: Vec<u32> = visible.iter().map(|&(_, r)| r).collect();
+            let got = seek_core::folder_facts(&ix, mask.as_deref().map(Vec::as_slice), &rows);
+            for ((i, _), f) in visible.into_iter().zip(got) {
+                facts[i] = Some(f);
+            }
+        }
+        Response::FolderFacts { facts }
+    })
+    .await
+    .unwrap_or_else(|e| err(format!("folder facts failed: {e}")))
+}
+
 fn space_folder(ix: &DeviceIndex, mount: &str, path: &str) -> Option<Option<u32>> {
     let path = path.trim_end_matches('\\');
     if path.eq_ignore_ascii_case(mount.trim_end_matches('\\')) {
@@ -509,13 +704,14 @@ async fn fetch_rows(
             .map(|s| (s.devices.clone(), s.hits.clone()))
     };
     let Some((devices, hits)) = found else {
-        return err("unknown or expired search");
+        // also what a client sees when idle unloading dropped its results: it searches again
+        return err("results changed; search again");
     };
     let limit = limit.min(MAX_ROWS_PER_FETCH) as usize;
     let start = (offset as usize).min(hits.len());
     let end = (start + limit).min(hits.len());
     let rows = tokio::task::spawn_blocking(move || {
-        let snap: Vec<Snapshot> = state.snapshot();
+        let snap: Vec<Snapshot> = state.snapshot("result rows");
         let guards: Vec<_> = snap.iter().map(|s| s.index.read().unwrap()).collect();
         // Map the device order captured at search time onto the current snapshot; a device that is
         // gone or whose rows were renumbered (compaction, rescan) cannot serve its old hits.
@@ -573,7 +769,7 @@ fn forget(state: &Arc<State>, id: DeviceId) -> Response {
         return err("only offline drives can be forgotten");
     }
     state.registry.write().unwrap().remove(id);
-    state.indexes.write().unwrap().remove(&id);
+    state.drop_index(id);
     state.dirty.lock().unwrap().remove(&id);
     let _ = std::fs::remove_file(state.index_path(id));
     state.remove_journal(id);
@@ -724,5 +920,29 @@ fn status(state: &Arc<State>) -> StatusInfo {
                 done: false,
             })
             .collect(),
+    }
+}
+
+#[cfg(test)]
+mod same_size_tests {
+    use super::*;
+
+    #[test]
+    fn a_page_is_capped_but_never_splits_a_group() {
+        let sizes = [(9, 9_000), (8, 9_000), (7, 9_000)];
+        assert_eq!(groups_in_page(&sizes, u32::MAX), 2, "18000 fits the cap, 27000 does not");
+        assert_eq!(groups_in_page(&sizes, 9_000), 1);
+        assert_eq!(groups_in_page(&sizes, 0), 1, "always one group");
+        assert_eq!(groups_in_page(&[(5, 30_000), (4, 2)], u32::MAX), 1, "one group may exceed the cap");
+        assert_eq!(groups_in_page(&[], 10), 0);
+    }
+
+    #[test]
+    fn a_known_drive_without_an_index_is_reported_not_skipped() {
+        let (a, b, c) = (uuid::Uuid::from_u128(1), uuid::Uuid::from_u128(2), uuid::Uuid::from_u128(3));
+        // c is not a drive at all: skipped; b is a drive whose index did not load
+        assert_eq!(first_unloaded(&[a, b, c], &[a, b], &[a]), Some(b));
+        assert_eq!(first_unloaded(&[a, c], &[a, b], &[a]), None);
+        assert_eq!(first_unloaded(&[], &[a], &[]), None);
     }
 }

@@ -1,0 +1,34 @@
+// Merge into your tailnet policy file (https://login.tailscale.com/admin/acls/file).
+// The default allow-all rule must go, but do not just delete it: your own devices would stop reaching each other.
+// Tagged nodes such as the hub are not members, so the first grant keeps them out; the second lets a PC that has
+// Tailscale running reach the hub, because on such a PC the hub's name resolves to its tailnet address rather than
+// to Funnel. Also remove any broader `funnel` nodeAttr (for example one targeting "*" or autogroup:member). If your
+// file uses "acls" rather than "grants", write the first rule as {"action":"accept","src":["autogroup:member"],
+// "dst":["autogroup:member:*"]} and the second as {"action":"accept","src":["autogroup:member"],
+// "dst":["tag:seek-hub:443"]}.
+{
+  "grants": [
+    {
+      "src": ["autogroup:member"],
+      "dst": ["autogroup:member"],
+      "ip":  ["*"],
+    },
+    {
+      "src": ["autogroup:member"],
+      "dst": ["tag:seek-hub"],
+      "ip":  ["tcp:443"],
+    },
+  ],
+
+  "tagOwners": {
+    "tag:seek-hub": ["autogroup:admin"],
+  },
+
+  // Only the hub's tag may publish to the internet.
+  "nodeAttrs": [
+    {
+      "target": ["tag:seek-hub"],
+      "attr":   ["funnel"],
+    },
+  ],
+}

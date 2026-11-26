@@ -1,8 +1,10 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import type { SeekApi, SeekEvent } from "./types";
+import type { CleanEvent, SeekApi, SeekEvent } from "./types";
 
 export const EVENT_CHANNEL = "seek://event";
+/** Duplicate-scan events of the Decimator (`app/src-tauri/src/cleanup.rs`). */
+export const CLEAN_EVENT_CHANNEL = "seek://clean";
 
 export function createTauriApi(): SeekApi {
   return {
@@ -20,9 +22,13 @@ export function createTauriApi(): SeekApi {
     installService: () => invoke("install_service"),
     getSettings: () => invoke("get_settings"),
     setSettings: (settings) => invoke("set_settings", { settings }),
+    settingsProblem: () => invoke("settings_problem"),
     startPairing: () => invoke("start_pairing"),
     discoveredPcs: () => invoke("discovered_pcs"),
     joinPairing: (addr, code) => invoke("join_pairing", { addr, code }),
+    linkHub: (addr, code) => invoke("link_hub", { addr, code }),
+    unlinkHub: () => invoke("unlink_hub"),
+    hubStatus: () => invoke("hub_status"),
     listPeers: () => invoke("list_peers"),
     unlink: (hostId) => invoke("unlink", { hostId }),
     renamePeer: (hostId, name) => invoke("rename_peer", { hostId, name }),
@@ -32,6 +38,37 @@ export function createTauriApi(): SeekApi {
     spaceTree: (deviceId, path, depth) => invoke("space_tree", { deviceId, path, depth }),
     spaceLargest: (deviceId, path, limit) => invoke("space_largest", { deviceId, path, limit }),
     spaceTypes: (deviceId, path) => invoke("space_types", { deviceId, path }),
+    // Decimator. Rust has clean_scan_start / _cancel / _state, clean_leftovers, clean_apps, clean_prepare,
+    // clean_commit, clean_history, clean_put_back, uninstall_start / _state / _leftovers and open_recycle_bin.
+    // Nothing here runs at load. Each argument is the camelCase of the Rust parameter (app_id is appId).
+    cleanScanStart: (deviceIds) => invoke("clean_scan_start", { deviceIds }),
+    cleanScanFaster: (on) => invoke("clean_scan_faster", { on }),
+    cleanRemembered: () => invoke("clean_remembered"),
+    cleanForget: () => invoke("clean_forget"),
+    cleanScanCancel: () => invoke("clean_scan_cancel"),
+    cleanScanState: () => invoke("clean_scan_state"),
+    cleanLeftovers: () => invoke("clean_leftovers"),
+    cleanApps: () => invoke("clean_apps"),
+    cleanPrepare: (req) => invoke("clean_prepare", { req }),
+    cleanCommit: (token, ids) => invoke("clean_commit", { token, ids }),
+    cleanHistory: () => invoke("clean_history"),
+    cleanPutBack: (entryIds) => invoke("clean_put_back", { entryIds }),
+    uninstallStart: (appId) => invoke("uninstall_start", { appId }),
+    uninstallState: (appId) => invoke("uninstall_state", { appId }),
+    uninstallLeftovers: (appId) => invoke("uninstall_leftovers", { appId }),
+    openRecycleBin: () => invoke("open_recycle_bin"),
+    onCleanEvent(cb) {
+      let disposed = false;
+      let unlisten: (() => void) | null = null;
+      void listen<CleanEvent>(CLEAN_EVENT_CHANNEL, (e) => cb(e.payload)).then((fn) => {
+        if (disposed) fn();
+        else unlisten = fn;
+      });
+      return () => {
+        disposed = true;
+        unlisten?.();
+      };
+    },
     onEvent(cb) {
       let disposed = false;
       let unlisten: (() => void) | null = null;
