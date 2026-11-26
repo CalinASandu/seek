@@ -1,4 +1,4 @@
-# Builds the Seek installer: app/src-tauri/target-dir .../bundle/nsis/Seek_<version>_x64-setup.exe
+# Builds the Seek installer: target\installer\release\bundle\nsis\Seek_<version>_x64-setup.exe
 # The installer ships seek-service.exe next to the app and registers SeekService (runs as SYSTEM).
 # Native tools (cargo, pnpm) write progress to stderr; failures are detected via $LASTEXITCODE.
 $ErrorActionPreference = "Continue"
@@ -7,6 +7,8 @@ $env:CARGO_PROFILE_RELEASE_LTO = "thin"
 $env:CARGO_PROFILE_RELEASE_CODEGEN_UNITS = "1"
 $env:CARGO_PROFILE_RELEASE_INCREMENTAL = "false"
 $root = Split-Path $PSScriptRoot -Parent
+# Own target folder: the dev service and window run from target\release and lock those files.
+$env:CARGO_TARGET_DIR = Join-Path $root "target\installer"
 Push-Location $root
 try {
     cargo build --release -p seek-service
@@ -14,7 +16,7 @@ try {
     # Tauri's externalBin expects the target triple in the file name; it installs it as seek-service.exe.
     $bin = Join-Path $root "app\src-tauri\binaries"
     New-Item -ItemType Directory -Force $bin | Out-Null
-    Copy-Item "target\release\seek-service.exe" (Join-Path $bin "seek-service-x86_64-pc-windows-msvc.exe") -Force -ErrorAction Stop
+    Copy-Item "target\installer\release\seek-service.exe" (Join-Path $bin "seek-service-x86_64-pc-windows-msvc.exe") -Force -ErrorAction Stop
     Push-Location app
     try {
         # The installer-only config adds externalBin, so normal builds never need the copied binary.
@@ -23,7 +25,7 @@ try {
     } finally {
         Pop-Location
     }
-    Get-ChildItem "target\release\bundle\nsis\*.exe" | ForEach-Object { "installer: $($_.FullName)" }
+    Get-ChildItem "target\installer\release\bundle\nsis\*.exe" | ForEach-Object { "installer: $($_.FullName)" }
 } finally {
     Pop-Location
 }

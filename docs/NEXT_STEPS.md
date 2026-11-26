@@ -127,7 +127,7 @@ devices, a results page, save/load, a live-change batch, real scans (`--scan D:\
 peak memory is its own) and service round trips (`--remote`). `--json` saves, `--compare` prints deltas.
 `perf.ps1` saves to `perf-results\` (git-ignored) and compares with the previous run automatically.
 
-**Installer**: `.\scripts\build-installer.ps1` → `target\release\bundle\nsis\Seek_0.1.0_x64-setup.exe` (3.6 MB).
+**Installer**: `.\scripts\build-installer.ps1` → `target\installer\release\bundle\nsis\Seek_0.1.0_x64-setup.exe` (3.6 MB).
 Per-machine (Program Files — the SYSTEM service must not live in a user-writable folder). Hooks
 (`app/src-tauri/windows/hooks.nsh`): stop the service before files are replaced, `seek-service install`
 after (now idempotent: updates an existing registration), `seek-service uninstall` on uninstall; the index in
