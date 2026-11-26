@@ -186,11 +186,10 @@ and from synthetic benchmarks. Run them yourself with `seek perf`.
 ## Install
 
 > [!NOTE]
-> Seek is in early development and there are no release builds yet. You can build the installer from
-> source, as shown below.
+> Seek is in early development. Windows 10/11, 64-bit only.
 
-1. Build the installer: `.\scripts\build-installer.ps1`. It produces
-   `target\release\bundle\nsis\Seek_<version>_x64-setup.exe`.
+1. Download `Seek_<version>_x64-setup.exe` from the [latest release](https://github.com/CalinASandu/seek/releases/latest),
+   or build it yourself with `.\scripts\build-installer.ps1` (it lands in `target\installer\release\bundle\nsis\`).
 2. Run it. It installs Seek for all users and registers the **Seek indexing service**. This is the only
    admin prompt you'll see.
 3. Open **Seek** from the Start menu. Closing the window keeps Seek in the tray.
